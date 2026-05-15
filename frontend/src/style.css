@@ -1,0 +1,48 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-surface-0 text-gray-100 font-['Inter',sans-serif];
+  margin: 0;
+  min-height: 100vh;
+}
+
+/* ── Scrollbar ────────────────────────────────── */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { @apply bg-surface-100; }
+::-webkit-scrollbar-thumb { @apply bg-surface-300 rounded-full; }
+
+/* ── Utility classes ─────────────────────────── */
+.stat-card {
+  @apply bg-surface-100 rounded-xl border border-white/5 p-4;
+}
+
+.profit  { @apply text-profit; }
+.loss    { @apply text-loss; }
+.neutral { @apply text-gray-400; }
+
+/* ── PrimeVue dark overrides ─────────────────── */
+.p-datatable .p-datatable-tbody > tr {
+  background: transparent !important;
+}
+.p-datatable .p-datatable-tbody > tr:hover {
+  @apply bg-surface-200 !important;
+}
+
+.badge-buy    { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-profit/20 text-profit; }
+.badge-sell   { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-loss/20 text-loss; }
+.badge-pump   { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-orange-500/20 text-orange-400; }
+.badge-dump   { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-red-500/20 text-red-400; }
+.badge-hold   { @apply inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-gray-500/20 text-gray-400; }
+
+.status-running { @apply inline-flex items-center gap-1 text-profit; }
+.status-stopped { @apply inline-flex items-center gap-1 text-gray-400; }
+
+.pulse-dot {
+  @apply w-2 h-2 rounded-full bg-profit animate-pulse;
+}

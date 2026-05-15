@@ -1,0 +1,9 @@
+node_modules/
+dist/
+.env
+*.db
+*.db-journal
+*.log
+backend-log.txt
+frontend-log.txt
+.claude/

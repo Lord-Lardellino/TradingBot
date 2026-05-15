@@ -1,0 +1,231 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./tradingbot.db"
+}
+
+model Bot {
+  id          Int      @id @default(autoincrement())
+  name        String
+  strategy    String
+  symbol      String
+  timeframe   String   @default("1m")
+  status      String   @default("stopped")
+  testMode    Boolean  @default(true)
+  config      String   @default("{}")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  trades      Trade[]
+  signals     Signal[]
+}
+
+model Trade {
+  id          Int       @id @default(autoincrement())
+  botId       Int
+  bot         Bot       @relation(fields: [botId], references: [id], onDelete: Cascade)
+  symbol      String
+  side        String
+  quantity    Float
+  entryPrice  Float
+  exitPrice   Float?
+  total       Float
+  pnl         Float?
+  pnlPct      Float?
+  fee         Float     @default(0)
+  status      String    @default("open")
+  orderId     String?
+  openedAt    DateTime  @default(now())
+  closedAt    DateTime?
+}
+
+model Signal {
+  id          Int      @id @default(autoincrement())
+  botId       Int
+  bot         Bot      @relation(fields: [botId], references: [id], onDelete: Cascade)
+  symbol      String
+  type        String
+  price       Float
+  rsi         Float?
+  macd        Float?
+  macdSignal  Float?
+  histogram   Float?
+  ema9        Float?
+  ema21       Float?
+  bbUpper     Float?
+  bbLower     Float?
+  volume      Float?
+  volumeRatio Float?
+  executed    Boolean  @default(false)
+  createdAt   DateTime @default(now())
+}
+
+model Settings {
+  id             Int      @id @default(1)
+  apiKey         String   @default("")
+  apiSecret      String   @default("")
+  testMode       Boolean  @default(true)
+  maxOpenTrades  Int      @default(3)
+  stakeAmount    Float    @default(10)
+  stopLossPct    Float    @default(0.5)
+  takeProfitPct  Float    @default(1.0)
+  updatedAt      DateTime @updatedAt
+}
+
+// ── Simulatore scanner ────────────────────────────────────────────────────────
+
+model SimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String    // LONG | SHORT
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  takeProfit2   Float
+  leverage      Int
+  riskEur       Float     // EUR rischiati su questo trade
+  positionSize  Float     // nozionale EUR
+  marginEur     Float     // margine richiesto EUR
+  grade         String
+  score         Int
+  targetTP      String    @default("TP1")
+  status        String    @default("open") // open | tp1 | tp2 | sl | manual
+  closePrice    Float?
+  pnl           Float?    // EUR
+  pnlCapPct     Float?    // % sul capitale al momento dell'apertura
+  fees          Float     @default(0)
+  capitalBefore Float     // capitale prima di questo trade
+  capitalAfter  Float?    // capitale dopo la chiusura
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+// ── AI Brain — parametri dinamici e log analisi ──────────────────────────────
+
+model AiParams {
+  id                Int      @id @default(1)
+  enabled           Boolean  @default(false)
+  // Parametri scanner
+  atrMultSl         Float    @default(2.0)
+  tp1Rr             Float    @default(2.0)
+  tp2Rr             Float    @default(3.0)
+  minSlPct          Float    @default(0.70)
+  minEma5mSlope     Float    @default(0.001)
+  minEmitScore      Int      @default(55)
+  minVolRatio       Float    @default(0.8)
+  enterGrades       String   @default("A+,A")
+  allowedDirections String   @default("LONG,SHORT")
+  // Stato operativo
+  mode              String   @default("normal")
+  consecutiveLosses Int      @default(0)
+  // Stato analisi
+  lastAnalysisAt    DateTime?
+  lastWinRate       Float?
+  totalAnalyses     Int      @default(0)
+  updatedAt         DateTime @updatedAt
+}
+
+model AiBrainLog {
+  id             Int      @id @default(autoincrement())
+  createdAt      DateTime @default(now())
+  winRate        Float
+  tradesAnalyzed Int
+  changes        String   // JSON: [{param, from, to, reason}]
+  summary        String
+  action         String   @default("normal")
+  mode           String   @default("normal")
+}
+
+model SimConfig {
+  id              Int     @id @default(1)
+  startingCapital Float   @default(1000)
+  marginPerTrade  Float   @default(10)   // fixed USD margin per trade
+  targetTP        String  @default("TP1")
+  maxConcurrent   Int     @default(3)
+  autoEnter       Boolean @default(true)
+  updatedAt       DateTime @updatedAt
+}
+
+// ── Live Trading — ordini reali MEXC ─────────────────────────────────────────
+
+model LiveTrade {
+  id            String    @id
+  symbol        String
+  direction     String    // LONG | SHORT
+  entry         Float
+  stopLoss      Float
+  takeProfit    Float
+  leverage      Int
+  marginEur     Float
+  positionSize  Float
+  contracts     Float
+  orderId       String?
+  slOrderId     String?   // MEXC native stop-loss order ID
+  tpOrderId     String?   // MEXC native take-profit order ID
+  grade         String
+  score         Int
+  status        String    @default("open") // open | tp | sl | manual | error
+  closePrice    Float?
+  pnl           Float?
+  feesOpen      Float?    // fee effettiva apertura
+  feesClose     Float?    // fee effettiva chiusura
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+  note          String?
+}
+
+model LiveConfig {
+  id              Int      @id @default(1)
+  enabled         Boolean  @default(false)
+  autoClose       Boolean  @default(true)
+  marginPerTrade  Float    @default(5)
+  minGrade        String   @default("A+")
+  maxConcurrent   Int      @default(2)
+  updatedAt       DateTime @updatedAt
+}
+
+// ── Intraday 4H — PHR v1 (Pump-Halt-Retest) ──────────────────────────────────
+
+model IntraSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String    @default("LONG")
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  takeProfit2   Float
+  takeProfit3   Float
+  leverage      Int
+  slPct         Float
+  marginEur     Float
+  positionSize  Float
+  riskEur       Float
+  grade         String
+  score         Int
+  pumpPct       Float
+  distToEma34   Float
+  targetTP      String    @default("TP2")
+  status        String    @default("open") // open | tp1 | tp2 | tp3 | sl | manual
+  closePrice    Float?
+  pnl           Float?
+  pnlCapPct     Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model IntraSimConfig {
+  id              Int      @id @default(1)
+  startingCapital Float    @default(1000)
+  marginPerTrade  Float    @default(10)
+  leverage        Int      @default(20)
+  targetTP        String   @default("TP2")
+  maxConcurrent   Int      @default(5)
+  autoEnter       Boolean  @default(true)
+  minGrade        String   @default("B")
+  updatedAt       DateTime @updatedAt
+}
