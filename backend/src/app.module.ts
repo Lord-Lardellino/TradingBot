@@ -16,6 +16,7 @@ import { SimulationModule } from './simulation/simulation.module';
 import { LiveModule } from './live/live.module';
 import { AiBrainModule } from './ai-brain/ai-brain.module';
 import { IntraModule } from './intra/intra.module';
+import { MtfScannerModule } from './mtf-scanner/mtf-scanner.module';
 
 @Module({
   imports: [
@@ -36,6 +37,7 @@ import { IntraModule } from './intra/intra.module';
     LiveModule,
     AiBrainModule,
     IntraModule,
+    MtfScannerModule,
   ],
 })
 export class AppModule {}

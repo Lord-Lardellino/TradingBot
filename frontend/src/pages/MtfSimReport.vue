@@ -5,11 +5,11 @@
     <div class="flex flex-wrap items-center justify-between gap-3">
       <div>
         <h1 class="text-xl font-bold text-white flex items-center gap-2">
-          📊 Report Simulazione
-          <span class="text-xs font-normal text-gray-500">partendo da €{{ a?.startingCapital ?? 100 }}</span>
+          📊 Simulazione Multi-TF
+          <span class="text-xs font-normal text-gray-500">ERB v7 · 5m · 15m · 1h</span>
         </h1>
         <p class="text-xs text-gray-500 mt-0.5">
-          Ogni segnale del scanner viene simulato automaticamente · fee MEXC 0.038%×2 = 0.076% round-trip
+          Ogni segnale MTF viene simulato automaticamente · fee MEXC 0.038%×2 = 0.076% round-trip
         </p>
       </div>
       <div class="flex gap-2">
@@ -18,8 +18,28 @@
       </div>
     </div>
 
+    <!-- TF Tabs -->
+    <div class="flex gap-1 bg-surface-100 p-1 rounded-xl w-fit">
+      <button
+        v-for="tf in tfs" :key="tf"
+        @click="activeTf = tf"
+        :class="[
+          'px-5 py-2 rounded-lg text-sm font-semibold transition-all',
+          activeTf === tf
+            ? 'bg-cyan-500 text-white shadow'
+            : 'text-gray-400 hover:text-white hover:bg-surface-200',
+        ]"
+      >
+        {{ tf }}
+        <span v-if="store.trades[tf].filter(t => t.status === 'open').length"
+              class="ml-1.5 px-1.5 py-0.5 text-[10px] rounded-full bg-white/20">
+          {{ store.trades[tf].filter(t => t.status === 'open').length }}
+        </span>
+      </button>
+    </div>
+
     <!-- Loading -->
-    <div v-if="store.loading" class="flex justify-center py-20">
+    <div v-if="isLoading" class="flex justify-center py-20">
       <ProgressSpinner />
     </div>
 
@@ -28,7 +48,7 @@
       <!-- Capitale headline -->
       <div class="stat-card flex items-center gap-6 py-5">
         <div>
-          <div class="text-xs text-gray-500 mb-1">Capitale attuale</div>
+          <div class="text-xs text-gray-500 mb-1">Capitale attuale ({{ activeTf }})</div>
           <div class="text-4xl font-bold font-mono" :class="a.totalPnl >= 0 ? 'text-profit' : 'text-loss'">
             €{{ a.currentCapital.toFixed(2) }}
           </div>
@@ -83,39 +103,33 @@
         </div>
       </div>
 
-      <!-- Fee breakdown card -->
+      <!-- Fee breakdown -->
       <div class="stat-card" v-if="a.totalTrades > 0">
-        <h3 class="text-sm font-semibold text-white mb-3 flex items-center gap-2">
-          Breakdown PnL / Fee
-          <span class="text-[10px] text-gray-500 font-normal font-mono">MEXC taker 0.05%×2 = 0.10% round-trip</span>
-        </h3>
+        <h3 class="text-sm font-semibold text-white mb-3">Breakdown PnL / Fee</h3>
         <div class="grid grid-cols-3 gap-4">
-          <!-- Gross PnL -->
           <div class="bg-surface-200 rounded-lg p-3">
             <div class="text-xs text-gray-500 mb-1">PnL Lordo</div>
-            <div class="text-xl font-bold font-mono" :class="grossPnl >= 0 ? 'text-profit' : 'text-loss'">
-              {{ grossPnl >= 0 ? '+' : '' }}€{{ grossPnl.toFixed(2) }}
+            <div class="text-xl font-bold font-mono" :class="a.totalGrossPnl >= 0 ? 'text-profit' : 'text-loss'">
+              {{ a.totalGrossPnl >= 0 ? '+' : '' }}€{{ a.totalGrossPnl.toFixed(2) }}
             </div>
             <div class="text-[10px] text-gray-600 mt-1">prima delle commissioni</div>
           </div>
-          <!-- Fees -->
           <div class="bg-surface-200 rounded-lg p-3">
             <div class="text-xs text-gray-500 mb-1">Fee Pagate</div>
             <div class="text-xl font-bold font-mono text-yellow-400">
-              -€{{ feesPaid.toFixed(2) }}
+              -€{{ a.totalFeesPaid.toFixed(2) }}
             </div>
             <div class="text-[10px] text-gray-600 mt-1">
-              {{ a.totalTrades > 0 ? (feesPaid / a.totalTrades).toFixed(3) : '0.000' }}€ media/trade
+              {{ a.totalTrades > 0 ? (a.totalFeesPaid / a.totalTrades).toFixed(3) : '0.000' }}€ media/trade
             </div>
           </div>
-          <!-- Net PnL -->
           <div class="bg-surface-200 rounded-lg p-3 border" :class="a.totalPnl >= 0 ? 'border-profit/20' : 'border-loss/20'">
             <div class="text-xs text-gray-500 mb-1">PnL Netto</div>
             <div class="text-xl font-bold font-mono" :class="a.totalPnl >= 0 ? 'text-profit' : 'text-loss'">
               {{ a.totalPnl >= 0 ? '+' : '' }}€{{ a.totalPnl.toFixed(2) }}
             </div>
-            <div class="text-[10px] mt-1" :class="feesPaid > 0 ? 'text-gray-500' : 'text-gray-600'">
-              fee = {{ grossPnl !== 0 ? ((feesPaid / Math.abs(grossPnl)) * 100).toFixed(1) : '0' }}% del lordo
+            <div class="text-[10px] mt-1 text-gray-600">
+              fee = {{ a.totalGrossPnl !== 0 ? ((a.totalFeesPaid / Math.abs(a.totalGrossPnl)) * 100).toFixed(1) : '0' }}% del lordo
             </div>
           </div>
         </div>
@@ -132,7 +146,6 @@
           </div>
           <div class="text-profit text-lg font-bold font-mono mt-1">
             +€{{ a.bestTrade.pnl?.toFixed(2) }}
-            <span class="text-sm opacity-70">(+{{ a.bestTrade.pnlCapPct?.toFixed(2) }}%)</span>
           </div>
         </div>
         <div v-if="a.worstTrade" class="stat-card border-loss/20">
@@ -144,23 +157,16 @@
           </div>
           <div class="text-loss text-lg font-bold font-mono mt-1">
             €{{ a.worstTrade.pnl?.toFixed(2) }}
-            <span class="text-sm opacity-70">({{ a.worstTrade.pnlCapPct?.toFixed(2) }}%)</span>
           </div>
         </div>
       </div>
 
-      <!-- By Grade breakdown -->
+      <!-- By Grade -->
       <div class="stat-card" v-if="Object.keys(a.byGrade).length">
         <h3 class="text-sm font-semibold text-white mb-3">Performance per Grade</h3>
         <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <div
-            v-for="(g, grade) in a.byGrade"
-            :key="grade"
-            class="bg-surface-200 rounded-lg p-3 text-center"
-          >
-            <div :class="gradeBadge(grade)" class="inline-block px-2 py-0.5 rounded font-bold text-sm mb-2">
-              {{ grade }}
-            </div>
+          <div v-for="(g, grade) in a.byGrade" :key="grade" class="bg-surface-200 rounded-lg p-3 text-center">
+            <div :class="gradeBadge(grade)" class="inline-block px-2 py-0.5 rounded font-bold text-sm mb-2">{{ grade }}</div>
             <div class="text-xs text-gray-500">{{ g.trades }} trade · {{ g.winRate.toFixed(0) }}% win</div>
             <div class="font-mono font-bold mt-1" :class="g.pnl >= 0 ? 'text-profit' : 'text-loss'">
               {{ g.pnl >= 0 ? '+' : '' }}€{{ g.pnl.toFixed(2) }}
@@ -171,11 +177,10 @@
 
       <!-- Config riepilogo -->
       <div class="stat-card">
-        <h3 class="text-sm font-semibold text-white mb-3">Parametri simulazione</h3>
-        <div class="grid grid-cols-2 md:grid-cols-5 gap-3 text-xs text-center">
+        <h3 class="text-sm font-semibold text-white mb-3">Parametri simulazione ({{ activeTf }})</h3>
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs text-center">
           <div><div class="text-gray-500">Capitale</div><div class="font-bold text-white">€{{ a.config.startingCapital }}</div></div>
           <div><div class="text-gray-500">Margine/trade</div><div class="font-bold text-white">${{ a.config.marginPerTrade }}</div></div>
-          <div><div class="text-gray-500">Target</div><div class="font-bold text-white">{{ a.config.targetTP }}</div></div>
           <div><div class="text-gray-500">Max concurrent</div><div class="font-bold text-white">{{ a.config.maxConcurrent }}</div></div>
           <div><div class="text-gray-500">Auto-enter</div><div :class="a.config.autoEnter ? 'text-profit' : 'text-gray-500'" class="font-bold">{{ a.config.autoEnter ? 'ON' : 'OFF' }}</div></div>
         </div>
@@ -183,13 +188,11 @@
 
       <!-- Trade history -->
       <div class="stat-card">
-
-        <!-- Header con summary stats -->
         <div class="flex items-center justify-between mb-4">
           <h3 class="text-sm font-semibold text-white flex items-center gap-2">
-            Storico Trade Simulati
+            Storico Trade ({{ activeTf }})
             <span class="text-[10px] bg-white/5 border border-white/8 rounded-full px-2 py-0.5 text-gray-400 font-normal">
-              {{ store.trades.length }}
+              {{ currentTrades.length }}
             </span>
           </h3>
           <div class="flex items-center gap-3 text-[11px] font-mono">
@@ -201,16 +204,13 @@
           </div>
         </div>
 
-        <!-- Lista trade -->
         <div class="space-y-2 max-h-[640px] overflow-y-auto -mx-1 px-1">
-
-          <div v-if="store.trades.length === 0"
-               class="text-center text-gray-600 py-12 text-sm">
+          <div v-if="currentTrades.length === 0" class="text-center text-gray-600 py-12 text-sm">
             Nessun trade simulato ancora
           </div>
 
           <div
-            v-for="t in store.trades" :key="t.id"
+            v-for="t in currentTrades" :key="t.id"
             :class="tradeRowBg(t.status)"
             class="rounded-xl border px-4 py-3 flex items-center gap-5 transition-colors group cursor-pointer"
             @click="openChart(t)"
@@ -222,22 +222,16 @@
                 <span class="text-gray-600 font-normal text-[10px]">/USDT</span>
               </div>
               <div class="flex items-center gap-1 mt-1.5 flex-wrap">
-                <span :class="t.direction === 'LONG' ? 'badge-buy' : 'badge-sell'"
-                      class="text-[10px] px-1.5 py-px font-semibold">
+                <span :class="t.direction === 'LONG' ? 'badge-buy' : 'badge-sell'" class="text-[10px] px-1.5 py-px font-semibold">
                   {{ t.direction }}
                 </span>
-                <span :class="gradeBadge(t.grade)"
-                      class="text-[10px] px-1.5 py-px rounded font-bold">
-                  {{ t.grade }}
-                </span>
+                <span :class="gradeBadge(t.grade)" class="text-[10px] px-1.5 py-px rounded font-bold">{{ t.grade }}</span>
                 <span class="text-gray-500 text-[10px] font-mono">{{ t.leverage }}×</span>
               </div>
-              <div class="text-[9px] text-gray-600 font-mono mt-1.5">
-                {{ timeAgo(t.openedAt) }}
-              </div>
+              <div class="text-[9px] text-gray-600 font-mono mt-1.5">{{ timeAgo(t.openedAt) }}</div>
             </div>
 
-            <!-- ② Price ladder + progress bar -->
+            <!-- ② Price ladder -->
             <div class="flex-1 min-w-0">
               <PriceLadder
                 :entry="t.entry" :sl="t.stopLoss"
@@ -245,7 +239,6 @@
                 :close-price="t.status !== 'open' ? t.closePrice : (t.currentPrice ?? null)"
                 :direction="t.direction" :status="t.status"
               />
-              <!-- Barra di avanzamento verso TP1 (solo trade aperti) -->
               <div v-if="t.status === 'open'" class="mt-2 flex items-center gap-2">
                 <div class="flex-1 h-[3px] bg-white/5 rounded-full overflow-hidden">
                   <div
@@ -261,7 +254,7 @@
               </div>
             </div>
 
-            <!-- ③ Livelli prezzi -->
+            <!-- ③ Livelli -->
             <div class="flex-shrink-0 w-28 hidden md:block">
               <div class="space-y-[3px] font-mono text-[10px]">
                 <div class="flex justify-between gap-2">
@@ -285,33 +278,23 @@
 
             <!-- ④ PnL -->
             <div class="flex-shrink-0 w-28 text-right">
-              <!-- Trade aperto -->
               <template v-if="t.status === 'open'">
                 <template v-if="t.unrealizedPnl != null">
                   <div class="text-base font-bold font-mono leading-tight"
                        :class="t.unrealizedPnl >= 0 ? 'text-profit' : 'text-loss'">
                     {{ t.unrealizedPnl >= 0 ? '+' : '' }}€{{ t.unrealizedPnl.toFixed(2) }}
                   </div>
-                  <div class="text-[10px] text-yellow-500/50 font-mono mt-0.5">
-                    fee −€{{ t.fees.toFixed(3) }}
-                  </div>
+                  <div class="text-[10px] text-yellow-500/50 font-mono mt-0.5">fee −€{{ t.fees.toFixed(3) }}</div>
                 </template>
                 <span v-else class="text-yellow-400 text-xs animate-pulse font-mono">live…</span>
               </template>
-              <!-- Trade chiuso -->
               <template v-else-if="t.pnl != null">
                 <div class="text-[10px] text-gray-600 font-mono">
                   lordo {{ (t.pnl + t.fees) >= 0 ? '+' : '' }}€{{ (t.pnl + t.fees).toFixed(2) }}
                 </div>
                 <div class="text-[10px] text-yellow-500/40 font-mono">fee −€{{ t.fees.toFixed(3) }}</div>
-                <div class="text-sm font-bold font-mono mt-0.5"
-                     :class="t.pnl >= 0 ? 'text-profit' : 'text-loss'">
+                <div class="text-sm font-bold font-mono mt-0.5" :class="t.pnl >= 0 ? 'text-profit' : 'text-loss'">
                   {{ t.pnl >= 0 ? '+' : '' }}€{{ t.pnl.toFixed(2) }}
-                </div>
-                <div v-if="t.pnlCapPct != null"
-                     class="text-[9px] font-mono"
-                     :class="t.pnlCapPct >= 0 ? 'text-profit/50' : 'text-loss/50'">
-                  {{ t.pnlCapPct >= 0 ? '+' : '' }}{{ t.pnlCapPct.toFixed(2) }}%
                 </div>
               </template>
             </div>
@@ -322,7 +305,7 @@
               <button
                 v-if="t.status === 'open'"
                 class="text-[10px] text-gray-600 hover:text-red-400 transition-colors px-2 py-0.5 rounded border border-white/8 hover:border-red-500/30 font-mono opacity-0 group-hover:opacity-100"
-                @click.stop="store.closeManual(t.id)"
+                @click.stop="store.closeManual(t.id, activeTf)"
               >
                 chiudi ×
               </button>
@@ -335,10 +318,10 @@
     <!-- Empty state -->
     <div v-else class="stat-card text-center py-16">
       <div class="text-5xl mb-4">📊</div>
-      <p class="text-gray-400 font-semibold">Simulazione non ancora avviata</p>
+      <p class="text-gray-400 font-semibold">Simulazione {{ activeTf }} non ancora avviata</p>
       <p class="text-gray-600 text-sm mt-2">
-        I trade vengono simulati automaticamente quando il Pump Scanner rileva segnali.<br>
-        Attiva il scanner e i risultati appariranno qui.
+        I trade vengono simulati automaticamente quando l'MTF Scanner rileva segnali.<br>
+        Attiva lo scanner e i risultati appariranno qui.
       </p>
     </div>
 
@@ -349,22 +332,14 @@
              class="fixed inset-0 z-50 flex items-center justify-center p-4"
              style="background: rgba(0,0,0,0.78); backdrop-filter: blur(4px)"
              @click.self="selectedTrade = null">
-          <div class="relative bg-[#13131e] rounded-2xl border border-white/10 shadow-2xl w-full max-w-4xl overflow-hidden"
-               @click.stop>
-
-            <!-- Header -->
+          <div class="relative bg-[#13131e] rounded-2xl border border-white/10 shadow-2xl w-full max-w-4xl overflow-hidden" @click.stop>
             <div class="flex items-center justify-between px-5 py-3 border-b border-white/8">
               <div class="flex items-center gap-3">
                 <span class="font-mono font-bold text-white text-lg">
                   {{ selectedTrade.symbol.replace('/USDT:USDT','') }}/USDT
                 </span>
-                <span :class="selectedTrade.direction === 'LONG' ? 'badge-buy' : 'badge-sell'">
-                  {{ selectedTrade.direction }}
-                </span>
-                <span :class="gradeBadge(selectedTrade.grade)"
-                      class="text-xs px-1.5 py-0.5 rounded font-bold">
-                  {{ selectedTrade.grade }}
-                </span>
+                <span :class="selectedTrade.direction === 'LONG' ? 'badge-buy' : 'badge-sell'">{{ selectedTrade.direction }}</span>
+                <span :class="gradeBadge(selectedTrade.grade)" class="text-xs px-1.5 py-0.5 rounded font-bold">{{ selectedTrade.grade }}</span>
                 <StatusBadge :status="selectedTrade.status" />
               </div>
               <div class="flex items-center gap-1">
@@ -382,8 +357,6 @@
                 </button>
               </div>
             </div>
-
-            <!-- Chart -->
             <PriceChart
               :symbol="selectedTrade.symbol"
               :timeframe="chartTimeframe"
@@ -391,8 +364,6 @@
               :show-ema34="true"
               :height="380"
             />
-
-            <!-- Legend footer -->
             <div class="flex flex-wrap items-center gap-4 px-5 py-2.5 border-t border-white/8 text-[11px] font-mono">
               <div class="flex items-center gap-1.5">
                 <span class="inline-block w-5 border-t border-dashed border-red-400" />
@@ -416,21 +387,19 @@
               </div>
               <div class="ml-auto flex items-center gap-3">
                 <span class="text-gray-600">{{ timeAgo(selectedTrade.openedAt) }}</span>
-                <span v-if="selectedTrade.pnl != null"
-                      class="font-bold text-sm"
+                <span v-if="selectedTrade.pnl != null" class="font-bold text-sm"
                       :class="selectedTrade.pnl >= 0 ? 'text-profit' : 'text-loss'">
                   {{ selectedTrade.pnl >= 0 ? '+' : '' }}€{{ selectedTrade.pnl.toFixed(2) }}
                 </span>
               </div>
             </div>
-
           </div>
         </div>
       </Transition>
     </Teleport>
 
     <!-- Config dialog -->
-    <Dialog v-model:visible="showConfig" header="Configurazione Simulazione" :style="{ width: '380px' }" modal>
+    <Dialog v-model:visible="showConfig" :header="`Config Simulazione ${activeTf}`" :style="{ width: '360px' }" modal>
       <div class="space-y-4 py-2">
         <div class="flex flex-col gap-1.5">
           <label class="text-xs text-gray-400">Capitale iniziale (€)</label>
@@ -439,11 +408,6 @@
         <div class="flex flex-col gap-1.5">
           <label class="text-xs text-gray-400">Margine per trade ($ fisso)</label>
           <InputNumber v-model="cfg.marginPerTrade" :min="1" :max="1000" :step="1" prefix="$ " class="w-full" />
-          <span class="text-[11px] text-gray-600">${{ cfg.marginPerTrade }} margine · leva max 10× → posizione max ${{ cfg.marginPerTrade * 10 }}</span>
-        </div>
-        <div class="flex flex-col gap-1.5">
-          <label class="text-xs text-gray-400">Take Profit target</label>
-          <Select v-model="cfg.targetTP" :options="tpOptions" option-label="label" option-value="value" class="w-full" />
         </div>
         <div class="flex flex-col gap-1.5">
           <label class="text-xs text-gray-400">Max trade contemporanei</label>
@@ -451,7 +415,7 @@
         </div>
         <div class="flex items-center gap-2">
           <ToggleSwitch v-model="cfg.autoEnter" />
-          <span class="text-sm text-gray-400">Auto-entra sui segnali del scanner</span>
+          <span class="text-sm text-gray-400">Auto-entra sui segnali dello scanner</span>
         </div>
       </div>
       <template #footer>
@@ -468,30 +432,34 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, defineComponent, getCurrentInstance, h } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch, defineComponent, getCurrentInstance, h } from 'vue'
 import { useConfirm } from 'primevue/useconfirm'
 import { useToast } from 'primevue/usetoast'
 import Button from 'primevue/button'
 import Dialog from 'primevue/dialog'
-import Select from 'primevue/select'
 import InputNumber from 'primevue/inputnumber'
 import ToggleSwitch from 'primevue/toggleswitch'
 import ProgressSpinner from 'primevue/progressspinner'
 import ConfirmDialog from 'primevue/confirmdialog'
 import Toast from 'primevue/toast'
-import { useSimulationStore, type SimTrade } from '@/stores/simulation'
+import { useMtfScannerStore, type MtfTrade } from '@/stores/mtf-scanner'
 import { createChart, ColorType } from 'lightweight-charts'
 import PriceChart, { type PriceLineConfig } from '@/components/PriceChart.vue'
 
-const store = useSimulationStore()
+const store   = useMtfScannerStore()
 const confirm = useConfirm()
-const toast = useToast()
-const a        = computed(() => store.analytics)
-const grossPnl = computed(() => a.value?.totalGrossPnl ?? 0)
-const feesPaid = computed(() => a.value?.totalFeesPaid ?? 0)
+const toast   = useToast()
 
-const selectedTrade  = ref<SimTrade | null>(null)
-const chartTimeframe = ref('1m')
+const tfs = ['5m', '15m', '1h'] as const
+type Tf = typeof tfs[number]
+const activeTf  = ref<Tf>('5m')
+const isLoading = ref(false)
+
+const a = computed(() => store.analytics[activeTf.value])
+const currentTrades = computed(() => store.trades[activeTf.value] ?? [])
+
+const selectedTrade  = ref<MtfTrade | null>(null)
+const chartTimeframe = ref('5m')
 
 const chartLines = computed((): PriceLineConfig[] => {
   const t = selectedTrade.value
@@ -506,17 +474,13 @@ const chartLines = computed((): PriceLineConfig[] => {
   return lines
 })
 
-function openChart(trade: SimTrade) {
+function openChart(trade: MtfTrade) {
   selectedTrade.value = trade
-  chartTimeframe.value = '1m'
+  chartTimeframe.value = activeTf.value
 }
 
 const showConfig = ref(false)
-const cfg = ref({ startingCapital: 1000, marginPerTrade: 10, targetTP: 'TP1', maxConcurrent: 3, autoEnter: true })
-const tpOptions = [
-  { label: 'TP1 — 1:2 (più sicuro, +3%)', value: 'TP1' },
-  { label: 'TP2 — 1:3 (più aggressivo, +4.5%)', value: 'TP2' },
-]
+const cfg = ref({ startingCapital: 500, marginPerTrade: 10, maxConcurrent: 3, autoEnter: true })
 
 // ─── Price Ladder SVG ─────────────────────────────────────────────────────────
 const PriceLadder = defineComponent({
@@ -552,15 +516,13 @@ const PriceLadder = defineComponent({
       const xClose = props.closePrice != null ? xOf(props.closePrice) : null
 
       const isLong = props.direction === 'LONG'
-
       const [lossX, lossW] = isLong ? [xSl, xEntry - xSl]    : [xEntry, xSl - xEntry]
       const [tp1X,  tp1W]  = isLong ? [xEntry, xTp1 - xEntry] : [xTp1, xEntry - xTp1]
       const [tp2X,  tp2W]  = isLong ? [xTp1, xTp2 - xTp1]    : [xTp2, xTp1 - xTp2]
 
       const dotColor = props.status === 'sl' ? '#ef4444'
         : (props.status === 'tp1' || props.status === 'tp2') ? '#22c55e'
-        : props.status === 'open' ? '#fbbf24'
-        : '#94a3b8'
+        : props.status === 'open' ? '#fbbf24' : '#94a3b8'
 
       const slPct  = ((Math.abs(props.entry - props.sl)  / props.entry) * 100).toFixed(2)
       const tp1Pct = ((Math.abs(props.tp1 - props.entry) / props.entry) * 100).toFixed(2)
@@ -568,7 +530,6 @@ const PriceLadder = defineComponent({
 
       const gLoss = `gl${uid}`, gTp1 = `gt1${uid}`, gTp2 = `gt2${uid}`, gGlow = `gg${uid}`
 
-      // Gradient stops — all x1=0%→x2=100%; direction encoded in stop opacities
       const lossStops = isLong
         ? [['0%', '#ef4444', '0.42'], ['100%', '#ef4444', '0.04']]
         : [['0%', '#ef4444', '0.04'], ['100%', '#ef4444', '0.42']]
@@ -586,74 +547,44 @@ const PriceLadder = defineComponent({
           )
         )
 
-      return h('svg', {
-        width: W, height: H,
-        style: 'display:block; overflow:visible; flex-shrink:0',
-      }, [
-        // ── Defs: gradients + glow filter ────────────────────────────────────
+      return h('svg', { width: W, height: H, style: 'display:block; overflow:visible; flex-shrink:0' }, [
         h('defs', {}, [
-          mkGrad(gLoss, lossStops),
-          mkGrad(gTp1,  tp1Stops),
-          mkGrad(gTp2,  tp2Stops),
+          mkGrad(gLoss, lossStops), mkGrad(gTp1, tp1Stops), mkGrad(gTp2, tp2Stops),
           h('filter', { id: gGlow, x: '-80%', y: '-80%', width: '260%', height: '260%' }, [
             h('feGaussianBlur', { 'in': 'SourceGraphic', stdDeviation: '4', result: 'blur' }),
-            h('feMerge', {}, [
-              h('feMergeNode', { in: 'blur' }),
-              h('feMergeNode', { in: 'SourceGraphic' }),
-            ]),
+            h('feMerge', {}, [h('feMergeNode', { in: 'blur' }), h('feMergeNode', { in: 'SourceGraphic' })]),
           ]),
         ]),
-
-        // ── Track background ─────────────────────────────────────────────────
         h('rect', { x: pad, y: barY, width: innerW, height: barH, rx: 5, fill: '#111827', stroke: '#1e3a5f', 'stroke-width': '0.5' }),
-
-        // ── Zone fills ───────────────────────────────────────────────────────
         lossW > 0 && h('rect', { x: lossX, y: barY, width: lossW, height: barH, fill: `url(#${gLoss})` }),
         tp1W  > 0 && h('rect', { x: tp1X,  y: barY, width: tp1W,  height: barH, fill: `url(#${gTp1})` }),
         tp2W  > 0 && h('rect', { x: tp2X,  y: barY, width: tp2W,  height: barH, fill: `url(#${gTp2})` }),
-
-        // Track border on top of zone fills
         h('rect', { x: pad, y: barY, width: innerW, height: barH, rx: 5, fill: 'none', stroke: '#1e3a5f', 'stroke-width': '0.5' }),
-
-        // ── Tick SL ──────────────────────────────────────────────────────────
         h('line', { x1: xSl, x2: xSl, y1: barY + 2, y2: barY + barH - 2, stroke: '#f87171', 'stroke-width': 1.5 }),
         h('text', { x: xSl, y: labelY, 'text-anchor': 'middle', fill: '#f87171', 'font-size': 8.5, 'font-family': 'ui-monospace,monospace', 'font-weight': '600' }, 'SL'),
         h('text', { x: xSl, y: pctY,   'text-anchor': 'middle', fill: '#f8717170', 'font-size': 7, 'font-family': 'ui-monospace,monospace' }, `-${slPct}%`),
-
-        // ── Tick Entry ───────────────────────────────────────────────────────
         h('line', { x1: xEntry, x2: xEntry, y1: barY - 4, y2: barY + barH + 4, stroke: '#e2e8f0', 'stroke-width': 2 }),
         h('text', { x: xEntry, y: labelY, 'text-anchor': 'middle', fill: '#e2e8f0', 'font-size': 8.5, 'font-family': 'ui-monospace,monospace', 'font-weight': '700' }, 'ENT'),
-
-        // ── Tick TP1 ─────────────────────────────────────────────────────────
         h('line', { x1: xTp1, x2: xTp1, y1: barY + 2, y2: barY + barH - 2, stroke: '#4ade80', 'stroke-width': 1.5, 'stroke-dasharray': '3,2' }),
         h('text', { x: xTp1, y: labelY, 'text-anchor': 'middle', fill: '#4ade80', 'font-size': 8.5, 'font-family': 'ui-monospace,monospace', 'font-weight': '600' }, 'TP1'),
         h('text', { x: xTp1, y: pctY,   'text-anchor': 'middle', fill: '#4ade8070', 'font-size': 7, 'font-family': 'ui-monospace,monospace' }, `+${tp1Pct}%`),
-
-        // ── Tick TP2 ─────────────────────────────────────────────────────────
         h('line', { x1: xTp2, x2: xTp2, y1: barY + 2, y2: barY + barH - 2, stroke: '#22c55e', 'stroke-width': 1.5 }),
         h('text', { x: xTp2, y: labelY, 'text-anchor': 'middle', fill: '#22c55e', 'font-size': 8.5, 'font-family': 'ui-monospace,monospace', 'font-weight': '600' }, 'TP2'),
         h('text', { x: xTp2, y: pctY,   'text-anchor': 'middle', fill: '#22c55e70', 'font-size': 7, 'font-family': 'ui-monospace,monospace' }, `+${tp2Pct}%`),
-
-        // ── Current price / close dot ─────────────────────────────────────────
         xClose != null && h('circle', {
           cx: xClose, cy: barY + barH / 2,
           r: props.status === 'open' ? 6.5 : 5.5,
-          fill: dotColor,
-          stroke: '#fff',
-          'stroke-width': 1.5,
+          fill: dotColor, stroke: '#fff', 'stroke-width': 1.5,
           filter: props.status === 'open' ? `url(#${gGlow})` : undefined,
         }),
-        // Inner white dot on live price
         xClose != null && props.status === 'open' && h('circle', {
-          cx: xClose, cy: barY + barH / 2,
-          r: 2.5, fill: '#ffffffcc',
+          cx: xClose, cy: barY + barH / 2, r: 2.5, fill: '#ffffffcc',
         }),
       ])
     }
   },
 })
 
-// Tiny equity chart component
 const EquityMiniChart = defineComponent({
   props: { curve: Array, start: Number },
   setup(props) {
@@ -686,11 +617,31 @@ const EquityMiniChart = defineComponent({
   },
 })
 
-// ─── Trade list helpers ───────────────────────────────────────────────────────
+const StatusBadge = defineComponent({
+  name: 'StatusBadge',
+  props: { status: { type: String, required: true } },
+  setup(props) {
+    return () => {
+      const map: Record<string, { cls: string; label: string }> = {
+        open:   { cls: 'bg-yellow-400/10 text-yellow-300 border-yellow-400/20',        label: '● Aperto'  },
+        tp1:    { cls: 'bg-green-500/15 text-green-300 border-green-500/25 font-bold', label: '✓ TP1'    },
+        tp2:    { cls: 'bg-green-400/15 text-green-200 border-green-400/30 font-bold', label: '✓ TP2'    },
+        sl:     { cls: 'bg-red-500/15 text-red-400 border-red-500/25 font-bold',       label: '✗ SL'     },
+        manual: { cls: 'bg-gray-500/10 text-gray-500 border-gray-500/20',              label: '— Chiuso' },
+      }
+      const c = map[props.status] ?? map.manual
+      return h('span', {
+        class: `inline-flex items-center text-[10px] font-mono px-2 py-0.5 rounded-full border ${c.cls}`,
+      }, c.label)
+    }
+  },
+})
 
-const tradeOpenCount = computed(() => store.trades.filter(t => t.status === 'open').length)
-const tradeTpCount   = computed(() => store.trades.filter(t => t.status === 'tp1' || t.status === 'tp2').length)
-const tradeSlCount   = computed(() => store.trades.filter(t => t.status === 'sl').length)
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const tradeOpenCount = computed(() => currentTrades.value.filter(t => t.status === 'open').length)
+const tradeTpCount   = computed(() => currentTrades.value.filter(t => t.status === 'tp1' || t.status === 'tp2').length)
+const tradeSlCount   = computed(() => currentTrades.value.filter(t => t.status === 'sl').length)
 
 function tradeRowBg(status: string) {
   if (status === 'tp1' || status === 'tp2') return 'bg-green-950/20 border-green-500/10 hover:border-green-500/20'
@@ -699,15 +650,13 @@ function tradeRowBg(status: string) {
   return 'bg-slate-900/30 border-white/5'
 }
 
-function tradeProgress(trade: any): number {
+function tradeProgress(trade: MtfTrade): number {
   if (trade.status !== 'open') return 0
-  const entry  = trade.entry as number
-  const tp1    = trade.takeProfit1 as number
-  const curP   = trade.currentPrice as number | null
-  if (!curP || !entry || !tp1) return 0
-  const dir = trade.direction === 'LONG' ? 1 : -1
-  const done   = (curP - entry) * dir
-  const needed = Math.abs(tp1 - entry)
+  const curP = trade.currentPrice
+  if (!curP) return 0
+  const dir    = trade.direction === 'LONG' ? 1 : -1
+  const done   = (curP - trade.entry) * dir
+  const needed = Math.abs(trade.takeProfit1 - trade.entry)
   if (needed <= 0) return 0
   return Math.max(-50, Math.min(110, (done / needed) * 100))
 }
@@ -722,33 +671,11 @@ function timeAgo(dateStr: string): string {
   return `${hr}h ${m % 60}m fa`
 }
 
-// Status badge component
-const StatusBadge = defineComponent({
-  name: 'StatusBadge',
-  props: { status: { type: String, required: true } },
-  setup(props) {
-    return () => {
-      const map: Record<string, { cls: string; label: string }> = {
-        open:   { cls: 'bg-yellow-400/10 text-yellow-300 border-yellow-400/20',         label: '● Aperto'  },
-        tp1:    { cls: 'bg-green-500/15 text-green-300 border-green-500/25 font-bold',  label: '✓ TP1'    },
-        tp2:    { cls: 'bg-green-400/15 text-green-200 border-green-400/30 font-bold',  label: '✓ TP2'    },
-        sl:     { cls: 'bg-red-500/15 text-red-400 border-red-500/25 font-bold',        label: '✗ SL'     },
-        manual: { cls: 'bg-gray-500/10 text-gray-500 border-gray-500/20',               label: '— Chiuso' },
-      }
-      const c = map[props.status] ?? map.manual
-      return h('span', {
-        class: `inline-flex items-center text-[10px] font-mono px-2 py-0.5 rounded-full border ${c.cls}`,
-      }, c.label)
-    }
-  },
-})
-
 function gradeBadge(grade: string) {
   return { 'A+': 'bg-yellow-400 text-black', 'A': 'bg-yellow-400/70 text-black', 'B': 'bg-blue-400/30 text-blue-300', 'C': 'bg-gray-500/20 text-gray-400' }[grade] ?? 'bg-gray-500/20 text-gray-400'
 }
 
-
-function formatPrice(p: number) {
+function formatPrice(p: number | undefined) {
   if (!p) return '—'
   if (p < 0.01) return p.toFixed(6)
   if (p < 1)    return p.toFixed(4)
@@ -756,32 +683,45 @@ function formatPrice(p: number) {
 }
 
 async function saveConfig() {
-  await store.updateConfig(cfg.value)
+  await store.updateConfig(activeTf.value, cfg.value)
   showConfig.value = false
   toast.add({ severity: 'success', summary: 'Config salvata', life: 2000 })
 }
 
 function confirmReset() {
   confirm.require({
-    message: 'Cancellare tutti i trade simulati e resettare il capitale?',
+    message: `Cancellare tutti i trade simulati (${activeTf.value}) e resettare il capitale?`,
     header: 'Reset simulazione',
     icon: 'pi pi-exclamation-triangle',
     rejectProps: { label: 'Annulla', severity: 'secondary', text: true },
     acceptProps: { label: 'Reset', severity: 'danger' },
     accept: async () => {
-      await store.reset()
-      toast.add({ severity: 'info', summary: 'Simulazione resettata', life: 2000 })
+      await store.reset(activeTf.value)
+      toast.add({ severity: 'info', summary: `Sim ${activeTf.value} resettata`, life: 2000 })
     },
   })
 }
 
+async function loadTf(tf: Tf) {
+  isLoading.value = true
+  try {
+    await Promise.all([store.fetchAnalytics(tf), store.fetchTrades(tf)])
+    if (store.analytics[tf]?.config) Object.assign(cfg.value, store.analytics[tf]!.config)
+  } finally {
+    isLoading.value = false
+  }
+}
+
+watch(activeTf, (tf) => { void loadTf(tf) })
+
 let refreshTimer: ReturnType<typeof setInterval>
 
 onMounted(async () => {
-  await Promise.all([store.fetchAnalytics(), store.fetchTrades()])
-  if (a.value?.config) Object.assign(cfg.value, a.value.config)
-  // Fallback poll silenzioso — il WebSocket è il canale primario, questo è backup
-  refreshTimer = setInterval(() => store.refreshAnalytics(), 10_000)
+  await loadTf(activeTf.value)
+  refreshTimer = setInterval(() => {
+    void store.refreshAnalytics(activeTf.value)
+    void store.fetchTrades(activeTf.value)
+  }, 30_000)
 })
 
 onUnmounted(() => {

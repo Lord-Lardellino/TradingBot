@@ -54,6 +54,18 @@ const router = createRouter({
           meta: { title: 'Pump Scanner' },
         },
         {
+          path: 'mtf-scanner',
+          name: 'mtf-scanner',
+          component: () => import('@/pages/MtfScanner.vue'),
+          meta: { title: 'Multi-TF Scanner' },
+        },
+        {
+          path: 'mtf-sim',
+          name: 'mtf-sim',
+          component: () => import('@/pages/MtfSimReport.vue'),
+          meta: { title: 'Simulazione MTF' },
+        },
+        {
           path: 'intraday',
           name: 'intraday',
           component: () => import('@/pages/Intraday.vue'),

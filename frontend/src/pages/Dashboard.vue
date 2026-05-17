@@ -20,7 +20,7 @@
         <div class="text-xs text-gray-500 mb-1">Total PnL</div>
         <div
           class="text-2xl font-bold font-mono"
-          :class="(dashSummary?.trades?.totalPnl ?? 0) >= 0 ? 'profit' : 'loss'"
+          :class="(dashSummary?.trades?.totalPnl ?? 0) >= 0 ? 'text-profit' : 'text-loss'"
         >
           {{ (dashSummary?.trades?.totalPnl ?? 0) >= 0 ? '+' : '' }}${{ dashSummary?.trades?.totalPnl?.toFixed(2) ?? '0.00' }}
         </div>
@@ -30,7 +30,7 @@
         <div class="text-xs text-gray-500 mb-1">Win Rate</div>
         <div
           class="text-2xl font-bold"
-          :class="(dashSummary?.trades?.winRate ?? 0) >= 50 ? 'profit' : 'loss'"
+          :class="(dashSummary?.trades?.winRate ?? 0) >= 50 ? 'text-profit' : 'text-loss'"
         >
           {{ dashSummary?.trades?.winRate?.toFixed(1) ?? '—' }}%
         </div>

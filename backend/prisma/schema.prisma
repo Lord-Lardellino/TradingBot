@@ -186,6 +186,43 @@ model LiveConfig {
   updatedAt       DateTime @updatedAt
 }
 
+// ── Multi-TF Scanner — ERB v7 su 5m / 15m / 1h ──────────────────────────────
+
+model MtfSimulatedTrade {
+  id            String    @id
+  tf            String    // "5m" | "15m" | "1h"
+  symbol        String
+  direction     String    // LONG | SHORT
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  takeProfit2   Float
+  leverage      Int
+  marginEur     Float
+  positionSize  Float
+  riskEur       Float
+  grade         String
+  score         Int
+  status        String    @default("open") // open | tp1 | tp2 | sl | manual
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model MtfSimConfig {
+  id              Int      @id @default(autoincrement())
+  tf              String   @unique
+  startingCapital Float    @default(500)
+  marginPerTrade  Float    @default(10)
+  maxConcurrent   Int      @default(3)
+  autoEnter       Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+}
+
 // ── Intraday 4H — PHR v1 (Pump-Halt-Retest) ──────────────────────────────────
 
 model IntraSimulatedTrade {

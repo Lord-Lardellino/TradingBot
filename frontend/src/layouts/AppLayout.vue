@@ -16,17 +16,23 @@
       </div>
 
       <!-- Nav -->
-      <nav class="flex-1 px-3 py-4 space-y-1">
-        <RouterLink
-          v-for="item in navItems"
-          :key="item.to"
-          :to="item.to"
-          class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-400 hover:text-white hover:bg-surface-200 transition-colors"
-          active-class="!text-white !bg-surface-200 border border-white/10"
-        >
-          <i :class="['pi', item.icon, 'text-base']" />
-          {{ item.label }}
-        </RouterLink>
+      <nav class="flex-1 px-3 py-4 space-y-0.5 overflow-y-auto">
+        <template v-for="item in navItems" :key="item.to ?? item.section">
+          <!-- Section separator -->
+          <div v-if="item.section" class="pt-3 pb-1 px-2">
+            <span class="text-[10px] font-semibold uppercase tracking-widest text-gray-600">{{ item.section }}</span>
+          </div>
+          <!-- Nav link -->
+          <RouterLink
+            v-else
+            :to="item.to!"
+            class="flex items-center gap-3 px-3 py-2 rounded-lg text-sm text-gray-400 hover:text-white hover:bg-surface-200 transition-colors"
+            active-class="!text-white !bg-surface-200 border border-white/10"
+          >
+            <i :class="['pi', item.icon, 'text-base']" />
+            {{ item.label }}
+          </RouterLink>
+        </template>
       </nav>
 
       <!-- Connection status -->
@@ -52,15 +58,23 @@ import { useSocket } from '@/composables/useSocket'
 
 const { connected } = useSocket()
 
-const navItems = [
-  { to: '/dashboard',  icon: 'pi-home',          label: 'Dashboard' },
-  { to: '/brain',      icon: 'pi-microchip-ai',  label: 'AI Brain' },
-  { to: '/live',       icon: 'pi-dollar',        label: 'Live Trading' },
-  { to: '/scanner',    icon: 'pi-bell',          label: 'Scalping VCB' },
-  { to: '/simulation', icon: 'pi-chart-line',    label: 'Sim Scalping' },
-  { to: '/intraday',   icon: 'pi-chart-bar',     label: 'Intraday 4H' },
-  { to: '/bots',       icon: 'pi-android',       label: 'Bot Manager' },
-  { to: '/trades',     icon: 'pi-list',          label: 'Trade History' },
-  { to: '/settings',   icon: 'pi-cog',           label: 'Settings' },
+const navItems: { to?: string; icon?: string; label?: string; section?: string }[] = [
+  { to: '/dashboard',    icon: 'pi-home',         label: 'Dashboard' },
+  { to: '/brain',        icon: 'pi-microchip-ai', label: 'AI Brain' },
+  { to: '/live',         icon: 'pi-dollar',       label: 'Live Trading' },
+
+  { section: 'Scalping 1m' },
+  { to: '/scanner',      icon: 'pi-bell',         label: 'ERB Scanner' },
+  { to: '/simulation',   icon: 'pi-chart-line',   label: 'Simulazione 1m' },
+
+  { section: 'Multi Timeframe' },
+  { to: '/mtf-scanner',  icon: 'pi-objects-column', label: '5m · 15m · 1h' },
+  { to: '/mtf-sim',      icon: 'pi-chart-line',     label: 'Sim MTF' },
+
+  { section: 'Altro' },
+  { to: '/intraday',     icon: 'pi-chart-bar',    label: 'Intraday 4H' },
+  { to: '/bots',         icon: 'pi-android',      label: 'Bot Manager' },
+  { to: '/trades',       icon: 'pi-list',         label: 'Trade History' },
+  { to: '/settings',     icon: 'pi-cog',          label: 'Settings' },
 ]
 </script>

@@ -7,6 +7,7 @@ import { useScannerStore } from '@/stores/scanner'
 import { useSimulationStore } from '@/stores/simulation'
 import { useLiveStore } from '@/stores/live'
 import { useIntraStore } from '@/stores/intra'
+import { useMtfScannerStore } from '@/stores/mtf-scanner'
 import { useSound } from '@/composables/useSound'
 
 let socket: Socket | null = null
@@ -81,6 +82,22 @@ export function useSocket() {
 
     socket.on('intra:positions', (data: any[]) => {
       useIntraStore().updatePositions(data)
+    })
+
+    socket.on('mtf:signal', (data: any) => {
+      useMtfScannerStore().addLive(data)
+    })
+
+    socket.on('mtf:status', (data: any) => {
+      useMtfScannerStore().updateStatus(data)
+    })
+
+    socket.on('mtf:trade', (data: any) => {
+      useMtfScannerStore().addLiveTrade(data)
+    })
+
+    socket.on('mtf:positions', (data: any[]) => {
+      useMtfScannerStore().updatePositions(data)
     })
   }
 
