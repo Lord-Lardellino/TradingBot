@@ -38,14 +38,18 @@ export interface ScannerSignal {
   vwapAbove: boolean;
   atr14Pct: number;
   rsiAboveSignal: boolean;
+  sparkline: { t: number; o: number; h: number; l: number; c: number }[];
+  ema34spark: number[];
 }
 
 // ─── Costanti ─────────────────────────────────────────────────────────────────
-const MIN_VOLUME_24H = 150_000;
-const TOP_CANDIDATES = 60;
-const CANDLES_5M     = 80;   // EMA34 su 5m stabilizzata con 47+ candle
-const CANDLES_1M     = 80;   // finestra di analisi 1m
-const MAX_SL_PCT     = 0.80;
+const MIN_VOLUME_24H  = 10_000_000;  // liquidità reale: spread bassi, slippage contenuto
+const TOP_CANDIDATES  = 200;          // per ciclo: ruota su tutti via shuffle
+const CANDLES_5M      = 80;
+const CANDLES_1M      = 80;
+const FIXED_SL_PCT    = 0.50;  // SL fisso: ~€0.50 loss su A+ (10x, €100 pos)
+const FIXED_TP1_PCT   = 1.00;  // TP1 fisso: ~€1.00 gain — 1:2 RR garantito
+const FIXED_TP2_PCT   = 1.50;  // TP2 fisso: 1:3 RR
 const SIGNAL_COOLDOWN = 300_000;
 const MAX_LONG_CYCLE  = 3;
 const MAX_SHORT_CYCLE = 3;
@@ -63,6 +67,7 @@ export class ScannerService implements OnModuleInit {
 
   private p: BrainParams = { ...BRAIN_DEFAULTS, enabled: false, lastAnalysisAt: null, lastWinRate: null, totalAnalyses: 0 };
   private dbg: Record<string, number> = {};
+  private diagSample: string | null = null;
   private lastRawSignals = 0;
   private lastEmitted    = 0;
 
@@ -110,18 +115,21 @@ export class ScannerService implements OnModuleInit {
         this.simulation.getOpenSymbols(),
       ]);
 
-      const candidates = Object.values(tickers)
-        .filter(
-          (t) =>
-            this.validFuturesSymbols.has(t.symbol) &&
-            (t.quoteVolume ?? 0) >= MIN_VOLUME_24H &&
-            !openSymbols.has(t.symbol),
-        )
-        .sort((a, b) => (b.quoteVolume ?? 0) - (a.quoteVolume ?? 0))
-        .slice(0, TOP_CANDIDATES);
+      // Pool qualificato: volume solido + nessuna posizione aperta
+      const qualifiedPool = Object.values(tickers).filter(
+        (t) =>
+          this.validFuturesSymbols.has(t.symbol) &&
+          (t.quoteVolume ?? 0) >= MIN_VOLUME_24H &&
+          !openSymbols.has(t.symbol),
+      );
+      // Shuffle per ruotare tra tutti i pair qualificati ad ogni ciclo
+      // (evita di analizzare sempre le stesse 200 coppie top-volume)
+      const shuffled = qualifiedPool.slice().sort(() => Math.random() - 0.5);
+      const candidates = shuffled.slice(0, TOP_CANDIDATES);
 
       this.scannedCount = this.validFuturesSymbols.size;
       this.dbg = {};
+      this.diagSample = null;
 
       const cycleSignals: ScannerSignal[] = [];
       for (const ticker of candidates) {
@@ -129,8 +137,11 @@ export class ScannerService implements OnModuleInit {
         if (sig) cycleSignals.push(sig);
         await new Promise((r) => setTimeout(r, 50));
       }
-      const dbgStr = Object.entries(this.dbg).map(([k,v]) => `${k}:${v}`).join(' | ');
-      this.logger.log(`[VCB debug] ${dbgStr || 'no rejections logged'}`);
+      const dbgStr = Object.entries(this.dbg)
+        .filter(([k]) => !k.startsWith('_'))
+        .map(([k,v]) => `${k}:${v}`).join(' | ');
+      this.logger.log(`[ERB debug] rejected=${Object.values(this.dbg).filter((_, i) => !Object.keys(this.dbg)[i].startsWith('_')).reduce((a,b)=>a+(b as number),0)} | ${dbgStr || 'no rejections'} | maxScore:${this.dbg['_max']??0}`);
+      if (this.diagSample) this.logger.log(`[ERB diag] ${this.diagSample}`);
 
       // Brain in modalità pausa: scanner continua a girare ma non entra in trade
       if (this.p.mode === 'paused') {
@@ -190,17 +201,27 @@ export class ScannerService implements OnModuleInit {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // STRATEGIA: "Volatility Contraction Breakout" (VCB v1) — 2026-05-14
+  // STRATEGIA: "EMA34 Rebound" (ERB v7) — 2026-05-16
   //
-  //   Pre-pump/dump detection via squeeze:
-  //   1. Mercato si comprime (6 candle con range e volume calanti)
-  //   2. Breakout esplosivo fuori dalla zona di compressione
-  //      con volume ≥ 2× media e corpo ≥ 40% (non un doji)
-  //   3. EMA34 su 5m per conferma trend (scoring bonus)
-  //   4. Entry entro 0.25% dal close del breakout — zero chase
-  //   5. SL appena fuori dalla zona di compressione, TP = squeeze height × 1.8
+  //   Principio: SOLO EMA34 + price action. Nessun RSI, MACD, volume come filtro.
+  //   Il prezzo tocca l'EMA34 e rimbalza nella direzione del trend.
   //
-  //   Simmetrico LONG/SHORT — opera su futures — time exit 3 min.
+  //   FILTRI (tutti basati su EMA34 e candele):
+  //   1. Lateral: max 2 crossings EMA34 in 20 candle → mercato laterale = no
+  //   2. Trend: EMA34 slope > 0.075% (6c) → pendenza marcata obbligatoria
+  //   3. Prossimità: LONG [-0.25%, +0.45%] / SHORT [-0.45%, +0.25%] da EMA34
+  //      (range allineato all'SL fisso: SL è sempre dall'altra parte dell'EMA34)
+  //   4. Touch: wick di una delle 3 candle recenti ha toccato EMA34
+  //   5. SL/TP fissi: SL 0.50% + TP1 1.00% (sempre 1:2 RR) → ~-€0.50/+€1.00
+  //   6. Dir: candle trigger (n-2) chiude nella direzione del trade
+  //   7. Body: corpo >= 30% → no doji / spinning top
+  //   8. Trig dist: close del trigger entro 0.35% da EMA34 (no ingressi tardivi)
+  //
+  //   SCORING (grade: A+ ≥62, A ≥50, B ≥38, C <38 — max 72 pts):
+  //   • Slope EMA34          → 8-20 pts
+  //   • Distanza entry-EMA34 → 5-25 pts  ← fattore principale
+  //   • Wick verso EMA34     → 5-15 pts
+  //   • Corpo candle         → 6-12 pts
   // ═══════════════════════════════════════════════════════════════════════════
 
   private async analyzePair(ticker: ccxt.Ticker): Promise<ScannerSignal | null> {
@@ -212,7 +233,9 @@ export class ScannerService implements OnModuleInit {
         this.exchange.fetchOHLCV(sym, '1m', undefined, CANDLES_1M),
       ]);
 
-      if (raw5m.length < 40 || raw1m.length < 35) { this.dbg['L0_no_data'] = (this.dbg['L0_no_data'] ?? 0) + 1; return null; }
+      if (raw5m.length < 40 || raw1m.length < 40) {
+        this.dbg['L0_no_data'] = (this.dbg['L0_no_data'] ?? 0) + 1; return null;
+      }
 
       const o1 = raw1m.map(c => c[1] as number);
       const h1 = raw1m.map(c => c[2] as number);
@@ -221,181 +244,135 @@ export class ScannerService implements OnModuleInit {
       const v1 = raw1m.map(c => c[5] as number);
       const c5 = raw5m.map(c => c[4] as number);
 
-      const entry = ticker.last ?? c1.at(-1)!;
       const n     = c1.length;
+      const entry = ticker.last ?? c1.at(-1)!;
 
-      // Index layout (1m):
-      //   n-1 = candle live (in formazione) — entry = ticker.last
-      //   n-2 = BREAKOUT TRIGGER (ultimo candle chiuso)
-      //   [n-2-SQZ_WINDOW .. n-3] = SQUEEZE WINDOW (6 candle)
-      //   [REF_START .. SQZ_START-1] = finestra di riferimento (fino a 20 candle)
+      // ─── EMA34 su 1m ─────────────────────────────────────────────────────
+      const ema34arr = this.indicators.emaArray(c1, 34);
+      const ema_n2   = ema34arr.at(-2)!;
+      const ema_n8   = ema34arr.at(-8)!;
 
-      const SQZ_END   = n - 2;                   // esclusivo — finisce prima del trigger
-      const SQZ_START = SQZ_END - SQZ_WINDOW;    // n-8 (incluso)
-      const REF_END   = SQZ_START;
-      const REF_START = Math.max(0, REF_END - 20);
-
-      if (SQZ_START < 1 || REF_START >= REF_END) return null;
-
-      // ─── Finestra di riferimento (20 candle prima dello squeeze) ─────────
-      let refSumRange = 0, refSumVol = 0;
-      const refLen = REF_END - REF_START;
-      for (let i = REF_START; i < REF_END; i++) {
-        refSumRange += h1[i] - l1[i];
-        refSumVol   += v1[i];
+      // ─── FILTRO 1: LATERAL ────────────────────────────────────────────────
+      // Prezzo che oscilla ripetutamente sull'EMA34 = mercato laterale = scarto.
+      // Un rimbalzo valido genera 1-2 crossing al massimo.
+      let crossings = 0;
+      for (let j = 2; j <= 20; j++) {
+        const prevAbove = c1[n - j - 1] > ema34arr[n - j - 1];
+        const currAbove = c1[n - j]     > ema34arr[n - j];
+        if (prevAbove !== currAbove) crossings++;
       }
-      const refAvgRange = refSumRange / refLen;
-      const refAvgVol   = refSumVol   / refLen;
+      // Un bounce valido genera max 2 crossing (scende a EMA, risale). >= 3 = oscillazione laterale.
+      if (crossings >= 3) { this.dbg['F1_lateral'] = (this.dbg['F1_lateral'] ?? 0) + 1; return null; }
 
-      // ─── LAYER 1: SQUEEZE QUALITY ─────────────────────────────────────────
-      // La zona di compressione deve essere significativamente più stretta
-      // e silenziosa della finestra di riferimento.
-
-      const sqzHighs = h1.slice(SQZ_START, SQZ_END);
-      const sqzLows  = l1.slice(SQZ_START, SQZ_END);
-      const sqzVols  = v1.slice(SQZ_START, SQZ_END);
-
-      const sqzZoneHigh = Math.max(...sqzHighs);
-      const sqzZoneLow  = Math.min(...sqzLows);
-      const sqzZoneRange = sqzZoneHigh - sqzZoneLow;
-
-      let sqzSumRange = 0, sqzSumVol = 0;
-      for (let i = 0; i < SQZ_WINDOW; i++) {
-        sqzSumRange += sqzHighs[i] - sqzLows[i];
-        sqzSumVol   += sqzVols[i];
+      // ─── FILTRO 2: TREND EMA34 (slope 6 candle) ──────────────────────────
+      // EMA34 deve essere decisamente direzionata. Soglia 0.075%: esclude trend piatti
+      // come il cerchio rosso, richiede la pendenza marcata delle frecce verdi.
+      const slopePct   = (ema_n2 - ema_n8) / ema_n8 * 100;
+      const trendLong  = slopePct >  0.075;
+      const trendShort = slopePct < -0.075;
+      if (!trendLong && !trendShort) {
+        this.dbg['F1_flat'] = (this.dbg['F1_flat'] ?? 0) + 1; return null;
       }
-      const sqzAvgRange = sqzSumRange / SQZ_WINDOW;
-      const sqzAvgVol   = sqzSumVol   / SQZ_WINDOW;
 
-      // Rapporto zona squeeze vs candle di riferimento
-      const sqzZoneRel  = refAvgRange > 0 ? sqzZoneRange / refAvgRange : 999;
-      const sqzRangeRat = refAvgRange > 0 ? sqzAvgRange  / refAvgRange : 1;
-      const sqzVolRat   = refAvgVol   > 0 ? sqzAvgVol    / refAvgVol   : 1;
-
-      if (sqzZoneRel  >= 5.0) { this.dbg['L1_no_sqz']  = (this.dbg['L1_no_sqz']  ?? 0) + 1; return null; }
-      if (sqzRangeRat >= 0.90) { this.dbg['L1_no_comp'] = (this.dbg['L1_no_comp'] ?? 0) + 1; return null; }
-      if (sqzVolRat   >= 0.95) { this.dbg['L1_vol_hi']  = (this.dbg['L1_vol_hi']  ?? 0) + 1; return null; }
-
-      // ─── LAYER 2: BREAKOUT TRIGGER (n-2, ultimo candle chiuso) ──────────
-      // Deve rompere FUORI dalla zona di compressione con volume esplosivo.
-
-      const trigO   = o1[n - 2], trigC = c1[n - 2];
-      const trigH   = h1[n - 2], trigL = l1[n - 2];
-      const trigVol = v1[n - 2];
-
-      const brkLong  = trigC > sqzZoneHigh;
-      const brkShort = trigC < sqzZoneLow;
-      if (!brkLong && !brkShort) { this.dbg['L2_no_brk'] = (this.dbg['L2_no_brk'] ?? 0) + 1; return null; }
-
-      const isLong    = brkLong;
+      const isLong    = trendLong;
       const direction: 'LONG' | 'SHORT' = isLong ? 'LONG' : 'SHORT';
 
       const allowedDirs = (this.p.allowedDirections ?? 'LONG,SHORT').split(',');
       if (!allowedDirs.includes(direction)) return null;
 
-      // Candle direzionale (verde per LONG, rossa per SHORT)
-      if (isLong  && trigC <= trigO) { this.dbg['L2_dir'] = (this.dbg['L2_dir'] ?? 0) + 1; return null; }
-      if (!isLong && trigC >= trigO) { this.dbg['L2_dir'] = (this.dbg['L2_dir'] ?? 0) + 1; return null; }
+      // ─── FILTRO 3: PROSSIMITÀ EMA34 ───────────────────────────────────────
+      // Con SL fisso 0.50%, il prezzo deve essere entro quel range dall'EMA34:
+      // SL deve atterrare dall'altra parte dell'EMA34 (senso geometrico del bounce).
+      // LONG:  [-0.25%, +0.45%] — price vicino a EMA34, SL sempre sotto EMA34
+      // SHORT: [-0.45%, +0.25%] — price vicino a EMA34, SL sempre sopra EMA34
+      const emaDist    = (entry - ema_n2) / ema_n2 * 100;
+      const emaDistAbs = Math.abs(emaDist);
 
-      // Corpo ≥ 40% del range
-      const trigRange = trigH - trigL;
-      const trigBody  = trigRange > 0 ? Math.abs(trigC - trigO) / trigRange : 0;
-      if (trigBody < 0.40) { this.dbg['L2_body'] = (this.dbg['L2_body'] ?? 0) + 1; return null; }
+      if (!this.diagSample) {
+        this.diagSample = `[pre-F3] ${sym} ${direction} slope=${slopePct.toFixed(3)}% emaDist=${emaDist.toFixed(2)}% cross=${crossings}`;
+      }
 
-      // Volume spike ≥ 2× riferimento (conferma istituzionale)
-      const trigVolR = refAvgVol > 0 ? trigVol / refAvgVol : 1;
-      if (trigVolR < 2.0) { this.dbg['L2_vol'] = (this.dbg['L2_vol'] ?? 0) + 1; return null; }
+      if (isLong  && (emaDist < -0.25 || emaDist > 0.45)) {
+        this.dbg['F2_far'] = (this.dbg['F2_far'] ?? 0) + 1; return null;
+      }
+      if (!isLong && (emaDist >  0.25 || emaDist < -0.45)) {
+        this.dbg['F2_far'] = (this.dbg['F2_far'] ?? 0) + 1; return null;
+      }
 
-      // Espansione del range: la candle di breakout deve essere più grande delle squeeze
-      const rangeExp = sqzAvgRange > 0 ? trigRange / sqzAvgRange : 1;
-      if (rangeExp < 1.5) { this.dbg['L2_range'] = (this.dbg['L2_range'] ?? 0) + 1; return null; }
+      // ─── FILTRO 4: WICK → EMA34 ───────────────────────────────────────────
+      // Almeno una delle 3 candle recenti deve aver toccato/lambito l'EMA34.
+      // wickPct < -1.5% = EMA34 neanche sfiorata → non è un vero bounce.
+      const bestLow  = Math.min(l1[n-2], l1[n-3], l1[n-4]);
+      const bestHigh = Math.max(h1[n-2], h1[n-3], h1[n-4]);
+      const wickPct  = isLong
+        ? (ema_n2 - bestLow)  / ema_n2 * 100
+        : (bestHigh - ema_n2) / ema_n2 * 100;
+      if (wickPct < -1.5) { this.dbg['F2_no_touch'] = (this.dbg['F2_no_touch'] ?? 0) + 1; return null; }
 
-      // Anti-chase: prezzo live entro 0.25% dal close del breakout
-      const chaseD = (entry - trigC) / trigC * 100;
-      if (isLong  && chaseD >  0.25) { this.dbg['L2_chase'] = (this.dbg['L2_chase'] ?? 0) + 1; return null; }
-      if (!isLong && chaseD < -0.25) { this.dbg['L2_chase'] = (this.dbg['L2_chase'] ?? 0) + 1; return null; }
-
-      // ─── LAYER 3: INDICATORI ─────────────────────────────────────────────
-
-      const rsi1m    = this.indicators.rsi(c1, 14);
-      if (rsi1m < 25 || rsi1m > 75) { this.dbg['L3_rsi'] = (this.dbg['L3_rsi'] ?? 0) + 1; return null; }
-
+      // ─── SL / TP fissi — RR sempre 1:2 ───────────────────────────────────
+      // SL e TP fissi per ogni trade: perdita e guadagno sempre identici in %.
+      // Per qualità/aggressività si agisce sulla leva, non sullo stop.
       const atr14_1m = this.indicators.atr(h1, l1, c1, 14);
-      const atr1mPct = entry > 0 ? (atr14_1m / entry) * 100 : 0;
-      if (atr1mPct < 0.10) { this.dbg['L3_atr'] = (this.dbg['L3_atr'] ?? 0) + 1; return null; }
+      const atr1mPct = entry > 0 ? atr14_1m / entry * 100 : 0;
+      const slPct    = FIXED_SL_PCT;
+      const tp1Pct   = FIXED_TP1_PCT;
+      const tp2Pct   = FIXED_TP2_PCT;
 
-      const macd1m = this.indicators.macd(c1, 12, 26, 9);
-      const macdOk = isLong
-        ? macd1m.histogram > macd1m.prevHistogram
-        : macd1m.histogram < macd1m.prevHistogram;
+      // Dati del candle n-2 (ultimo chiuso, candle di conferma bounce)
+      const trigO = o1[n - 2], trigC = c1[n - 2];
+      const trigH = h1[n - 2], trigL = l1[n - 2];
 
-      // ─── SL / TP ──────────────────────────────────────────────────────────
-      // SL: appena oltre l'estremità opposta della zona di squeeze + buffer ATR
-      // TP: misurazione classica = altezza squeeze × RR ratio
+      // ─── FILTRO 5: DIREZIONE CANDLE TRIGGER ───────────────────────────────
+      // Il candle di conferma deve chiudere nella direzione del bounce.
+      const trigRange     = trigH - trigL;
+      const trigBody      = trigRange > 0 ? Math.abs(trigC - trigO) / trigRange : 0;
+      const bullishCandle = trigC > trigO;
+      if ( isLong && !bullishCandle) { this.dbg['F3_dir'] = (this.dbg['F3_dir'] ?? 0) + 1; return null; }
+      if (!isLong &&  bullishCandle) { this.dbg['F3_dir'] = (this.dbg['F3_dir'] ?? 0) + 1; return null; }
+      if (trigBody < 0.30) { this.dbg['F3_body'] = (this.dbg['F3_body'] ?? 0) + 1; return null; }
 
-      const atrBuf  = Math.max(atr14_1m * 0.25, entry * 0.001);
-      const rawSlPct = isLong
-        ? (entry - sqzZoneLow  + atrBuf) / entry * 100
-        : (sqzZoneHigh - entry + atrBuf) / entry * 100;
-      const slPct   = Math.max(rawSlPct, this.p.minSlPct);
-      if (slPct > MAX_SL_PCT) { this.dbg['SL_wide'] = (this.dbg['SL_wide'] ?? 0) + 1; return null; }
+      // ─── FILTRO 6: TRIGGER CLOSE VICINO ALL'EMA34 ────────────────────────
+      // La candela di bounce deve essersi chiusa entro 0.35% dall'EMA34.
+      // Con SL fisso 0.50%, se il trigger è già oltre 0.35% il RR è compromesso.
+      const trigCloseDist = (trigC - ema_n2) / ema_n2 * 100;
+      if (isLong  && trigCloseDist > 0.35) { this.dbg['F2_trig_far'] = (this.dbg['F2_trig_far'] ?? 0) + 1; return null; }
+      if (!isLong && trigCloseDist < -0.35) { this.dbg['F2_trig_far'] = (this.dbg['F2_trig_far'] ?? 0) + 1; return null; }
 
-      const tp1Pct = slPct * this.p.tp1Rr;
-      const tp2Pct = slPct * this.p.tp2Rr;
-      if (tp1Pct > 8.0 * atr1mPct) { this.dbg['TP_unreach'] = (this.dbg['TP_unreach'] ?? 0) + 1; return null; }
-
-      // ─── SCORING (max 100 pts) — A+≥70, A≥50, B≥35 ─────────────────────
-
+      // ─── SCORING (basato solo su qualità EMA34 bounce) ────────────────────
       let score = 0;
       const reasons: string[] = [];
 
-      // 1. Tightezza zona squeeze vs candle normali: 6-20 pts
-      if      (sqzZoneRel < 1.0) { score += 20; reasons.push(`Squeeze ultra tight (${sqzZoneRel.toFixed(2)}× ATR)`); }
-      else if (sqzZoneRel < 1.5) { score += 15; reasons.push(`Squeeze tight (${sqzZoneRel.toFixed(2)}×)`); }
-      else if (sqzZoneRel < 2.5) { score += 10; }
+      // 1. Forza trend EMA34 (8-20 pts)
+      const absSlope = Math.abs(slopePct);
+      if      (absSlope > 0.15) { score += 20; reasons.push(`Trend forte ${slopePct.toFixed(3)}%`); }
+      else if (absSlope > 0.09) { score += 15; reasons.push(`Trend ${slopePct.toFixed(3)}%`); }
+      else if (absSlope > 0.06) { score += 12; }
+      else                      { score +=  8; }
+
+      // 2. Prossimità entry → EMA34 (5-25 pts) — più vicino = migliore RR
+      if      (emaDistAbs < 0.10) { score += 25; reasons.push(`EMA34 ${emaDist.toFixed(2)}%`); }
+      else if (emaDistAbs < 0.30) { score += 20; reasons.push(`EMA34 ${emaDist.toFixed(2)}%`); }
+      else if (emaDistAbs < 0.60) { score += 14; }
+      else                        { score +=  7; }
+
+      // 3. Wick verso EMA34 (5-15 pts) — mostra la pressione di rimbalzo
+      if      (wickPct > 0.10) { score += 15; reasons.push(`Wick EMA34 ${wickPct.toFixed(2)}%`); }
+      else if (wickPct > 0)    { score += 12; reasons.push(`Sfiorato EMA34`); }
+      else if (wickPct > -0.30){ score +=  9; }
+      else                     { score +=  5; }
+
+      // 4. Corpo candle trigger (6-12 pts) — già filtrato >= 30%
+      if      (trigBody >= 0.70) { score += 12; reasons.push(`Corpo ${(trigBody*100).toFixed(0)}%`); }
+      else if (trigBody >= 0.50) { score +=  9; reasons.push(`Corpo ${(trigBody*100).toFixed(0)}%`); }
       else                       { score +=  6; }
-
-      // 2. Compressione volume durante squeeze: 6-20 pts
-      if      (sqzVolRat < 0.40) { score += 20; reasons.push(`Vol squeeze forte (${(sqzVolRat*100).toFixed(0)}% avg)`); }
-      else if (sqzVolRat < 0.60) { score += 15; reasons.push(`Vol squeeze (${(sqzVolRat*100).toFixed(0)}%)`); }
-      else if (sqzVolRat < 0.75) { score += 10; }
-      else                       { score +=  6; }
-
-      // 3. Volume spike breakout: 12-25 pts
-      if      (trigVolR >= 5.0) { score += 25; reasons.push(`Breakout vol ×${trigVolR.toFixed(1)} (istituzionale)`); }
-      else if (trigVolR >= 3.5) { score += 20; reasons.push(`Breakout vol ×${trigVolR.toFixed(1)}`); }
-      else if (trigVolR >= 2.5) { score += 15; }
-      else                      { score += 12; }
-
-      // 4. Corpo candle breakout: 4-15 pts
-      if      (trigBody >= 0.80) { score += 15; reasons.push(`Marubozu ${(trigBody*100).toFixed(0)}%`); }
-      else if (trigBody >= 0.65) { score += 11; }
-      else if (trigBody >= 0.50) { score +=  7; }
-      else                       { score +=  4; }
-
-      // 5. EMA34 su 5m — trend alignment bonus: 0-10 pts
-      const ema34_5 = this.indicators.emaArray(c5, 34);
-      const e34_5   = ema34_5.at(-1)!;
-      const aboveEma34 = entry > e34_5;
-      if ((isLong && aboveEma34) || (!isLong && !aboveEma34)) {
-        const distEma34 = Math.abs(entry - e34_5) / e34_5 * 100;
-        if (distEma34 >= 0.20) { score += 10; reasons.push(`EMA34 allineata (${distEma34.toFixed(2)}% away)`); }
-        else                   { score +=  6; }
-      }
-
-      // 6. MACD in direzione breakout: 0-5 pts
-      if (macdOk) { score += 5; reasons.push(`MACD ${isLong ? '↑' : '↓'}`); }
-
-      // 7. RSI in zona neutrale (breakout più affidabile da 40-60): 3-5 pts
-      if (rsi1m >= 40 && rsi1m <= 60) { score += 5; }
-      else                             { score += 3; }
 
       this.dbg['_max'] = Math.max(this.dbg['_max'] ?? 0, score);
+      this.diagSample = `[OK] ${sym} ${direction} slope=${slopePct.toFixed(3)}% emaDist=${emaDist.toFixed(2)}% trigClose=${trigCloseDist.toFixed(2)}% wick=${wickPct.toFixed(2)}% body=${(trigBody*100).toFixed(0)}% cross=${crossings} score=${score}`;
 
       if (score < this.p.minEmitScore) { this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1; return null; }
 
       const grade: ScannerSignal['grade'] =
-        score >= 70 ? 'A+' : score >= 50 ? 'A' : score >= 35 ? 'B' : 'C';
+        score >= 62 ? 'A+' : score >= 50 ? 'A' : score >= 38 ? 'B' : 'C';
       const suggestedLeverage =
         grade === 'A+' ? 10 : grade === 'A' ? 8 : grade === 'B' ? 5 : 3;
 
@@ -403,7 +380,14 @@ export class ScannerService implements OnModuleInit {
       const takeProfit1 = parseFloat((entry * (isLong ? 1 + tp1Pct / 100 : 1 - tp1Pct / 100)).toPrecision(6));
       const takeProfit2 = parseFloat((entry * (isLong ? 1 + tp2Pct / 100 : 1 - tp2Pct / 100)).toPrecision(6));
 
+      // Metriche informative per UI (non usate come filtri)
+      const refVols   = v1.slice(n - 22, n - 2);
+      const refAvgVol = refVols.reduce((a, b) => a + b, 0) / refVols.length;
+      const trigVolR  = refAvgVol > 0 ? v1[n - 2] / refAvgVol : 1;
+      const rsi1m    = this.indicators.rsi(c1, 14);
       const rsi5mVal = this.indicators.rsi(c5, 14);
+      const macd1m   = this.indicators.macd(c1, 12, 26, 9);
+      const macdOk   = isLong ? macd1m.histogram > macd1m.prevHistogram : macd1m.histogram < macd1m.prevHistogram;
       const vwap     = this.calculateDayVwap(raw5m);
 
       return {
@@ -424,8 +408,8 @@ export class ScannerService implements OnModuleInit {
         rsi5m:            parseFloat(rsi5mVal.toFixed(1)),
         rsi15m:           parseFloat(rsi1m.toFixed(1)),
         macdConfirm:      macdOk,
-        emaConfirm:       (isLong && aboveEma34) || (!isLong && !aboveEma34),
-        timeframeConfirm: (isLong && aboveEma34) || (!isLong && !aboveEma34),
+        emaConfirm:       trendLong || trendShort,
+        timeframeConfirm: trendLong || trendShort,
         score,
         grade,
         reasons,
@@ -436,6 +420,14 @@ export class ScannerService implements OnModuleInit {
         vwapAbove:        entry > vwap,
         atr14Pct:         parseFloat(atr1mPct.toFixed(3)),
         rsiAboveSignal:   rsi1m > 50,
+        sparkline:   raw1m.slice(-70).map(c => ({
+          t: c[0] as number,
+          o: c[1] as number,
+          h: c[2] as number,
+          l: c[3] as number,
+          c: c[4] as number,
+        })),
+        ema34spark:  ema34arr.slice(-70),
       };
     } catch {
       this.dbg['L0_error'] = (this.dbg['L0_error'] ?? 0) + 1;

@@ -22,11 +22,11 @@ export interface BrainParams {
 
 export const BRAIN_DEFAULTS: Omit<BrainParams, 'enabled' | 'lastAnalysisAt' | 'lastWinRate' | 'totalAnalyses'> = {
   atrMultSl:         1.5,
-  tp1Rr:             1.8,   // TP1 = 1.8× SL — misurazione squeeze height
-  tp2Rr:             3.0,
-  minSlPct:          0.30,  // SL minimo 0.30% — VCB usa SL strutturale sotto squeeze zone
-  minEma5mSlope:     0.001,
-  minEmitScore:      30,    // soglia bassa: scoring VCB ha floor naturale ~31 pts
+  tp1Rr:             2.0,   // TP1 = 2× SL — ERB v7: SL 0.50% → TP1 1.00%
+  tp2Rr:             3.0,   // TP2 = 3× SL — ERB v7: SL 0.50% → TP2 1.50%
+  minSlPct:          0.50,  // SL fisso ERB v7: ~€0.50 loss su A+ (10×, €100 pos)
+  minEma5mSlope:     0.075, // slope minima EMA34 su 6 candle 1m (0.075%)
+  minEmitScore:      30,    // soglia base: scoring ERB v7 ha floor naturale ~31 pts
   minVolRatio:       1.0,
   enterGrades:       'A+,A,B',
   allowedDirections: 'LONG,SHORT',
@@ -37,17 +37,17 @@ export const BRAIN_DEFAULTS: Omit<BrainParams, 'enabled' | 'lastAnalysisAt' | 'l
 // Bounds assoluti — il brain non può mai uscire da questi range
 const BOUNDS = {
   atrMultSl:     { min: 0.8,  max: 2.0   },
-  tp1Rr:         { min: 1.5,  max: 3.5   },
-  tp2Rr:         { min: 2.0,  max: 5.0   },
-  minSlPct:      { min: 0.20, max: 1.00  },
-  minEma5mSlope: { min: 0.001,max: 0.015 },
+  tp1Rr:         { min: 1.8,  max: 3.5   },
+  tp2Rr:         { min: 2.5,  max: 5.0   },
+  minSlPct:      { min: 0.40, max: 1.00  }, // mai sotto 0.40% — SL fisso ERB v7 è 0.50%
+  minEma5mSlope: { min: 0.050,max: 0.150 }, // range attorno alla soglia corrente 0.075%
   minEmitScore:  { min: 20,   max: 80    },
   minVolRatio:   { min: 0.6,  max: 3.0   },
 };
 
 // ── Soglie di modo ────────────────────────────────────────────────────────────
 const MODE_THRESHOLDS = {
-  paused:       { consec: 7 },
+  paused:       { drawdown: 50 },
   crisis:       { wr10: 28, wr20: 35, drawdown: 10 },
   conservative: { wr20: 44, consec: 4, drawdown: 6  },
   healthy:      { wr20: 58, pf: 1.2  },
@@ -61,6 +61,10 @@ export class AiBrainService {
   private cache: BrainParams | null = null;
   private cacheAt = 0;
   private readonly CACHE_TTL = 30_000;
+
+  // Analizza solo i trade chiusi DOPO questo timestamp.
+  // Si azzera ad ogni toggle(true) o clearAll() — fresh start garantito.
+  private sessionStart = new Date();
 
   constructor(private prisma: PrismaService) {}
 
@@ -82,13 +86,14 @@ export class AiBrainService {
   invalidateCache() { this.cache = null; }
 
   async toggle(enabled: boolean): Promise<BrainParams> {
+    if (enabled) this.sessionStart = new Date();  // fresh start ad ogni attivazione
     const row = await this.prisma.aiParams.upsert({
       where:  { id: 1 },
       create: { id: 1, ...BRAIN_DEFAULTS, enabled },
       update: { enabled },
     });
     this.invalidateCache();
-    this.logger.log(`[Brain] ${enabled ? '🟢 ATTIVATO' : '🔴 DISATTIVATO'}`);
+    this.logger.log(`[Brain] ${enabled ? `🟢 ATTIVATO — analisi da ${this.sessionStart.toISOString()}` : '🔴 DISATTIVATO'}`);
     return row as unknown as BrainParams;
   }
 
@@ -122,6 +127,19 @@ export class AiBrainService {
     return row as unknown as BrainParams;
   }
 
+  async clearAll(): Promise<BrainParams> {
+    this.sessionStart = new Date();  // reset: la prossima analisi parte da zero
+    await this.prisma.aiBrainLog.deleteMany({});
+    const row = await this.prisma.aiParams.upsert({
+      where:  { id: 1 },
+      create: { id: 1, ...BRAIN_DEFAULTS, enabled: false, lastWinRate: null, lastAnalysisAt: null, totalAnalyses: 0 },
+      update: { ...BRAIN_DEFAULTS, lastWinRate: null, lastAnalysisAt: null, totalAnalyses: 0 },
+    });
+    this.invalidateCache();
+    this.logger.log('[Brain] Clear completo: parametri default + storico azzerato');
+    return row as unknown as BrainParams;
+  }
+
   async getLog(limit = 50) {
     return this.prisma.aiBrainLog.findMany({
       orderBy: { createdAt: 'desc' },
@@ -144,16 +162,34 @@ export class AiBrainService {
     const params = await this.getParams();
     if (!params.enabled) return;
 
-    // ── 1. LOAD ────────────────────────────────────────────────────────────
-    const trades = await this.prisma.simulatedTrade.findMany({
-      where:   { status: { not: 'open' } },
+    // ── 1. LOAD — solo trade chiusi DOPO l'attivazione corrente del brain ───
+    const liveClosed = await this.prisma.liveTrade.findMany({
+      where:   { status: { notIn: ['open', 'error'] }, closedAt: { gte: this.sessionStart } },
       orderBy: { closedAt: 'desc' },
       take:    50,
     });
 
-    if (trades.length < 8) {
-      this.logger.debug('[Brain] Dati insufficienti (< 8 trade chiusi)');
-      return;
+    let trades: any[];
+    let dataSource: 'live' | 'simulation';
+
+    if (liveClosed.length >= 8) {
+      trades = liveClosed.map(t => ({
+        ...t,
+        fees:         (t.feesOpen ?? 0) + (t.feesClose ?? 0),
+        capitalAfter: null,
+      }));
+      dataSource = 'live';
+    } else {
+      trades = await this.prisma.simulatedTrade.findMany({
+        where:   { status: { not: 'open' }, closedAt: { gte: this.sessionStart } },
+        orderBy: { closedAt: 'desc' },
+        take:    50,
+      });
+      dataSource = 'simulation';
+      if (trades.length < 8) {
+        this.logger.debug(`[Brain] Dati insufficienti (${trades.length}/8 trade chiusi dalla sessione ${this.sessionStart.toISOString()})`);
+        return;
+      }
     }
 
     // ── 2. METRICS ────────────────────────────────────────────────────────
@@ -204,9 +240,10 @@ export class AiBrainService {
 
     // ── Log ───────────────────────────────────────────────────────────────
     const changeStr = toApply.map(a => `${a.param}: ${a.from}→${a.to}`).join(' | ');
+    const srcTag    = dataSource === 'live' ? '[LIVE]' : '[SIM]';
     const summary   = toApply.length
-      ? `[${mode.toUpperCase()}] WR ${m.winRate20.toFixed(0)}% (↑5m:${m.winRate5.toFixed(0)}%) → ${changeStr}`
-      : `[${mode.toUpperCase()}] WR ${m.winRate20.toFixed(0)}% su ${m.window20} trade — nessuna modifica`;
+      ? `${srcTag} [${mode.toUpperCase()}] WR ${m.winRate20.toFixed(0)}% (↑5m:${m.winRate5.toFixed(0)}%) → ${changeStr}`
+      : `${srcTag} [${mode.toUpperCase()}] WR ${m.winRate20.toFixed(0)}% su ${m.window20} trade — nessuna modifica`;
 
     await this.prisma.aiBrainLog.create({
       data: {
@@ -323,8 +360,8 @@ export class AiBrainService {
   private determineMode(m: ReturnType<typeof this.computeMetrics>): string {
     const T = MODE_THRESHOLDS;
 
-    // 🛑 PAUSED — emergenza massima: perdite seriali devastanti
-    if (m.consecutiveLosses >= T.paused.consec) return 'paused';
+    // 🛑 PAUSED — emergenza massima: 50% del capitale perso dal picco
+    if (m.drawdownPct >= T.paused.drawdown) return 'paused';
 
     // 🚨 CRISIS — performance critica, rischio capitali
     if (
