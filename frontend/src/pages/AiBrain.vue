@@ -19,13 +19,22 @@
           Analizza i trade chiusi ogni 5 min · aggiusta i parametri strategia in autonomia
         </p>
       </div>
-      <Button
-        size="small"
-        icon="pi pi-refresh"
-        severity="secondary"
-        :loading="store.loading"
-        @click="store.fetchAll()"
-      />
+      <div class="flex items-center gap-2">
+        <button
+          class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium text-red-400 hover:text-red-300 hover:bg-red-500/10 border border-red-500/20 transition-colors"
+          @click="confirmClear"
+        >
+          <i class="pi pi-trash text-xs" />
+          Clear Brain
+        </button>
+        <button
+          class="flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-sm text-gray-400 hover:text-white border border-white/8 transition-colors disabled:opacity-40"
+          :disabled="store.loading"
+          @click="store.fetchAll()"
+        >
+          <i class="pi pi-refresh text-xs" :class="{ 'animate-spin': store.loading }" />
+        </button>
+      </div>
     </div>
 
     <!-- ── KILL SWITCH ──────────────────────────────────────────────────── -->
@@ -192,6 +201,8 @@
     </div>
 
   </div>
+
+  <ConfirmDialog />
 </template>
 
 <script setup lang="ts">
@@ -199,6 +210,7 @@ import { ref, computed, onMounted, defineComponent, h, resolveComponent } from '
 import { useBrainStore, DEFAULTS } from '@/stores/aiBrain'
 import type { BrainParams } from '@/stores/aiBrain'
 import { useConfirm } from 'primevue/useconfirm'
+import ConfirmDialog from 'primevue/confirmdialog'
 
 const store   = useBrainStore()
 const confirm = useConfirm()
@@ -285,6 +297,18 @@ function confirmReset() {
     acceptLabel:   'Reset',
     rejectLabel:   'Annulla',
     accept:        () => store.resetDefaults(),
+  })
+}
+
+function confirmClear() {
+  confirm.require({
+    message:       'Azzerare il brain completamente? Verranno eliminati parametri, storico analisi e tutti i log.',
+    header:        'Clear Brain',
+    icon:          'pi pi-trash',
+    acceptClass:   'p-button-danger',
+    acceptLabel:   'Azzera tutto',
+    rejectLabel:   'Annulla',
+    accept:        () => store.clearBrain(),
   })
 }
 

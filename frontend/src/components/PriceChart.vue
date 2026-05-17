@@ -9,21 +9,32 @@ import {
   type IChartApi,
   type ISeriesApi,
   type CandlestickData,
+  type IPriceLine,
   ColorType,
+  LineStyle,
 } from 'lightweight-charts'
 import axios from 'axios'
+
+export interface PriceLineConfig {
+  price: number
+  color: string
+  label: string
+  dashed?: boolean
+}
 
 const props = defineProps<{
   symbol: string
   timeframe?: string
   height?: number
+  lines?: PriceLineConfig[]
+  showEma34?: boolean
 }>()
 
 const chartEl = ref<HTMLElement>()
 let chart: IChartApi
 let candleSeries: ISeriesApi<'Candlestick'>
-let emaSeries9: ISeriesApi<'Line'>
-let emaSeries21: ISeriesApi<'Line'>
+let emaSeries34: ISeriesApi<'Line'> | null = null
+let activePriceLines: IPriceLine[] = []
 
 const height = props.height ?? 320
 
@@ -46,21 +57,38 @@ function computeEMA(data: CandlestickData[], period: number) {
   return result
 }
 
+function applyPriceLines() {
+  if (!candleSeries) return
+  activePriceLines.forEach(pl => candleSeries.removePriceLine(pl))
+  activePriceLines = []
+  for (const l of (props.lines ?? [])) {
+    const pl = candleSeries.createPriceLine({
+      price:            l.price,
+      color:            l.color,
+      lineWidth:        2,
+      lineStyle:        l.dashed ? LineStyle.Dashed : LineStyle.Solid,
+      axisLabelVisible: true,
+      title:            l.label,
+    })
+    activePriceLines.push(pl)
+  }
+}
+
 async function loadData() {
   if (!chart) return
   const { data } = await axios.get('/api/mexc/ohlcv', {
     params: { symbol: props.symbol, timeframe: props.timeframe ?? '1m', limit: 200 },
   })
   const candles: CandlestickData[] = data.map((d: any) => ({
-    time: Math.floor(d.timestamp / 1000),
-    open: d.open,
-    high: d.high,
-    low: d.low,
+    time:  Math.floor(d.timestamp / 1000),
+    open:  d.open,
+    high:  d.high,
+    low:   d.low,
     close: d.close,
   }))
   candleSeries.setData(candles)
-  emaSeries9.setData(computeEMA(candles, 9))
-  emaSeries21.setData(computeEMA(candles, 21))
+  if (emaSeries34) emaSeries34.setData(computeEMA(candles, 34))
+  applyPriceLines()
   chart.timeScale().fitContent()
 }
 
@@ -82,26 +110,26 @@ onMounted(() => {
   })
 
   candleSeries = chart.addCandlestickSeries({
-    upColor: '#22c55e',
-    downColor: '#ef4444',
+    upColor:       '#22c55e',
+    downColor:     '#ef4444',
     borderUpColor: '#22c55e',
     borderDownColor: '#ef4444',
-    wickUpColor: '#22c55e',
+    wickUpColor:   '#22c55e',
     wickDownColor: '#ef4444',
   })
 
-  emaSeries9 = chart.addLineSeries({ color: '#a78bfa', lineWidth: 1, title: 'EMA9' })
-  emaSeries21 = chart.addLineSeries({ color: '#f59e0b', lineWidth: 1, title: 'EMA21' })
+  if (props.showEma34) {
+    emaSeries34 = chart.addLineSeries({ color: '#22d3ee', lineWidth: 2, title: 'EMA34' })
+  }
 
   loadData()
 
-  const ro = new ResizeObserver(() => {
-    chart.applyOptions({ width: chartEl.value!.clientWidth })
-  })
+  const ro = new ResizeObserver(() => chart?.applyOptions({ width: chartEl.value!.clientWidth }))
   ro.observe(chartEl.value!)
 })
 
 onBeforeUnmount(() => chart?.remove())
 
 watch(() => [props.symbol, props.timeframe], loadData)
+watch(() => props.lines, applyPriceLines, { deep: true })
 </script>

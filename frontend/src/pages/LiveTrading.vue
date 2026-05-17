@@ -121,7 +121,145 @@
 
       </div>
 
-      <!-- ── 2. Open Positions (MEXC live) ─────────────────────────────── -->
+      <!-- ── 2. Analytics ──────────────────────────────────────────────── -->
+      <div class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3">
+
+        <div class="stat-card col-span-2 md:col-span-1">
+          <div class="text-xs text-gray-500 mb-1">Trade Chiusi</div>
+          <div class="text-2xl font-bold font-mono text-white">{{ analytics?.totalTrades ?? 0 }}</div>
+          <div class="text-xs text-gray-600 mt-0.5">
+            <span class="text-green-400">{{ analytics?.openTrades ?? 0 }} aperti</span>
+            <span v-if="analytics && analytics.tradesWithPnl < analytics.totalTrades" class="text-gray-600 ml-1">
+              · {{ analytics.tradesWithPnl }} con PnL
+            </span>
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <div class="text-xs text-gray-500 mb-1">PnL Realizzato</div>
+          <div class="text-xl font-bold font-mono"
+            :class="analytics?.totalPnl == null ? 'text-gray-600'
+              : analytics.totalPnl >= 0 ? 'text-profit' : 'text-loss'"
+          >
+            <template v-if="analytics?.totalPnl == null">—</template>
+            <template v-else>
+              {{ analytics.totalPnl >= 0 ? '+' : '' }}{{ fmt(analytics.totalPnl) }}
+            </template>
+          </div>
+          <div class="text-xs text-gray-600 font-mono mt-0.5">USDT</div>
+        </div>
+
+        <div class="stat-card">
+          <div class="text-xs text-gray-500 mb-1">Fee Totali</div>
+          <div class="text-xl font-bold font-mono text-red-400">
+            {{ analytics?.totalFees ? '-' + fmt(analytics.totalFees) : '—' }}
+          </div>
+          <div class="text-xs text-gray-600 font-mono mt-0.5">USDT</div>
+        </div>
+
+        <div class="stat-card">
+          <div class="text-xs text-gray-500 mb-1">Win Rate</div>
+          <div class="text-xl font-bold font-mono"
+            :class="analytics?.winRate == null ? 'text-gray-600'
+              : analytics.winRate >= 50 ? 'text-indigo-300' : 'text-loss'"
+          >
+            {{ analytics?.winRate == null ? '—' : analytics.winRate.toFixed(1) + '%' }}
+          </div>
+          <div class="text-xs text-gray-600 mt-0.5">
+            {{ analytics?.tradesWithPnl ? analytics.tradesWithPnl + ' trade' : 'nessun dato' }}
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <div class="text-xs text-gray-500 mb-1">Fee Ap. media</div>
+          <div class="text-xl font-bold font-mono text-yellow-400">
+            {{ analytics?.avgFeeOpen ? fmt(analytics.avgFeeOpen) : '—' }}
+          </div>
+          <div class="text-xs text-gray-600 font-mono mt-0.5">USDT</div>
+        </div>
+
+        <div class="stat-card">
+          <div class="text-xs text-gray-500 mb-1">Fee Ch. media</div>
+          <div class="text-xl font-bold font-mono text-yellow-400">
+            {{ analytics?.avgFeeClose != null ? fmt(analytics.avgFeeClose) : '—' }}
+          </div>
+          <div class="text-xs text-gray-600 font-mono mt-0.5">USDT</div>
+        </div>
+
+        <div class="stat-card">
+          <div class="text-xs text-gray-500 mb-1">Fee RT%</div>
+          <div class="text-xl font-bold font-mono text-orange-400">
+            {{ analytics?.feeRatePct != null ? analytics.feeRatePct.toFixed(4) + '%' : '—' }}
+          </div>
+          <div class="text-xs text-gray-600 mt-0.5">round-trip</div>
+        </div>
+
+      </div>
+
+      <!-- ── 3. Bot Config ──────────────────────────────────────────────── -->
+      <div class="stat-card">
+        <div class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Configurazione Bot VCB</div>
+
+        <div v-if="config?.enabled"
+          class="flex items-start gap-2 rounded-lg border border-orange-500/30 bg-orange-500/5 p-3 mb-4 text-xs"
+        >
+          <i class="pi pi-exclamation-triangle text-orange-400 mt-0.5 flex-shrink-0" />
+          <span class="text-orange-300">
+            Bot attivo — ogni segnale VCB grade {{ config?.minGrade }}+ aprirà una posizione da
+            ${{ config?.marginPerTrade }} con leva automatica.
+          </span>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
+          <div>
+            <div class="text-xs text-gray-500 mb-1.5">Margine per trade ($)</div>
+            <InputNumber
+              v-model="draft.marginPerTrade"
+              :min="1" :max="100" :step="1"
+              :disabled="configLoading"
+              size="small" fluid
+            />
+          </div>
+          <div>
+            <div class="text-xs text-gray-500 mb-1.5">Grade minima</div>
+            <Select
+              v-model="draft.minGrade"
+              :options="['A+', 'A', 'B']"
+              :disabled="configLoading"
+              size="small" fluid
+            />
+          </div>
+          <div>
+            <div class="text-xs text-gray-500 mb-1.5">Max trade concurrent</div>
+            <InputNumber
+              v-model="draft.maxConcurrent"
+              :min="1" :max="10" :step="1"
+              :disabled="configLoading"
+              size="small" fluid
+            />
+          </div>
+          <div>
+            <div class="text-xs text-gray-500 mb-1.5">Auto-chiusura SL/TP</div>
+            <div class="flex items-center gap-2 h-[30px]">
+              <ToggleSwitch
+                v-model="draft.autoClose"
+                :disabled="configLoading"
+                @update:model-value="(v: boolean) => saveConfig({ autoClose: v })"
+              />
+              <span class="text-xs text-gray-400">{{ draft.autoClose ? 'Sì' : 'No' }}</span>
+            </div>
+          </div>
+        </div>
+        <div class="flex justify-end mt-3">
+          <Button
+            size="small" icon="pi pi-check" label="Salva Config"
+            severity="secondary" :loading="configLoading"
+            @click="saveConfig({ marginPerTrade: draft.marginPerTrade, minGrade: draft.minGrade, maxConcurrent: draft.maxConcurrent })"
+          />
+        </div>
+      </div>
+
+      <!-- ── 4. Open Positions (MEXC live) ─────────────────────────────── -->
       <div class="stat-card !p-0 overflow-hidden">
         <div class="flex items-center justify-between px-5 py-3 border-b border-white/5">
           <div class="flex items-center gap-2">
@@ -195,7 +333,7 @@
         </div>
       </div>
 
-      <!-- ── 3. Live Bot Trades ─────────────────────────────────────────── -->
+      <!-- ── 5. Live Bot Trades ─────────────────────────────────────────── -->
       <div class="stat-card !p-0 overflow-hidden">
         <div class="flex items-center justify-between px-5 py-3 border-b border-white/5">
           <div class="flex items-center gap-2">
@@ -284,120 +422,6 @@
               </tr>
             </tbody>
           </table>
-        </div>
-      </div>
-
-      <!-- ── 4. Analytics ──────────────────────────────────────────────── -->
-      <div class="grid grid-cols-2 md:grid-cols-4 xl:grid-cols-7 gap-3">
-        <div class="stat-card col-span-2 md:col-span-1">
-          <div class="text-xs text-gray-500 mb-1">Trade Chiusi</div>
-          <div class="text-2xl font-bold font-mono text-white">{{ analytics?.totalTrades ?? 0 }}</div>
-          <div class="text-xs text-gray-600 mt-0.5">
-            <span class="text-green-400">{{ analytics?.openTrades ?? 0 }} aperti</span>
-          </div>
-        </div>
-        <div class="stat-card">
-          <div class="text-xs text-gray-500 mb-1">PnL Realizzato</div>
-          <div class="text-xl font-bold font-mono"
-            :class="(analytics?.totalPnl ?? 0) >= 0 ? 'text-profit' : 'text-loss'"
-          >
-            {{ (analytics?.totalPnl ?? 0) >= 0 ? '+' : '' }}{{ fmt(analytics?.totalPnl ?? 0) }}
-          </div>
-          <div class="text-xs text-gray-600 font-mono mt-0.5">USDT</div>
-        </div>
-        <div class="stat-card">
-          <div class="text-xs text-gray-500 mb-1">Fee Totali</div>
-          <div class="text-xl font-bold font-mono text-red-400">-{{ fmt(analytics?.totalFees ?? 0) }}</div>
-          <div class="text-xs text-gray-600 font-mono mt-0.5">USDT</div>
-        </div>
-        <div class="stat-card">
-          <div class="text-xs text-gray-500 mb-1">Win Rate</div>
-          <div class="text-xl font-bold font-mono text-indigo-300">
-            {{ analytics?.totalTrades ? (analytics.winRate ?? 0).toFixed(1) + '%' : '—' }}
-          </div>
-          <div class="text-xs text-gray-600 mt-0.5">trade chiusi</div>
-        </div>
-        <div class="stat-card">
-          <div class="text-xs text-gray-500 mb-1">Fee Ap. media</div>
-          <div class="text-xl font-bold font-mono text-yellow-400">{{ fmt(analytics?.avgFeeOpen ?? 0) }}</div>
-          <div class="text-xs text-gray-600 font-mono mt-0.5">USDT</div>
-        </div>
-        <div class="stat-card">
-          <div class="text-xs text-gray-500 mb-1">Fee Ch. media</div>
-          <div class="text-xl font-bold font-mono text-yellow-400">
-            {{ analytics?.avgFeeClose ? fmt(analytics.avgFeeClose) : '—' }}
-          </div>
-          <div class="text-xs text-gray-600 font-mono mt-0.5">USDT</div>
-        </div>
-        <div class="stat-card">
-          <div class="text-xs text-gray-500 mb-1">Fee RT%</div>
-          <div class="text-xl font-bold font-mono text-orange-400">
-            {{ analytics?.feeRatePct ? (analytics.feeRatePct).toFixed(4) + '%' : '—' }}
-          </div>
-          <div class="text-xs text-gray-600 mt-0.5">round-trip</div>
-        </div>
-      </div>
-
-      <!-- ── 5. Bot Config ──────────────────────────────────────────────── -->
-      <div class="stat-card">
-        <div class="text-xs font-semibold text-gray-400 uppercase tracking-wider mb-3">Configurazione Bot VCB</div>
-
-        <div v-if="config?.enabled"
-          class="flex items-start gap-2 rounded-lg border border-orange-500/30 bg-orange-500/5 p-3 mb-4 text-xs"
-        >
-          <i class="pi pi-exclamation-triangle text-orange-400 mt-0.5 flex-shrink-0" />
-          <span class="text-orange-300">
-            Bot attivo — ogni segnale VCB grade {{ config?.minGrade }}+ aprirà una posizione da
-            ${{ config?.marginPerTrade }} con leva automatica.
-          </span>
-        </div>
-
-        <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
-          <div>
-            <div class="text-xs text-gray-500 mb-1.5">Margine per trade ($)</div>
-            <InputNumber
-              v-model="draft.marginPerTrade"
-              :min="1" :max="100" :step="1"
-              :disabled="configLoading"
-              size="small" fluid
-            />
-          </div>
-          <div>
-            <div class="text-xs text-gray-500 mb-1.5">Grade minima</div>
-            <Select
-              v-model="draft.minGrade"
-              :options="['A+', 'A', 'B']"
-              :disabled="configLoading"
-              size="small" fluid
-            />
-          </div>
-          <div>
-            <div class="text-xs text-gray-500 mb-1.5">Max trade concurrent</div>
-            <InputNumber
-              v-model="draft.maxConcurrent"
-              :min="1" :max="10" :step="1"
-              :disabled="configLoading"
-              size="small" fluid
-            />
-          </div>
-          <div>
-            <div class="text-xs text-gray-500 mb-1.5">Auto-chiusura SL/TP</div>
-            <div class="flex items-center gap-2 h-[30px]">
-              <ToggleSwitch
-                v-model="draft.autoClose"
-                :disabled="configLoading"
-                @update:model-value="(v: boolean) => saveConfig({ autoClose: v })"
-              />
-              <span class="text-xs text-gray-400">{{ draft.autoClose ? 'Sì' : 'No' }}</span>
-            </div>
-          </div>
-        </div>
-        <div class="flex justify-end mt-3">
-          <Button
-            size="small" icon="pi pi-check" label="Salva Config"
-            severity="secondary" :loading="configLoading"
-            @click="saveConfig({ marginPerTrade: draft.marginPerTrade, minGrade: draft.minGrade, maxConcurrent: draft.maxConcurrent })"
-          />
         </div>
       </div>
 

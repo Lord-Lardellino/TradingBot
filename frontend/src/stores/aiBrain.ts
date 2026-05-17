@@ -76,9 +76,15 @@ export const useBrainStore = defineStore('brain', () => {
     await fetchLog()
   }
 
+  async function clearBrain() {
+    const { data } = await axios.post('/api/brain/clear')
+    params.value = data
+    log.value = []
+  }
+
   function parsedChanges(log: BrainLog): Array<{ param: string; from: any; to: any; reason: string }> {
     try { return JSON.parse(log.changes) } catch { return [] }
   }
 
-  return { params, log, loading, fetchAll, fetchParams, fetchLog, toggle, updateParam, resetDefaults, parsedChanges }
+  return { params, log, loading, fetchAll, fetchParams, fetchLog, toggle, updateParam, resetDefaults, clearBrain, parsedChanges }
 })

@@ -77,13 +77,14 @@ export interface LiveTradingConfig {
 
 export interface LiveTradingAnalytics {
   totalTrades: number
+  tradesWithPnl: number
   openTrades: number
-  totalPnl: number
+  totalPnl: number | null
   totalFees: number
-  winRate: number
+  winRate: number | null
   avgFeeOpen: number
-  avgFeeClose: number
-  feeRatePct: number
+  avgFeeClose: number | null
+  feeRatePct: number | null
 }
 
 export const useLiveStore = defineStore('live', () => {

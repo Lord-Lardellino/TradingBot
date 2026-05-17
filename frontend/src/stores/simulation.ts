@@ -47,6 +47,7 @@ export interface SimAnalytics {
   winRate: number
   avgWinEur: number
   avgLossEur: number
+  rrActual: number
   profitFactor: number
   maxDrawdownPct: number
   bestTrade: SimTrade | null

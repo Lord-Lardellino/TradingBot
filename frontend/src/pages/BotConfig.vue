@@ -162,7 +162,7 @@ async function handleCreate() {
   if (!form.name) return toast.add({ severity: 'warn', summary: 'Name required', life: 3000 })
   creating.value = true
   try {
-    await botStore.create({ ...form })
+    await botStore.create({ ...form, config: JSON.stringify(form.config) })
     showDialog.value = false
     toast.add({ severity: 'success', summary: 'Bot created', life: 3000 })
   } finally {

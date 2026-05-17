@@ -252,33 +252,71 @@ export class LiveTradingService implements OnModuleInit {
     let reason     = 'manual';
     let closePrice = 0;
     let feesClose: number | null = null;
+    let pnl: number | null = null;
 
-    // Get actual closing fills via trade history
+    const mexcSym    = this.markets[trade.symbol]?.id ?? trade.symbol.split('/')[0] + '_USDT';
+    const since      = new Date(trade.openedAt).getTime();
+    const entryRef   = Number(trade.entry);
+    const posType    = trade.direction === 'LONG' ? 1 : 2;
+
+    // Primary: MEXC position history — returns closeAvgPrice + realised PnL for SL/TP native closes
+    let resolvedFromHistory = false;
     try {
-      const since    = new Date(trade.openedAt).getTime();
-      const closeDir = trade.direction === 'LONG' ? 'sell' : 'buy';
-      const myTrades = await this.exchange.fetchMyTrades(trade.symbol, since, 20);
-      const closers  = myTrades
-        .filter(t => t.side === closeDir && t.timestamp >= since)
-        .sort((a, b) => b.timestamp - a.timestamp);
-      if (closers.length > 0) {
-        closePrice = Number(closers[0].price ?? 0);
-        feesClose  = closers.reduce((s, t) => s + Number(t.fee?.cost ?? 0), 0);
+      const res: any = await (this.exchange as any).contractPrivateGetPositionListHistoryPositions({
+        symbol:   mexcSym,
+        pageNum:  1,
+        pageSize: 10,
+      });
+      const list: any[] = res?.data?.resultList ?? (Array.isArray(res?.data) ? res.data : []);
+
+      const hist = list.find(p => {
+        if (Number(p.positionType) !== posType) return false;
+        const t = Number(p.updateTime ?? p.createTime ?? 0);
+        if (t > 0 && t < since) return false;
+        const avg = Number(p.openAvgPrice ?? 0);
+        return avg === 0 || entryRef === 0 || Math.abs(avg - entryRef) / entryRef < 0.01;
+      });
+
+      if (hist) {
+        const cp = Number(hist.closeAvgPrice ?? 0);
+        if (cp > 0) {
+          closePrice          = cp;
+          pnl                 = parseFloat(Number(hist.realised ?? hist.realizedPnl ?? 0).toFixed(4));
+          feesClose           = parseFloat((trade.positionSize * 0.00038).toFixed(6));
+          resolvedFromHistory = true;
+          this.logger.log(`[LIVE] positionHistory OK ${trade.symbol}: close=${cp} realised=${hist.realised ?? hist.realizedPnl}`);
+        }
       }
     } catch (e: any) {
-      this.logger.warn(`[LIVE] fetchMyTrades ${trade.symbol}: ${e?.message?.slice(0, 80)}`);
+      this.logger.warn(`[LIVE] positionHistory ${trade.symbol}: ${e?.message?.slice(0, 80)}`);
+    }
+
+    // Fallback: fetchMyTrades (may not return SL/TP fills on MEXC swap)
+    if (!resolvedFromHistory) {
+      try {
+        const closeDir = trade.direction === 'LONG' ? 'sell' : 'buy';
+        const myTrades = await this.exchange.fetchMyTrades(trade.symbol, since, 20);
+        const closers  = myTrades
+          .filter(t => t.side === closeDir && t.timestamp >= since)
+          .sort((a, b) => b.timestamp - a.timestamp);
+        if (closers.length > 0) {
+          closePrice = Number(closers[0].price ?? 0);
+          feesClose  = closers.reduce((s, t) => s + Number(t.fee?.cost ?? 0), 0);
+        }
+      } catch (e: any) {
+        this.logger.warn(`[LIVE] fetchMyTrades ${trade.symbol}: ${e?.message?.slice(0, 80)}`);
+      }
     }
 
     // Determine reason from closePrice proximity to SL/TP
     if (closePrice > 0) {
-      const slDist = Math.abs(closePrice - trade.stopLoss)   / trade.stopLoss;
-      const tpDist = Math.abs(closePrice - trade.takeProfit) / trade.takeProfit;
+      const slDist = Math.abs(closePrice - Number(trade.stopLoss))   / Number(trade.stopLoss);
+      const tpDist = Math.abs(closePrice - Number(trade.takeProfit)) / Number(trade.takeProfit);
       if      (slDist <= 0.008) reason = 'sl';
       else if (tpDist <= 0.008) reason = 'tp';
     }
 
     // Cancel remaining native SL/TP stop orders
-    const mexcSym = this.markets[trade.symbol]?.id ?? trade.symbol.split('/')[0] + '_USDT';
     if (trade.slOrderId) {
       try {
         await (this.exchange as any).contractPrivatePostStoporderCancel({
@@ -288,12 +326,11 @@ export class LiveTradingService implements OnModuleInit {
       } catch {}
     }
 
-    // Calculate PnL
-    let pnl: number | null = null;
-    if (closePrice > 0) {
+    // Compute PnL from price diff if not already obtained from realised
+    if (pnl === null && closePrice > 0) {
       const priceDiff = trade.direction === 'LONG'
-        ? (closePrice - trade.entry) / trade.entry
-        : (trade.entry - closePrice) / trade.entry;
+        ? (closePrice - entryRef) / entryRef
+        : (entryRef - closePrice) / entryRef;
       const fc = feesClose ?? (trade.positionSize * 0.00038);
       pnl       = parseFloat((trade.positionSize * priceDiff - (trade.feesOpen ?? 0) - fc).toFixed(4));
       feesClose = parseFloat((feesClose ?? (trade.positionSize * 0.00038)).toFixed(6));
@@ -304,9 +341,9 @@ export class LiveTradingService implements OnModuleInit {
       data: {
         status:   reason,
         closedAt: new Date(),
-        ...(closePrice > 0    ? { closePrice: parseFloat(closePrice.toFixed(8)) } : {}),
-        ...(pnl !== null      ? { pnl }                                           : {}),
-        ...(feesClose !== null ? { feesClose }                                    : {}),
+        ...(closePrice > 0     ? { closePrice: parseFloat(closePrice.toFixed(8)) } : {}),
+        ...(pnl !== null       ? { pnl }                                           : {}),
+        ...(feesClose !== null ? { feesClose }                                     : {}),
       },
     });
 
@@ -390,23 +427,44 @@ export class LiveTradingService implements OnModuleInit {
     });
     const open = await this.prisma.liveTrade.findMany({ where: { status: 'open' } });
 
-    const totalPnl    = closed.reduce((s, t) => s + (t.pnl ?? 0), 0);
-    const totalFees   = closed.reduce((s, t) => s + (t.feesOpen ?? 0) + (t.feesClose ?? 0), 0);
-    const wins        = closed.filter(t => (t.pnl ?? 0) > 0);
-    const winRate     = closed.length > 0 ? wins.length / closed.length * 100 : 0;
-    const avgFeeOpen  = closed.length > 0 ? closed.reduce((s, t) => s + (t.feesOpen ?? 0), 0) / closed.length : 0;
-    const avgFeeClose = closed.length > 0 ? closed.reduce((s, t) => s + (t.feesClose ?? 0), 0) / closed.length : 0;
-    const totalNotional = closed.reduce((s, t) => s + t.positionSize, 0);
+    // Solo trade con PnL reale (non null) contano per Win Rate e PnL totale
+    const withPnl  = closed.filter(t => t.pnl !== null);
+    const wins     = withPnl.filter(t => (t.pnl ?? 0) > 0);
+
+    const totalPnl = withPnl.length > 0
+      ? withPnl.reduce((s, t) => s + (t.pnl ?? 0), 0)
+      : null;
+
+    const winRate = withPnl.length > 0
+      ? wins.length / withPnl.length * 100
+      : null;
+
+    // Fee: usiamo tutto il closed per feesOpen (sempre presente), solo withFeesClose per la media close
+    const totalFees  = closed.reduce((s, t) => s + (t.feesOpen ?? 0) + (t.feesClose ?? 0), 0);
+    const avgFeeOpen = closed.length > 0
+      ? closed.reduce((s, t) => s + (t.feesOpen ?? 0), 0) / closed.length
+      : 0;
+
+    const withFeesClose = closed.filter(t => t.feesClose !== null);
+    const avgFeeClose   = withFeesClose.length > 0
+      ? withFeesClose.reduce((s, t) => s + (t.feesClose ?? 0), 0) / withFeesClose.length
+      : null;
+
+    // Fee RT% solo sui trade con dati completi
+    const totalNotional = withPnl.reduce((s, t) => s + t.positionSize, 0);
+    const feesOnWithPnl = withPnl.reduce((s, t) => s + (t.feesOpen ?? 0) + (t.feesClose ?? 0), 0);
+    const feeRatePct    = totalNotional > 0 ? feesOnWithPnl / totalNotional * 100 : null;
 
     return {
-      totalTrades:  closed.length,
-      openTrades:   open.length,
-      totalPnl:     parseFloat(totalPnl.toFixed(4)),
-      totalFees:    parseFloat(totalFees.toFixed(4)),
-      winRate:      parseFloat(winRate.toFixed(1)),
-      avgFeeOpen:   parseFloat(avgFeeOpen.toFixed(6)),
-      avgFeeClose:  parseFloat(avgFeeClose.toFixed(6)),
-      feeRatePct:   totalNotional > 0 ? parseFloat((totalFees / totalNotional * 100).toFixed(4)) : 0,
+      totalTrades:   closed.length,
+      tradesWithPnl: withPnl.length,
+      openTrades:    open.length,
+      totalPnl:      totalPnl !== null ? parseFloat(totalPnl.toFixed(4)) : null,
+      totalFees:     parseFloat(totalFees.toFixed(4)),
+      winRate:       winRate !== null ? parseFloat(winRate.toFixed(1)) : null,
+      avgFeeOpen:    parseFloat(avgFeeOpen.toFixed(6)),
+      avgFeeClose:   avgFeeClose !== null ? parseFloat(avgFeeClose.toFixed(6)) : null,
+      feeRatePct:    feeRatePct !== null ? parseFloat(feeRatePct.toFixed(4)) : null,
     };
   }
 }

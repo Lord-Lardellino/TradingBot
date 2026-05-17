@@ -28,6 +28,8 @@ export interface ScannerSignal {
   quoteVolume24h: number
   timestamp: string
   mexcUrl: string
+  sparkline?: { t: number; o: number; h: number; l: number; c: number }[]
+  ema34spark?: number[]
 }
 
 export interface ScannerStatus {

@@ -24,6 +24,7 @@ export interface SimAnalytics {
   winRate: number;
   avgWinEur: number;
   avgLossEur: number;
+  rrActual: number;
   profitFactor: number;
   maxDrawdownPct: number;
   bestTrade: any;
@@ -118,7 +119,7 @@ export class SimulationService implements OnModuleInit {
     let cfg = await this.prisma.simConfig.findUnique({ where: { id: 1 } });
     if (!cfg) {
       cfg = await this.prisma.simConfig.create({
-        data: { id: 1, startingCapital: 1000, marginPerTrade: 10, targetTP: 'TP2', maxConcurrent: 3, autoEnter: true },
+        data: { id: 1, startingCapital: 1000, marginPerTrade: 10, targetTP: 'TP1', maxConcurrent: 3, autoEnter: true },
       });
     }
     return {
@@ -133,7 +134,7 @@ export class SimulationService implements OnModuleInit {
   async updateConfig(data: Partial<SimConfigData>) {
     return this.prisma.simConfig.upsert({
       where:  { id: 1 },
-      create: { id: 1, startingCapital: 1000, marginPerTrade: 10, targetTP: 'TP2', maxConcurrent: 3, autoEnter: true, ...data } as any,
+      create: { id: 1, startingCapital: 1000, marginPerTrade: 10, targetTP: 'TP1', maxConcurrent: 3, autoEnter: true, ...data } as any,
       update: data,
     });
   }
@@ -363,6 +364,8 @@ export class SimulationService implements OnModuleInit {
 
     const sortedClosed = [...closed].sort((a, b) => (b.pnl ?? 0) - (a.pnl ?? 0));
 
+    const rrActual = avgLossEur > 0 ? avgWinEur / avgLossEur : 0;
+
     return {
       startingCapital: cfg.startingCapital,
       currentCapital:  parseFloat(capital.toFixed(4)),
@@ -378,6 +381,7 @@ export class SimulationService implements OnModuleInit {
       winRate:         parseFloat(winRate.toFixed(1)),
       avgWinEur:       parseFloat(avgWinEur.toFixed(4)),
       avgLossEur:      parseFloat(avgLossEur.toFixed(4)),
+      rrActual:        parseFloat(rrActual.toFixed(2)),
       profitFactor:    parseFloat(Math.min(profitFactor, 999).toFixed(2)),
       maxDrawdownPct:  parseFloat(maxDD.toFixed(2)),
       bestTrade:       sortedClosed[0] ?? null,

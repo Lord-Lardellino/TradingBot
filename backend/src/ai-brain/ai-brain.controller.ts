@@ -25,6 +25,11 @@ export class AiBrainController {
     return this.brain.resetToDefaults();
   }
 
+  @Post('clear')
+  clear() {
+    return this.brain.clearAll();
+  }
+
   @Get('log')
   log(@Query('limit') limit?: string) {
     return this.brain.getLog(limit ? parseInt(limit) : 30);

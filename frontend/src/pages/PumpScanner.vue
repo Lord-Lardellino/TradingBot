@@ -89,10 +89,10 @@
       </div>
     </div>
 
-    <!-- VCB Debug panel -->
+    <!-- ERB Debug panel -->
     <details class="stat-card text-xs font-mono" open>
       <summary class="cursor-pointer text-gray-500 hover:text-gray-300 select-none">
-        VCB filter debug — ultimo ciclo
+        ERB filter debug — ultimo ciclo
         <span class="ml-2 text-gray-600">
           ({{ status.rawSignals ?? 0 }} raw → {{ status.emitted ?? 0 }} emessi)
         </span>
@@ -119,9 +119,10 @@
           v-for="sig in filteredSignals"
           :key="sig.id"
           :class="[
-            'rounded-xl border p-4',
+            'rounded-xl border p-4 cursor-pointer transition-shadow hover:shadow-lg',
             sig.direction === 'LONG' ? 'bg-profit/5 border-profit/20' : 'bg-loss/5 border-loss/20'
           ]"
+          @click="openChart(sig)"
         >
           <!-- Row 1: direction + symbol + grade + time -->
           <div class="flex flex-wrap items-center gap-3 mb-3">
@@ -177,6 +178,17 @@
             </div>
           </div>
 
+          <!-- Mini chart 1m — lightweight-charts, dati già nel segnale -->
+          <div v-if="sig.sparkline?.length"
+               class="mb-3 rounded-lg overflow-hidden border border-white/10">
+            <SparkChart
+              :candles="sig.sparkline"
+              :ema34="sig.ema34spark ?? []"
+              :entry="sig.entry"
+              :is-long="sig.direction === 'LONG'"
+            />
+          </div>
+
           <!-- Row 3: indicators + suggestion -->
           <div class="flex flex-wrap items-center gap-4 text-xs">
             <!-- Indicators -->
@@ -223,18 +235,26 @@
               <span class="font-bold text-white">{{ sig.suggestedLeverage }}×</span>
             </div>
 
-            <!-- Trade button -->
-            <a :href="sig.mexcUrl" target="_blank" rel="noopener"
-              :class="[
-                'flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-sm font-bold transition-colors shrink-0',
-                sig.direction === 'LONG'
-                  ? 'bg-profit text-black hover:bg-green-400'
-                  : 'bg-loss text-white hover:bg-red-400'
-              ]"
-            >
-              {{ sig.direction === 'LONG' ? '▲ LONG su MEXC' : '▼ SHORT su MEXC' }}
-              <i class="pi pi-external-link text-xs" />
-            </a>
+            <!-- Buttons -->
+            <div class="flex items-center gap-2 shrink-0" @click.stop>
+              <button
+                @click="openChart(sig)"
+                class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium bg-surface-200 text-gray-300 border border-white/10 hover:text-white hover:border-white/30 transition-colors"
+              >
+                📈 Grafico
+              </button>
+              <a :href="sig.mexcUrl" target="_blank" rel="noopener"
+                :class="[
+                  'flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-sm font-bold transition-colors',
+                  sig.direction === 'LONG'
+                    ? 'bg-profit text-black hover:bg-green-400'
+                    : 'bg-loss text-white hover:bg-red-400'
+                ]"
+              >
+                {{ sig.direction === 'LONG' ? '▲ MEXC' : '▼ MEXC' }}
+                <i class="pi pi-external-link text-xs" />
+              </a>
+            </div>
           </div>
 
           <!-- Reasons (expandable) -->
@@ -262,6 +282,108 @@
     </div>
 
   </div>
+
+  <!-- ── Chart Modal ──────────────────────────────────────────────────────── -->
+  <Teleport to="body">
+    <Transition name="modal-fade">
+      <div
+        v-if="selectedSignal"
+        class="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm px-4 py-6"
+        @click.self="selectedSignal = null"
+      >
+        <div class="relative w-full max-w-4xl bg-[#13131e] rounded-2xl border border-white/10 shadow-2xl flex flex-col">
+
+          <!-- Modal header -->
+          <div class="flex items-center justify-between px-5 py-4 border-b border-white/5 flex-wrap gap-3">
+            <div class="flex items-center gap-3">
+              <span
+                :class="selectedSignal.direction === 'LONG' ? 'bg-profit text-black' : 'bg-loss text-white'"
+                class="text-sm font-bold px-3 py-1 rounded-lg"
+              >
+                {{ selectedSignal.direction === 'LONG' ? '▲ LONG' : '▼ SHORT' }}
+              </span>
+              <span class="font-mono font-bold text-white text-lg">
+                {{ selectedSignal.symbol.replace('/USDT:USDT', '') }}<span class="text-gray-500 text-sm">/USDT</span>
+              </span>
+              <span :class="gradeBadgeClass(selectedSignal.grade)" class="font-bold px-2 py-0.5 rounded text-sm">
+                {{ selectedSignal.grade }}
+              </span>
+              <span class="text-xs text-gray-600 font-mono">{{ formatTime(selectedSignal.timestamp) }}</span>
+            </div>
+            <!-- Price levels inline -->
+            <div class="flex items-center gap-4 text-xs font-mono flex-wrap">
+              <span class="text-gray-400">
+                Entry <span class="text-white font-bold">{{ formatPrice(selectedSignal.entry) }}</span>
+              </span>
+              <span>
+                SL <span class="text-loss font-bold">{{ formatPrice(selectedSignal.stopLoss) }}</span>
+                <span class="text-red-500 ml-1">−{{ selectedSignal.slPct }}%</span>
+              </span>
+              <span>
+                TP1 <span class="text-profit font-bold">{{ formatPrice(selectedSignal.takeProfit1) }}</span>
+                <span class="text-green-500 ml-1">+{{ selectedSignal.tp1Pct }}%</span>
+              </span>
+              <span>
+                TP2 <span class="text-profit/70 font-bold">{{ formatPrice(selectedSignal.takeProfit2) }}</span>
+                <span class="text-green-700 ml-1">+{{ selectedSignal.tp2Pct }}%</span>
+              </span>
+              <button @click="selectedSignal = null" class="text-gray-500 hover:text-white text-xl leading-none ml-2">✕</button>
+            </div>
+          </div>
+
+          <!-- Legend strip -->
+          <div class="flex items-center gap-5 px-5 pt-3 pb-1 text-xs font-mono">
+            <span class="flex items-center gap-1.5"><span class="inline-block w-5 h-0.5 bg-[#94a3b8]" />Entry</span>
+            <span class="flex items-center gap-1.5"><span class="inline-block w-5 h-0.5 bg-[#ef4444] border-dashed border-t-2 border-[#ef4444]" />SL</span>
+            <span class="flex items-center gap-1.5"><span class="inline-block w-5 h-0.5 bg-[#22c55e] border-dashed border-t-2 border-[#22c55e]" />TP1</span>
+            <span class="flex items-center gap-1.5"><span class="inline-block w-5 h-0.5 bg-[#16a34a] border-dashed border-t-2 border-[#16a34a]" />TP2</span>
+            <span class="flex items-center gap-1.5 ml-2"><span class="inline-block w-5 h-0.5 bg-[#22d3ee]" />EMA34</span>
+            <span class="flex items-center gap-1.5"><span class="inline-block w-5 h-0.5 bg-[#a78bfa]" />EMA9</span>
+            <span class="flex items-center gap-1.5"><span class="inline-block w-5 h-0.5 bg-[#f59e0b]" />EMA21</span>
+          </div>
+
+          <!-- Chart -->
+          <div class="px-4 pb-2">
+            <PriceChart
+              :symbol="selectedSignal.symbol"
+              :timeframe="chartTimeframe"
+              :height="370"
+              :lines="chartLines"
+              :show-ema34="true"
+            />
+          </div>
+
+          <!-- Footer: timeframe + MEXC link -->
+          <div class="flex items-center gap-2 px-5 pb-4">
+            <span class="text-xs text-gray-500 mr-1">TF:</span>
+            <button
+              v-for="tf in ['1m', '5m', '15m', '1h']"
+              :key="tf"
+              @click="chartTimeframe = tf"
+              :class="chartTimeframe === tf
+                ? 'bg-brand/20 text-brand-light border-brand/30'
+                : 'bg-surface-200 text-gray-400 border-white/5 hover:text-white'"
+              class="px-3 py-1 text-xs rounded border transition-colors"
+            >
+              {{ tf }}
+            </button>
+            <a
+              :href="selectedSignal.mexcUrl"
+              target="_blank" rel="noopener"
+              :class="selectedSignal.direction === 'LONG'
+                ? 'bg-profit text-black hover:bg-green-400'
+                : 'bg-loss text-white hover:bg-red-400'"
+              class="ml-auto flex items-center gap-1.5 px-4 py-1.5 rounded-lg text-sm font-bold transition-colors"
+            >
+              {{ selectedSignal.direction === 'LONG' ? '▲ LONG su MEXC' : '▼ SHORT su MEXC' }}
+              <i class="pi pi-external-link text-xs" />
+            </a>
+          </div>
+        </div>
+      </div>
+    </Transition>
+  </Teleport>
+
 </template>
 
 <script setup lang="ts">
@@ -269,8 +391,10 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import Button from 'primevue/button'
 import Select from 'primevue/select'
 import ToggleButton from 'primevue/togglebutton'
-import { useScannerStore } from '@/stores/scanner'
+import { useScannerStore, type ScannerSignal } from '@/stores/scanner'
 import { useSound, soundEnabled, armAudio } from '@/composables/useSound'
+import PriceChart   from '@/components/PriceChart.vue'
+import SparkChart   from '@/components/SparkChart.vue'
 
 const scannerStore = useScannerStore()
 const { playSignal } = useSound()
@@ -279,6 +403,25 @@ const audioArmed   = ref(false)
 const filterGrade  = ref<string>('C')
 const filterDir    = ref<string>('ALL')
 const onlyMTF      = ref(false)
+
+const selectedSignal  = ref<ScannerSignal | null>(null)
+const chartTimeframe  = ref('1m')
+
+const chartLines = computed(() => {
+  const s = selectedSignal.value
+  if (!s) return []
+  return [
+    { price: s.entry,       color: '#94a3b8', label: 'Entry' },
+    { price: s.stopLoss,    color: '#ef4444', label: 'SL',  dashed: true },
+    { price: s.takeProfit1, color: '#22c55e', label: 'TP1', dashed: true },
+    { price: s.takeProfit2, color: '#16a34a', label: 'TP2', dashed: true },
+  ]
+})
+
+function openChart(sig: ScannerSignal) {
+  selectedSignal.value = sig
+  chartTimeframe.value = '1m'
+}
 
 let debugTimer: ReturnType<typeof setInterval> | null = null
 
@@ -299,22 +442,17 @@ const gradeOrder: Record<string, number> = { 'C': 0, 'B': 1, 'A': 2, 'A+': 3 }
 const { status } = scannerStore
 
 const DEBUG_LABELS: Record<string, string> = {
-  L0_error:   'L0 API error',
-  L0_no_data: 'L0 no data',
-  L1_no_sqz:  'L1 no sqz',
-  L1_no_comp: 'L1 no comp',
-  L1_vol_hi:  'L1 vol high',
-  L2_no_brk:  'L2 no brk',
-  L2_dir:     'L2 dir',
-  L2_body:    'L2 body',
-  L2_vol:     'L2 vol',
-  L2_range:   'L2 range',
-  L2_chase:   'L2 chase',
-  L3_rsi:     'L3 rsi',
-  L3_atr:     'L3 atr',
-  SL_wide:    'SL wide',
-  TP_unreach: 'TP unreachable',
-  SCORE:      'score < min',
+  L0_error:     'API error',
+  L0_no_data:   'no data',
+  F1_lateral:   'F1 laterale EMA34',
+  F1_flat:      'F1 EMA34 piatta',
+  F2_far:       'F2 lontano EMA34',
+  F2_no_touch:  'F2 wick non tocca EMA',
+  F2_trig_far:  'F2 bounce già partito',
+  F3_dir:       'F3 no conferma dir',
+  F3_body:      'F3 doji/spinning top',
+  SL_wide:      'SL troppo largo',
+  SCORE:        'score < min',
 }
 
 const debugEntries = computed(() =>
@@ -401,4 +539,9 @@ onUnmounted(() => {
 .signal-list-enter-active { transition: all 0.35s ease; }
 .signal-list-enter-from   { opacity: 0; transform: translateY(-10px) scale(0.99); }
 .signal-list-leave-to     { opacity: 0; transform: translateX(40px); }
+
+.modal-fade-enter-active,
+.modal-fade-leave-active  { transition: opacity 0.2s ease; }
+.modal-fade-enter-from,
+.modal-fade-leave-to      { opacity: 0; }
 </style>
