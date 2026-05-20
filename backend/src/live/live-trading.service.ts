@@ -136,11 +136,20 @@ export class LiveTradingService implements OnModuleInit {
       const orderId   = typeof rawOrderId === 'number' ? String(rawOrderId) : (typeof rawOrderId === 'string' ? rawOrderId : '');
 
       // ── SL/TP aggiustati al fill reale usando le % già calcolate dal scanner ──
-      const isLong = signal.direction === 'LONG';
-      const slFrac = signal.slPct  / 100;   // es. 0.64% → 0.0064
-      const tpFrac = signal.tp1Pct / 100;   // es. 1.15% → 0.0115
-      const adjSL  = isLong ? filled * (1 - slFrac) : filled * (1 + slFrac);
-      const adjTP  = isLong ? filled * (1 + tpFrac) : filled * (1 - tpFrac);
+      // Buffer +0.3% sul SL per evitare errore MEXC 5003. Il TP viene scalato
+      // proporzionalmente per mantenere il RR configurato (es. 1:1.5).
+      const isLong    = signal.direction === 'LONG';
+      const slFrac      = signal.slPct / 100;
+      const SL_BUFFER   = 0.003; // 0.3% extra
+      const TP_RR       = 1.5;   // fisso 1:1.5 sempre
+      const totalSlFrac = slFrac + SL_BUFFER;
+      const totalTpFrac = totalSlFrac * TP_RR;
+      const adjSL = isLong
+        ? filled * (1 - totalSlFrac)
+        : filled * (1 + totalSlFrac);
+      const adjTP = isLong
+        ? filled * (1 + totalTpFrac)
+        : filled * (1 - totalTpFrac);
 
       const slPrice    = parseFloat(this.exchange.priceToPrecision(signal.symbol, adjSL));
       const tpPrice    = parseFloat(this.exchange.priceToPrecision(signal.symbol, adjTP));
@@ -150,8 +159,8 @@ export class LiveTradingService implements OnModuleInit {
       let tpOrderId: string | undefined;
 
       try {
-        // Fetch position per ottenere positionId (richiesto da MEXC stoporder/place)
-        await new Promise(r => setTimeout(r, 600)); // breve attesa affinché la posizione sia registrata
+        // Attesa 1.5s: garantisce che MEXC abbia registrato la posizione e il mark price sia stabile
+        await new Promise(r => setTimeout(r, 1500));
         const positions = await this.exchange.fetchPositions([signal.symbol]);
         const newPos = positions.find(p =>
           p.symbol === signal.symbol &&
@@ -162,21 +171,48 @@ export class LiveTradingService implements OnModuleInit {
         if (newPos) {
           const positionId = newPos.info?.positionId;
           const posVol     = Math.abs(Number(newPos.contracts ?? 0));
-          const res: any   = await (this.exchange as any).contractPrivatePostStoporderPlace({
-            symbol:          mexcSymbol,
-            positionId,
-            vol:             posVol,
-            stopLossPrice:   slPrice,
-            takeProfitPrice: tpPrice,
-          });
-          slOrderId = String(res?.data ?? '');
-          tpOrderId = slOrderId; // MEXC usa un unico stopOrderId per la coppia SL+TP
-          this.logger.log(`[LIVE] ✅ SL/TP set: SL @ ${slPrice} | TP @ ${tpPrice} | stopOrderId: ${slOrderId}`);
+
+          // Retry con buffer crescente se MEXC risponde 5003 (prezzo stop invalido)
+          let placed = false;
+          for (let attempt = 0; attempt < 3 && !placed; attempt++) {
+            const extraBuf = attempt * 0.002; // 0%, +0.2%, +0.4% extra ad ogni retry
+            const retrySL = isLong
+              ? parseFloat(this.exchange.priceToPrecision(signal.symbol, adjSL * (1 - extraBuf)))
+              : parseFloat(this.exchange.priceToPrecision(signal.symbol, adjSL * (1 + extraBuf)));
+            try {
+              const res: any = await (this.exchange as any).contractPrivatePostStoporderPlace({
+                symbol:          mexcSymbol,
+                positionId,
+                vol:             posVol,
+                stopLossPrice:   attempt === 0 ? slPrice : retrySL,
+                takeProfitPrice: tpPrice,
+              });
+              slOrderId = String(res?.data ?? '');
+              tpOrderId = slOrderId;
+              placed = true;
+              this.logger.log(`[LIVE] ✅ SL/TP set: SL @ ${attempt === 0 ? slPrice : retrySL} | TP @ ${tpPrice} | stopOrderId: ${slOrderId}${attempt > 0 ? ` (retry ${attempt})` : ''}`);
+            } catch (retryErr: any) {
+              if (retryErr?.message?.includes('5003') && attempt < 2) {
+                await new Promise(r => setTimeout(r, 800));
+              } else {
+                throw retryErr;
+              }
+            }
+          }
         } else {
           this.logger.warn(`[LIVE] Position not found after open for ${signal.symbol} — SL/TP not set`);
         }
       } catch (e: any) {
-        this.logger.warn(`[LIVE] SL/TP failed ${signal.symbol}: ${e?.message?.slice(0, 150)}`);
+        this.logger.warn(`[LIVE] SL/TP failed ${signal.symbol}: ${e?.message?.slice(0, 150)} — chiusura posizione immediata`);
+        // SL/TP non impostato: chiudi subito la posizione per non lasciare rischio scoperto
+        try {
+          const closeSide = signal.direction === 'LONG' ? 'sell' : 'buy';
+          await this.exchange.createOrder(signal.symbol, 'market', closeSide, amount, undefined, { reduceOnly: true });
+          this.logger.warn(`[LIVE] ⚠️ ${signal.symbol} chiuso immediatamente — SL/TP non impostabile`);
+        } catch (closeErr: any) {
+          this.logger.error(`[LIVE] Chiusura emergenza fallita ${signal.symbol}: ${closeErr?.message}`);
+        }
+        return; // non salvare il trade nel DB come aperto
       }
 
       const trade = await this.prisma.liveTrade.create({
