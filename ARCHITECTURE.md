@@ -569,9 +569,9 @@ ssh root@144.91.101.42 "pm2 restart tradingbot-api --update-env"
 **File**: `backend/.env` (NON committare in git)
 
 ```env
-MEXC_API_KEY=mx0vglSekVFPsc6riu
-MEXC_API_SECRET=0e80b038bbbf440893730c490143eb4f
-GEMINI_API_KEY=AIzaSyBLj_vkBbQgIIlqMuqDMcQbEqNTf2A7UAs
+MEXC_API_KEY=<la tua chiave MEXC>
+MEXC_API_SECRET=<il tuo secret MEXC>
+GEMINI_API_KEY=<la tua chiave Google AI>
 PORT=3000
 NODE_ENV=production
 TEST_MODE=true         # false = abilita ordini reali per gli scalper bot
