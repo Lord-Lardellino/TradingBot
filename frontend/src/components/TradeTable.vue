@@ -1,4 +1,5 @@
 <template>
+  <div class="overflow-x-auto -mx-1">
   <DataTable
     :value="trades"
     :loading="loading"
@@ -6,7 +7,7 @@
     scrollable
     scroll-height="400px"
     :row-class="rowClass"
-    class="text-xs"
+    class="text-xs min-w-[600px]"
   >
     <Column field="symbol" header="Symbol" class="font-mono font-semibold" />
     <Column header="Side">
@@ -57,6 +58,7 @@
       <div class="text-center text-gray-600 py-6">No trades found</div>
     </template>
   </DataTable>
+  </div>
 </template>
 
 <script setup lang="ts">

@@ -266,3 +266,197 @@ model IntraSimConfig {
   minGrade        String   @default("B")
   updatedAt       DateTime @updatedAt
 }
+
+// ── ERB Flex Scanner — body bounce 35% (vs 40% del main scanner) ─────────────
+
+model FlexSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String    // LONG | SHORT
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  takeProfit2   Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  grade         String
+  score         Int
+  status        String    @default("open") // open | tp1 | tp2 | sl | manual
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model FlexSimConfig {
+  id              Int      @id @default(1)
+  startingCapital Float    @default(500)
+  marginPerTrade  Float    @default(10)
+  maxConcurrent   Int      @default(3)
+  autoEnter       Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+}
+
+// ── SQZ Scalper — BB Squeeze Breakout + RSI(3) Extreme Bounce, multi-pair ────
+
+model SqzSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String
+  patternType   Int
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  takeProfit2   Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  grade         String
+  score         Int
+  status        String    @default("open")
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model SqzSimConfig {
+  id              Int      @id @default(1)
+  startingCapital Float    @default(500)
+  marginPerTrade  Float    @default(10)
+  maxConcurrent   Int      @default(3)
+  autoEnter       Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+}
+
+// ── HF Scanner — EMA9/21 Cross+Bounce + RSI(3) Flip, 300 coppie/ciclo ───────
+
+model HfSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String
+  patternType   Int
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  takeProfit2   Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  grade         String
+  score         Int
+  status        String    @default("open")
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model HfSimConfig {
+  id              Int      @id @default(1)
+  startingCapital Float    @default(500)
+  marginPerTrade  Float    @default(10)
+  maxConcurrent   Int      @default(5)
+  autoEnter       Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+}
+
+// ── Smart Scanner — AI-driven optimizer, 500 coppie, auto-tune ogni 5 min ────
+
+model SmartSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String
+  patternType   Int
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  takeProfit2   Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  grade         String
+  score         Int
+  status        String    @default("open")
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model SmartSimConfig {
+  id              Int      @id @default(1)
+  startingCapital Float    @default(500)
+  maxConcurrent   Int      @default(5)
+  autoEnter       Boolean  @default(true)
+  minScore        Int      @default(42)
+  minBodyPct      Float    @default(0.35)
+  atrSlMult       Float    @default(1.2)
+  tpRr            Float    @default(2.0)
+  autoOptimize    Boolean  @default(true)
+  liveEnabled     Boolean  @default(false)
+  updatedAt       DateTime @updatedAt
+}
+
+model SmartOptLog {
+  id             Int      @id @default(autoincrement())
+  createdAt      DateTime @default(now())
+  tradesAnalyzed Int
+  analysis       String
+  changes        String
+  reason         String
+  applied        Boolean  @default(true)
+}
+
+// ── SOL Scalper — single-asset EMA34 bounce su SOL/USDT 1m ──────────────────
+
+model SolSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String
+  patternType   Int
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  takeProfit2   Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  grade         String
+  score         Int
+  status        String    @default("open")
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model SolSimConfig {
+  id              Int      @id @default(1)
+  startingCapital Float    @default(500)
+  marginPerTrade  Float    @default(10)
+  maxConcurrent   Int      @default(1)
+  autoEnter       Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+}

@@ -98,4 +98,18 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   emitMtfPositions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
     this.server.emit('mtf:positions', positions);
   }
+
+  emitFlexSignal(signal: any) { this.server.emit('flex:signal', signal); }
+  emitFlexStatus(status: any) { this.server.emit('flex:status', status); }
+  emitFlexTrade(trade: any)   { this.server.emit('flex:trade', trade); }
+  emitFlexPositions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
+    this.server.emit('flex:positions', positions);
+  }
+
+  emitSolSignal(signal: any) { this.server.emit('sol:signal', signal); }
+  emitSolStatus(status: any) { this.server.emit('sol:status', status); }
+  emitSolTrade(trade: any)   { this.server.emit('sol:trade', trade); }
+  emitSolPositions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
+    this.server.emit('sol:positions', positions);
+  }
 }

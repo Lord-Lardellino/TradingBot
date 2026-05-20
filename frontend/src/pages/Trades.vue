@@ -1,5 +1,5 @@
 <template>
-  <div class="p-6 space-y-6">
+  <div class="p-3 sm:p-6 space-y-4 sm:space-y-6">
     <h1 class="text-xl font-bold text-white">Trade History</h1>
 
     <!-- Summary strip -->

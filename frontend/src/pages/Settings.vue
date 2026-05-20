@@ -1,5 +1,5 @@
 <template>
-  <div class="p-6 max-w-xl space-y-6">
+  <div class="p-3 sm:p-6 max-w-xl space-y-4 sm:space-y-6">
     <div>
       <h1 class="text-xl font-bold text-white">Settings</h1>
       <p class="text-sm text-gray-500 mt-0.5">Configure MEXC API and global trading parameters</p>

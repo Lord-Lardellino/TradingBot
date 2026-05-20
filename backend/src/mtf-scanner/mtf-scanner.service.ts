@@ -73,62 +73,50 @@ export interface MtfAnalytics {
 // ─── Configurazione per timeframe ─────────────────────────────────────────────
 
 interface TfConfig {
-  candles: number;
-  slopeThreshold: number;   // % su 6 candle EMA34
-  crossingsWindow: number;  // candle per il controllo lateral
-  fixedSlPct: number;
-  fixedTp1Pct: number;
-  fixedTp2Pct: number;
-  emaDistLong: [number, number];   // [min, max] emaDist per LONG
-  emaDistShort: [number, number];  // [min, max] emaDist per SHORT
-  trigCloseDistMax: number;        // max | trigCloseDist | per LONG/SHORT
-  wickThreshold: number;           // min wickPct (negativo = non ha toccato EMA)
-  cooldown: number;                // ms tra segnali per stessa coppia
+  candles:         number;
+  slopeThreshold:  number;
+  crossingsWindow: number;
+  maxSlPct:        number;          // SL max % dal bounce candle al close conf2
+  bounceEmaThresh: number;          // max % sopra/sotto EMA34 del wick bounce candle
+  cooldown:        number;
+  staleLookback:   number;          // indice near per F_stale (~2h wall time in candle)
+  staleThreshold:  number;          // soglia slope storico (% su 6 candle); scala con durata TF
 }
 
 const TF_CONFIGS: Record<string, TfConfig> = {
   '5m': {
-    candles:           80,
-    slopeThreshold:    0.040,
-    crossingsWindow:   20,
-    fixedSlPct:        0.60,
-    fixedTp1Pct:       1.20,
-    fixedTp2Pct:       1.80,
-    emaDistLong:       [-0.25, 0.60],
-    emaDistShort:      [-0.60, 0.25],
-    trigCloseDistMax:  0.45,
-    wickThreshold:     -2.0,
-    cooldown:          300_000,   // 5 min
+    candles:         150,
+    slopeThreshold:  0.050,
+    crossingsWindow: 20,
+    maxSlPct:        2.0,
+    bounceEmaThresh: 0.50,
+    cooldown:        300_000,
+    staleLookback:   24,            // ~2h: slope tra n-30 e n-24
+    staleThreshold:  0.050,         // = slopeThreshold (finestra 30 min)
   },
   '15m': {
-    candles:           80,
-    slopeThreshold:    0.030,
-    crossingsWindow:   20,
-    fixedSlPct:        0.80,
-    fixedTp1Pct:       1.60,
-    fixedTp2Pct:       2.40,
-    emaDistLong:       [-0.35, 0.80],
-    emaDistShort:      [-0.80, 0.35],
-    trigCloseDistMax:  0.60,
-    wickThreshold:     -2.5,
-    cooldown:          900_000,   // 15 min
+    candles:         150,
+    slopeThreshold:  0.035,
+    crossingsWindow: 20,
+    maxSlPct:        3.5,
+    bounceEmaThresh: 0.80,
+    cooldown:        900_000,
+    staleLookback:   0,             // disabilitato: 15m filtra già con pattern + body + ema_osc
+    staleThreshold:  0,
   },
   '1h': {
-    candles:           80,
-    slopeThreshold:    0.020,
-    crossingsWindow:   15,
-    fixedSlPct:        1.20,
-    fixedTp1Pct:       2.40,
-    fixedTp2Pct:       3.60,
-    emaDistLong:       [-0.50, 1.20],
-    emaDistShort:      [-1.20, 0.50],
-    trigCloseDistMax:  0.90,
-    wickThreshold:     -3.0,
-    cooldown:          3_600_000, // 1 ora
+    candles:         150,
+    slopeThreshold:  0.025,
+    crossingsWindow: 15,
+    maxSlPct:        6.0,
+    bounceEmaThresh: 1.50,
+    cooldown:        3_600_000,
+    staleLookback:   0,             // disabilitato: 1h filtra già con pattern + body + ema_osc
+    staleThreshold:  0,
   },
 };
 
-const MIN_VOLUME_24H  = 10_000_000;
+const MIN_VOLUME_24H  = 3_000_000;
 const TOP_CANDIDATES  = 150;
 const TAKER_FEE       = 0.00038;
 
@@ -161,9 +149,11 @@ export class MtfScannerService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
+    const apiKey = this.config.get('MEXC_API_KEY', '');
+    const secret = this.config.get('MEXC_API_SECRET', '');
+    const hasKeys = apiKey && apiKey !== 'your_api_key_here';
     this.exchange = new ccxt.mexc({
-      apiKey:          this.config.get('MEXC_API_KEY', ''),
-      secret:          this.config.get('MEXC_API_SECRET', ''),
+      ...(hasKeys ? { apiKey, secret } : {}),
       enableRateLimit: true,
       options:         { defaultType: 'swap' },
     });
@@ -227,6 +217,7 @@ export class MtfScannerService implements OnModuleInit {
       this.statusData[tf].rawSignals = cycleSignals.length;
 
       const emitList = cycleSignals
+        .filter((s) => s.grade === 'A+' || s.grade === 'A')
         .sort((a, b) => b.score - a.score)
         .slice(0, 3);
 
@@ -247,7 +238,7 @@ export class MtfScannerService implements OnModuleInit {
         emitted++;
 
         this.logger.log(
-          `[MTF-${tf}] [${signal.grade}] ${signal.direction} ${signal.symbol} score=${signal.score} SL=${cfg.fixedSlPct}% TP1=${cfg.fixedTp1Pct}%`,
+          `[MTF-${tf}] [${signal.grade}] ${signal.direction} ${signal.symbol} score=${signal.score} SL=${signal.slPct.toFixed(2)}% TP1=${signal.tp1Pct.toFixed(2)}%`,
         );
       }
 
@@ -270,7 +261,7 @@ export class MtfScannerService implements OnModuleInit {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // ANALISI ERB v7 — identica alla 1m, parametri adattati al timeframe
+  // ANALISI ERB v8 — 3-candle bounce, parametri adattati al timeframe
   // ═══════════════════════════════════════════════════════════════════════════
 
   private async analyzeForTf(ticker: ccxt.Ticker, tf: string): Promise<MtfSignal | null> {
@@ -288,12 +279,13 @@ export class MtfScannerService implements OnModuleInit {
       const c = raw.map(c => c[4] as number);
       const v = raw.map(c => c[5] as number);
       const n = c.length;
-      const entry = ticker.last ?? c.at(-1)!;
 
       // EMA34
       const ema34arr = this.indicators.emaArray(c, 34);
-      const ema_n2   = ema34arr.at(-2)!;
-      const ema_n8   = ema34arr.at(-8)!;
+      if (ema34arr.length < 8) return null;
+      const ema_n2 = ema34arr.at(-2)!;
+      const ema_n4 = ema34arr.at(-4)!;
+      const ema_n8 = ema34arr.at(-8)!;
 
       // F1 — LATERAL (crossings in N candle)
       let crossings = 0;
@@ -313,87 +305,127 @@ export class MtfScannerService implements OnModuleInit {
       const isLong    = trendLong;
       const direction: 'LONG' | 'SHORT' = isLong ? 'LONG' : 'SHORT';
 
-      // F3 — PROSSIMITÀ EMA34 (allineata con SL fisso)
-      const emaDist    = (entry - ema_n2) / ema_n2 * 100;
-      const emaDistAbs = Math.abs(emaDist);
-      const [dLongMin, dLongMax]   = cfg.emaDistLong;
-      const [dShortMin, dShortMax] = cfg.emaDistShort;
-      if (isLong  && (emaDist < dLongMin  || emaDist > dLongMax))  { dbg['F2_far'] = (dbg['F2_far'] ?? 0) + 1; return null; }
-      if (!isLong && (emaDist < dShortMin || emaDist > dShortMax)) { dbg['F2_far'] = (dbg['F2_far'] ?? 0) + 1; return null; }
+      // F2b — EMA34 STABILITY
+      {
+        let emaReversals = 0;
+        let lastSign = 0;
+        for (let j = n - 22; j <= n - 3; j++) {
+          if (j < 1 || j >= ema34arr.length) continue;
+          const slope = ema34arr[j] - ema34arr[j - 1];
+          const sign = slope > 0 ? 1 : slope < 0 ? -1 : 0;
+          if (sign !== 0 && lastSign !== 0 && sign !== lastSign) emaReversals++;
+          if (sign !== 0) lastSign = sign;
+        }
+        if (emaReversals >= 4) { dbg['F_ema_osc'] = (dbg['F_ema_osc'] ?? 0) + 1; return null; }
+      }
 
-      // F4 — WICK verso EMA34
-      const bestLow  = Math.min(l[n-2], l[n-3], l[n-4]);
-      const bestHigh = Math.max(h[n-2], h[n-3], h[n-4]);
-      const wickPct  = isLong
-        ? (ema_n2 - bestLow)  / ema_n2 * 100
-        : (bestHigh - ema_n2) / ema_n2 * 100;
-      if (wickPct < cfg.wickThreshold) { dbg['F2_no_touch'] = (dbg['F2_no_touch'] ?? 0) + 1; return null; }
+      // ─── FILTRO: TREND FRESCO — slope ~2h fa già forte = trend stale ────
+      // staleLookback=0 → filtro disabilitato (15m/1h: pattern+body+ema_osc bastano)
+      {
+        const A = cfg.staleLookback;
+        if (A > 0 && ema34arr.length >= A + 7) {
+          const emaNear = ema34arr.at(-A)!;
+          const emaFar  = ema34arr.at(-(A + 6))!;
+          const slopeOld = emaFar > 0 ? (emaNear - emaFar) / emaFar * 100 : 0;
+          if (isLong  && slopeOld >  cfg.staleThreshold) { dbg['F_stale'] = (dbg['F_stale'] ?? 0) + 1; return null; }
+          if (!isLong && slopeOld < -cfg.staleThreshold) { dbg['F_stale'] = (dbg['F_stale'] ?? 0) + 1; return null; }
+        }
+      }
 
-      // F5 — SL check: entry non troppo lontana da EMA34 rispetto all'SL fisso
-      const distToEmaPct = (isLong ? Math.max(entry - ema_n2, 0) : Math.max(ema_n2 - entry, 0)) / entry * 100;
-      if (distToEmaPct > cfg.fixedSlPct) { dbg['SL_wide'] = (dbg['SL_wide'] ?? 0) + 1; return null; }
+      // ─── 4-CANDLE BOUNCE PATTERN ──────────────────────────────────────────
+      // n-5, n-4 = due bounce (RED per LONG, GREEN per SHORT) — almeno 1 wick su EMA34
+      // n-3, n-2 = due conferme (GREEN per LONG, RED per SHORT) — corpo ≥40% → ENTRY
+      const b1O = o[n-5], b1C = c[n-5], b1H = h[n-5], b1L = l[n-5];
+      const b2O = o[n-4], b2C = c[n-4], b2H = h[n-4], b2L = l[n-4];
+      const conf1O = o[n-3], conf1C = c[n-3], conf1H = h[n-3], conf1L = l[n-3];
+      const conf2O = o[n-2], conf2C = c[n-2], conf2H = h[n-2], conf2L = l[n-2];
 
-      // F6 — CANDLE TRIGGER (n-2): direzione + corpo
-      const trigO = o[n - 2], trigC = c[n - 2];
-      const trigH = h[n - 2], trigL = l[n - 2];
-      const trigRange     = trigH - trigL;
-      const trigBody      = trigRange > 0 ? Math.abs(trigC - trigO) / trigRange : 0;
-      const bullishCandle = trigC > trigO;
-      if ( isLong && !bullishCandle) { dbg['F3_dir'] = (dbg['F3_dir'] ?? 0) + 1; return null; }
-      if (!isLong &&  bullishCandle) { dbg['F3_dir'] = (dbg['F3_dir'] ?? 0) + 1; return null; }
-      if (trigBody < 0.30)           { dbg['F3_body'] = (dbg['F3_body'] ?? 0) + 1; return null; }
+      const entry = conf2C;
 
-      // F7 — TRIGGER CLOSE vicino a EMA34
-      const trigCloseDist = (trigC - ema_n2) / ema_n2 * 100;
-      if (isLong  && trigCloseDist >  cfg.trigCloseDistMax) { dbg['F2_trig_far'] = (dbg['F2_trig_far'] ?? 0) + 1; return null; }
-      if (!isLong && trigCloseDist < -cfg.trigCloseDistMax) { dbg['F2_trig_far'] = (dbg['F2_trig_far'] ?? 0) + 1; return null; }
+      if (isLong) {
+        if (b1C >= b1O)       { dbg['F3_pat_bounce'] = (dbg['F3_pat_bounce'] ?? 0) + 1; return null; }
+        if (b2C >= b2O)       { dbg['F3_pat_bounce'] = (dbg['F3_pat_bounce'] ?? 0) + 1; return null; }
+        if (conf1C <= conf1O) { dbg['F3_pat_conf']   = (dbg['F3_pat_conf']   ?? 0) + 1; return null; }
+        if (conf2C <= conf2O) { dbg['F3_pat_conf']   = (dbg['F3_pat_conf']   ?? 0) + 1; return null; }
+      } else {
+        if (b1C <= b1O)       { dbg['F3_pat_bounce'] = (dbg['F3_pat_bounce'] ?? 0) + 1; return null; }
+        if (b2C <= b2O)       { dbg['F3_pat_bounce'] = (dbg['F3_pat_bounce'] ?? 0) + 1; return null; }
+        if (conf1C >= conf1O) { dbg['F3_pat_conf']   = (dbg['F3_pat_conf']   ?? 0) + 1; return null; }
+        if (conf2C >= conf2O) { dbg['F3_pat_conf']   = (dbg['F3_pat_conf']   ?? 0) + 1; return null; }
+      }
+
+      // Corpi sostanziosi su tutte e 4 le candele (≥40%)
+      const b1Range    = b1H - b1L;    const b1Body    = b1Range > 0    ? Math.abs(b1C - b1O) / b1Range : 0;
+      const b2Range    = b2H - b2L;    const b2Body    = b2Range > 0    ? Math.abs(b2C - b2O) / b2Range : 0;
+      const conf1Range = conf1H - conf1L; const conf1Body = conf1Range > 0 ? Math.abs(conf1C - conf1O) / conf1Range : 0;
+      const conf2Range = conf2H - conf2L; const conf2Body = conf2Range > 0 ? Math.abs(conf2C - conf2O) / conf2Range : 0;
+      if (b1Body    < 0.40) { dbg['F3_body'] = (dbg['F3_body'] ?? 0) + 1; return null; }
+      if (b2Body    < 0.40) { dbg['F3_body'] = (dbg['F3_body'] ?? 0) + 1; return null; }
+      if (conf1Body < 0.40) { dbg['F3_body'] = (dbg['F3_body'] ?? 0) + 1; return null; }
+      if (conf2Body < 0.40) { dbg['F3_body'] = (dbg['F3_body'] ?? 0) + 1; return null; }
+
+      // ─── BOUNCE: best wick delle 2 bounce verso EMA34 ────────────────────
+      const bestBounceLow  = Math.min(b1L, b2L);
+      const bestBounceHigh = Math.max(b1H, b2H);
+      const bounceLowToEma  = (bestBounceLow  - ema_n4) / ema_n4 * 100;
+      const bounceHighToEma = (ema_n4 - bestBounceHigh) / ema_n4 * 100;
+      if (isLong  && bounceLowToEma  > cfg.bounceEmaThresh) { dbg['F_bounce_touch'] = (dbg['F_bounce_touch'] ?? 0) + 1; return null; }
+      if (!isLong && bounceHighToEma > cfg.bounceEmaThresh) { dbg['F_bounce_touch'] = (dbg['F_bounce_touch'] ?? 0) + 1; return null; }
+
+      // ─── SL: extreme delle 2 bounce candle ───────────────────────────────
+      const dynSlLevel = isLong ? bestBounceLow : bestBounceHigh;
+      const slPct      = Math.max(Math.abs(entry - dynSlLevel) / entry * 100, 0.05);
+      if (slPct > cfg.maxSlPct) { dbg['SL_wide'] = (dbg['SL_wide'] ?? 0) + 1; return null; }
+      const tp1Pct = slPct * 2.0;
+      const tp2Pct = slPct * 3.0;
+
+      // Volume: ultima candela di conferma
+      const refVols   = v.slice(n - 22, n - 2);
+      const refAvgVol = refVols.reduce((a, b) => a + b, 0) / refVols.length;
+      const trigVolR  = refAvgVol > 0 ? v[n - 2] / refAvgVol : 1;
 
       // ─── SCORING ──────────────────────────────────────────────────────────
       let score = 0;
       const reasons: string[] = [];
 
+      // 1. Forza trend EMA34 (8-20 pts)
       const absSlope = Math.abs(slopePct);
       if      (absSlope > 0.12) { score += 20; reasons.push(`Trend forte ${slopePct.toFixed(3)}%`); }
       else if (absSlope > 0.07) { score += 15; reasons.push(`Trend ${slopePct.toFixed(3)}%`); }
       else if (absSlope > 0.04) { score += 12; }
       else                      { score +=  8; }
 
-      if      (emaDistAbs < 0.10) { score += 25; reasons.push(`EMA34 ${emaDist.toFixed(2)}%`); }
-      else if (emaDistAbs < 0.30) { score += 20; reasons.push(`EMA34 ${emaDist.toFixed(2)}%`); }
-      else if (emaDistAbs < 0.70) { score += 14; }
-      else                        { score +=  7; }
+      // 2. Qualità bounce su EMA34 (5-20 pts)
+      const bounceDepth = isLong ? -bounceLowToEma : -bounceHighToEma;
+      if      (bounceDepth >  0.15) { score += 20; reasons.push(`Bounce ${bounceDepth.toFixed(2)}%`); }
+      else if (bounceDepth >  0.05) { score += 15; reasons.push(`Bounce EMA34`); }
+      else if (bounceDepth >= 0.0)  { score += 10; reasons.push(`Touch EMA34`); }
+      else                          { score +=  5; }
 
-      if      (wickPct > 0.10) { score += 15; reasons.push(`Wick EMA34 ${wickPct.toFixed(2)}%`); }
-      else if (wickPct > 0)    { score += 12; reasons.push(`Sfiorato EMA34`); }
-      else if (wickPct > -0.50){ score +=  9; }
-      else                     { score +=  5; }
+      // 3. Corpi di tutte e 4 le candele (5-15 pts)
+      const avgBody = (b1Body + b2Body + conf1Body + conf2Body) / 4;
+      if      (avgBody >= 0.70) { score += 15; reasons.push(`Corpi ${(avgBody*100).toFixed(0)}%`); }
+      else if (avgBody >= 0.55) { score += 11; reasons.push(`Corpi ${(avgBody*100).toFixed(0)}%`); }
+      else                      { score +=  5; }
 
-      if      (trigBody >= 0.70) { score += 12; reasons.push(`Corpo ${(trigBody*100).toFixed(0)}%`); }
-      else if (trigBody >= 0.50) { score +=  9; reasons.push(`Corpo ${(trigBody*100).toFixed(0)}%`); }
-      else                       { score +=  6; }
+      // 4. Volume conf2 (3-10 pts)
+      if      (trigVolR >= 2.0) { score += 10; }
+      else if (trigVolR >= 1.5) { score +=  7; }
+      else                      { score +=  3; }
 
       dbg['_max'] = Math.max(dbg['_max'] ?? 0, score);
 
-      // Minimo 30 punti per emissione
       if (score < 30) { dbg['SCORE'] = (dbg['SCORE'] ?? 0) + 1; return null; }
 
       const grade: MtfSignal['grade'] =
-        score >= 62 ? 'A+' : score >= 50 ? 'A' : score >= 38 ? 'B' : 'C';
-      const leverage =
-        grade === 'A+' ? 8 : grade === 'A' ? 6 : grade === 'B' ? 4 : 3;
+        score >= 55 ? 'A+' : score >= 42 ? 'A' : score >= 32 ? 'B' : 'C';
+      const leverage = Math.min(Math.round(5 / slPct), 100);
 
-      const slPct  = cfg.fixedSlPct;
-      const tp1Pct = cfg.fixedTp1Pct;
-      const tp2Pct = cfg.fixedTp2Pct;
-
-      const stopLoss    = parseFloat((entry * (isLong ? 1 - slPct / 100 : 1 + slPct / 100)).toPrecision(6));
+      const stopLoss    = parseFloat(dynSlLevel.toPrecision(6));
       const takeProfit1 = parseFloat((entry * (isLong ? 1 + tp1Pct / 100 : 1 - tp1Pct / 100)).toPrecision(6));
       const takeProfit2 = parseFloat((entry * (isLong ? 1 + tp2Pct / 100 : 1 - tp2Pct / 100)).toPrecision(6));
 
       // Metriche informative
-      const refVols   = v.slice(n - 22, n - 2);
-      const refAvgVol = refVols.reduce((a, b) => a + b, 0) / refVols.length;
-      const trigVolR  = refAvgVol > 0 ? v[n - 2] / refAvgVol : 1;
       const atr14    = this.indicators.atr(h, l, c, 14);
       const atr14Pct = entry > 0 ? atr14 / entry * 100 : 0;
       const rsi14    = this.indicators.rsi(c, 14);
@@ -485,8 +517,10 @@ export class MtfScannerService implements OnModuleInit {
 
     const capital      = await this.currentCapital(tf);
     const marginEur    = cfg.marginPerTrade;
-    const positionSize = marginEur * signal.suggestedLeverage;
-    const riskEur      = positionSize * (signal.slPct / 100);
+    const TARGET_RISK  = 0.50;
+    const positionSize = TARGET_RISK * 100 / signal.slPct;   // = 50/slPct EUR
+    const simLeverage  = Math.min(Math.round(positionSize / marginEur), 125);
+    const riskEur      = TARGET_RISK;                         // sempre €0.50
     const fees         = positionSize * TAKER_FEE * 2;
 
     const trade = await this.prisma.mtfSimulatedTrade.create({
@@ -499,7 +533,7 @@ export class MtfScannerService implements OnModuleInit {
         stopLoss:     signal.stopLoss,
         takeProfit1:  signal.takeProfit1,
         takeProfit2:  signal.takeProfit2,
-        leverage:     signal.suggestedLeverage,
+        leverage:     simLeverage,
         marginEur,
         positionSize,
         riskEur:      parseFloat(riskEur.toFixed(4)),

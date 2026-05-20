@@ -25,7 +25,7 @@ export interface IntraSignal {
 
 const MIN_VOLUME_24H = 200_000;
 const TOP_CANDIDATES = 50;
-const CANDLES_4H     = 120;
+const CANDLES_4H     = 200;
 const MIN_PUMP_PCT   = 8.0;
 const SIGNAL_COOLDOWN = 4 * 60 * 60 * 1000; // one signal per symbol per 4h
 
@@ -48,9 +48,11 @@ export class IntraScannerService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
+    const apiKey = this.config.get('MEXC_API_KEY', '');
+    const secret = this.config.get('MEXC_API_SECRET', '');
+    const hasKeys = apiKey && apiKey !== 'your_api_key_here';
     this.exchange = new ccxt.mexc({
-      apiKey:          this.config.get('MEXC_API_KEY', ''),
-      secret:          this.config.get('MEXC_API_SECRET', ''),
+      ...(hasKeys ? { apiKey, secret } : {}),
       enableRateLimit: true,
       options:         { defaultType: 'swap' },
     });
@@ -135,12 +137,13 @@ export class IntraScannerService implements OnModuleInit {
       if (pumpIdx < 0) return;
 
       // ── LAYER 2: Retest — price consolidated near EMA34 after pump ───────────
+      // Retest più stretto: price deve avvicinarsi entro 1.5% dall'EMA34 (era 3%)
       let retestFound  = false;
       let minDistToEma = Infinity;
       for (let i = pumpIdx + 1; i <= n - 2; i++) {
         const distLow   = (l4[i] - ema34) / ema34 * 100;
         const distClose = Math.abs(c4[i] - ema34) / ema34 * 100;
-        if (distLow <= 3.0 || distClose <= 3.0) retestFound = true;
+        if (distLow <= 1.5 || distClose <= 1.5) retestFound = true;
         if (distClose < minDistToEma) minDistToEma = distClose;
       }
       if (!retestFound) return;
@@ -166,11 +169,13 @@ export class IntraScannerService implements OnModuleInit {
       const refAvgVol = refLen > 0 ? refVolSum / refLen : v4[trigIdx];
       const trigVolR  = refAvgVol > 0 ? v4[trigIdx] / refAvgVol : 1;
 
-      // ── Entry: anti-chase — live price within 1.5% above trigger close ───────
+      // ── Entry: anti-chase stretto — live price within 0.8% above trigger close ─
       const entry  = livePrice > 0 ? livePrice : trigC;
       const chaseD = (entry - trigC) / trigC * 100;
-      if (chaseD > 1.5 || chaseD < -2.0) return;
+      if (chaseD > 0.8 || chaseD < -2.0) return;
       if (entry <= ema34) return;
+      // Entry non deve essere troppo lontana da EMA34 (max 2%)
+      if ((entry - ema34) / ema34 * 100 > 2.0) return;
 
       // ── Scoring ───────────────────────────────────────────────────────────────
       let score = 0;

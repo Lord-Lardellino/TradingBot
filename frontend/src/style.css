@@ -19,7 +19,7 @@ body {
 
 /* ── Utility classes ─────────────────────────── */
 .stat-card {
-  @apply bg-surface-100 rounded-xl border border-white/5 p-4;
+  @apply bg-surface-100 rounded-xl border border-white/5 p-3 sm:p-4;
 }
 
 .profit  { @apply text-profit; }

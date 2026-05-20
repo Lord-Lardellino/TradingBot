@@ -18,6 +18,18 @@ const router = createRouter({
           meta: { title: 'Dashboard' },
         },
         {
+          path: 'live',
+          name: 'live',
+          component: () => import('@/pages/LiveTrading.vue'),
+          meta: { title: 'Live Trading' },
+        },
+        {
+          path: 'smart',
+          name: 'smart',
+          component: () => import('@/pages/SmartScanner.vue'),
+          meta: { title: 'Smart Scanner' },
+        },
+        {
           path: 'bots',
           name: 'bots',
           component: () => import('@/pages/BotConfig.vue'),
@@ -28,48 +40,6 @@ const router = createRouter({
           name: 'trades',
           component: () => import('@/pages/Trades.vue'),
           meta: { title: 'Trade History' },
-        },
-        {
-          path: 'simulation',
-          name: 'simulation',
-          component: () => import('@/pages/SimulationReport.vue'),
-          meta: { title: 'Simulazione' },
-        },
-        {
-          path: 'brain',
-          name: 'brain',
-          component: () => import('@/pages/AiBrain.vue'),
-          meta: { title: 'AI Brain' },
-        },
-        {
-          path: 'live',
-          name: 'live',
-          component: () => import('@/pages/LiveTrading.vue'),
-          meta: { title: 'Live Trading' },
-        },
-        {
-          path: 'scanner',
-          name: 'scanner',
-          component: () => import('@/pages/PumpScanner.vue'),
-          meta: { title: 'Pump Scanner' },
-        },
-        {
-          path: 'mtf-scanner',
-          name: 'mtf-scanner',
-          component: () => import('@/pages/MtfScanner.vue'),
-          meta: { title: 'Multi-TF Scanner' },
-        },
-        {
-          path: 'mtf-sim',
-          name: 'mtf-sim',
-          component: () => import('@/pages/MtfSimReport.vue'),
-          meta: { title: 'Simulazione MTF' },
-        },
-        {
-          path: 'intraday',
-          name: 'intraday',
-          component: () => import('@/pages/Intraday.vue'),
-          meta: { title: 'Intraday 4H' },
         },
         {
           path: 'settings',

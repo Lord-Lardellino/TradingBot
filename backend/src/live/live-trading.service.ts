@@ -4,7 +4,11 @@ import { ConfigService } from '@nestjs/config';
 import * as ccxt from 'ccxt';
 import { PrismaService } from '../prisma/prisma.service';
 import { EventsGateway } from '../events/events.gateway';
-import type { ScannerSignal } from '../scanner/scanner.service';
+export interface TradeSignal {
+  symbol: string; direction: 'LONG' | 'SHORT'; grade: string;
+  entry: number; slPct: number; tp1Pct: number; suggestedLeverage: number;
+  score?: number;
+}
 
 export interface LiveConfigData {
   enabled:        boolean;
@@ -27,9 +31,11 @@ export class LiveTradingService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
+    const apiKey = this.config.get<string>('MEXC_API_KEY', '');
+    const secret = this.config.get<string>('MEXC_API_SECRET', '');
+    const hasKeys = apiKey && apiKey !== 'your_api_key_here';
     this.exchange = new ccxt.mexc({
-      apiKey:          this.config.get<string>('MEXC_API_KEY'),
-      secret:          this.config.get<string>('MEXC_API_SECRET'),
+      ...(hasKeys ? { apiKey, secret } : {}),
       enableRateLimit: true,
       options:         { defaultType: 'swap' },
     });
@@ -77,7 +83,7 @@ export class LiveTradingService implements OnModuleInit {
 
   // ─── Entry ────────────────────────────────────────────────────────────────────
 
-  async enterTrade(signal: ScannerSignal): Promise<void> {
+  async enterTrade(signal: TradeSignal): Promise<void> {
     const cfg = await this.getConfig();
     if (!cfg.enabled) return;
 
@@ -189,7 +195,7 @@ export class LiveTradingService implements OnModuleInit {
           slOrderId,
           tpOrderId,
           grade:        signal.grade,
-          score:        signal.score,
+          score:        signal.score ?? 0,
           feesOpen:     parseFloat(actualFee.toFixed(6)),
           status:       'open',
         },
@@ -202,20 +208,23 @@ export class LiveTradingService implements OnModuleInit {
 
     } catch (e: any) {
       this.logger.error(`[LIVE] Order failed ${signal.symbol}: ${e?.message}`);
+      const isLongFallback = signal.direction === 'LONG';
+      const slFallback = signal.entry * (isLongFallback ? (1 - signal.slPct / 100) : (1 + signal.slPct / 100));
+      const tpFallback = signal.entry * (isLongFallback ? (1 + signal.tp1Pct / 100) : (1 - signal.tp1Pct / 100));
       await this.prisma.liveTrade.create({
         data: {
           id,
           symbol:       signal.symbol,
           direction:    signal.direction,
           entry:        signal.entry,
-          stopLoss:     signal.stopLoss,
-          takeProfit:   signal.takeProfit1,
+          stopLoss:     parseFloat(slFallback.toFixed(8)),
+          takeProfit:   parseFloat(tpFallback.toFixed(8)),
           leverage:     signal.suggestedLeverage,
           marginEur:    cfg.marginPerTrade,
           positionSize: cfg.marginPerTrade * signal.suggestedLeverage,
           contracts:    0,
           grade:        signal.grade,
-          score:        signal.score,
+          score:        signal.score ?? 0,
           status:       'error',
           note:         e?.message?.slice(0, 200),
         },

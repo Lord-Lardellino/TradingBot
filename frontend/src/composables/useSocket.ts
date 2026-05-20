@@ -3,12 +3,7 @@ import { ref, onUnmounted } from 'vue'
 import { useBotStore } from '@/stores/bot'
 import { useTradesStore } from '@/stores/trades'
 import { useSignalsStore } from '@/stores/signals'
-import { useScannerStore } from '@/stores/scanner'
-import { useSimulationStore } from '@/stores/simulation'
 import { useLiveStore } from '@/stores/live'
-import { useIntraStore } from '@/stores/intra'
-import { useMtfScannerStore } from '@/stores/mtf-scanner'
-import { useSound } from '@/composables/useSound'
 
 let socket: Socket | null = null
 
@@ -46,24 +41,6 @@ export function useSocket() {
       useBotStore().updateStatus(data.botId, data.status)
     })
 
-    socket.on('scanner:signal', (data: any) => {
-      useScannerStore().addLive(data)
-      const { playSignal } = useSound()
-      playSignal(data.direction === 'LONG' ? 'PUMP' : 'DUMP')
-    })
-
-    socket.on('scanner:status', (data: any) => {
-      useScannerStore().updateStatus(data)
-    })
-
-    socket.on('sim:trade', (data: any) => {
-      useSimulationStore().addLiveTrade(data)
-    })
-
-    socket.on('sim:positions', (data: any[]) => {
-      useSimulationStore().updatePositions(data)
-    })
-
     socket.on('live:update', (data: { account: any; positions: any[] }) => {
       useLiveStore().setFromSocket(data)
     })
@@ -72,33 +49,15 @@ export function useSocket() {
       useLiveStore().addLiveTrade(data)
     })
 
-    socket.on('intra:signal', (data: any) => {
-      useIntraStore().addLiveSignal(data)
-    })
-
-    socket.on('intra:trade', (data: any) => {
-      useIntraStore().addLiveTrade(data)
-    })
-
-    socket.on('intra:positions', (data: any[]) => {
-      useIntraStore().updatePositions(data)
-    })
-
-    socket.on('mtf:signal', (data: any) => {
-      useMtfScannerStore().addLive(data)
-    })
-
-    socket.on('mtf:status', (data: any) => {
-      useMtfScannerStore().updateStatus(data)
-    })
-
-    socket.on('mtf:trade', (data: any) => {
-      useMtfScannerStore().addLiveTrade(data)
-    })
-
-    socket.on('mtf:positions', (data: any[]) => {
-      useMtfScannerStore().updatePositions(data)
-    })
+    socket.on('smart:config',   (data: any)   => { import('@/stores/smart-scanner').then(m => {
+      const store = m.useSmartScannerStore()
+      if (store.analytics?.config) Object.assign(store.analytics.config, data)
+    }) })
+    socket.on('smart:signal',   (data: any)   => { import('@/stores/smart-scanner').then(m => m.useSmartScannerStore().addLiveSignal(data)) })
+    socket.on('smart:trade',    (data: any)   => { import('@/stores/smart-scanner').then(m => m.useSmartScannerStore().addLiveTrade(data)) })
+    socket.on('smart:positions',(data: any[]) => { import('@/stores/smart-scanner').then(m => m.useSmartScannerStore().updatePositions(data)) })
+    socket.on('smart:status',   (data: any)   => { import('@/stores/smart-scanner').then(m => { Object.assign(m.useSmartScannerStore().status, data) }) })
+    socket.on('smart:opt-log',  (data: any)   => { import('@/stores/smart-scanner').then(m => m.useSmartScannerStore().addOptLog(data)) })
   }
 
   function disconnect() {

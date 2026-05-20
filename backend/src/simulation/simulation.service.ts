@@ -56,10 +56,12 @@ export class SimulationService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
+    const apiKey = this.config.get<string>('MEXC_API_KEY', '');
+    const secret = this.config.get<string>('MEXC_API_SECRET', '');
+    const hasKeys = apiKey && apiKey !== 'your_api_key_here';
     // Exchange autenticato — SOLO per leggere fee reali e saldo futures. Nessun ordine.
     this.exchange = new ccxt.mexc({
-      apiKey:        this.config.get<string>('MEXC_API_KEY'),
-      secret:        this.config.get<string>('MEXC_API_SECRET'),
+      ...(hasKeys ? { apiKey, secret } : {}),
       enableRateLimit: true,
       options: { defaultType: 'swap' },
     });
@@ -178,9 +180,13 @@ export class SimulationService implements OnModuleInit {
     if (already) return;
 
     const capital      = await this.currentCapital();
-    const marginEur    = cfg.marginPerTrade;                          // fixed $10 margin
-    const positionSize = marginEur * signal.suggestedLeverage;        // leveraged position
-    const riskEur      = positionSize * (signal.slPct / 100);         // actual $ at risk
+    const marginEur    = cfg.marginPerTrade;
+    // Sizing fisso: loss sempre €0.50, profit TP1 = risk × 2 = €1.00 (RR 1:2)
+    const TARGET_RISK  = 0.50;
+    const positionSize = TARGET_RISK * 100 / signal.slPct;            // = 50/slPct EUR
+    const leverage     = Math.min(Math.round(positionSize / cfg.marginPerTrade), 125);
+    const riskEur      = TARGET_RISK;                                  // sempre €0.50
+    const tp1Profit    = parseFloat((riskEur * 2).toFixed(2));
     const fees         = positionSize * this.takerFeePct * 2;         // round-trip fees
 
     const targetTP = cfg.targetTP === 'TP2' ? signal.takeProfit2 : signal.takeProfit1;
@@ -195,7 +201,7 @@ export class SimulationService implements OnModuleInit {
         stopLoss:     signal.stopLoss,
         takeProfit1:  signal.takeProfit1,
         takeProfit2:  signal.takeProfit2,
-        leverage:     signal.suggestedLeverage,
+        leverage:     leverage,
         riskEur:      parseFloat(riskEur.toFixed(4)),
         positionSize: parseFloat(positionSize.toFixed(4)),
         marginEur:    parseFloat(marginEur.toFixed(4)),
@@ -212,7 +218,7 @@ export class SimulationService implements OnModuleInit {
     this.events.emitSimTrade(trade);
 
     this.logger.log(
-      `[SIM] Entered ${signal.direction} ${signal.symbol} | risk €${riskEur.toFixed(2)} | sz €${positionSize.toFixed(2)} | leva ${signal.suggestedLeverage}× | grade ${signal.grade}`,
+      `[SIM] Entered ${signal.direction} ${signal.symbol} | risk €${riskEur.toFixed(2)} | tp1 €${tp1Profit} | sz €${positionSize.toFixed(2)} | leva ${leverage}× | grade ${signal.grade}`,
     );
   }
 

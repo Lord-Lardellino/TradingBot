@@ -43,13 +43,11 @@ export interface ScannerSignal {
 }
 
 // ─── Costanti ─────────────────────────────────────────────────────────────────
-const MIN_VOLUME_24H  = 10_000_000;  // liquidità reale: spread bassi, slippage contenuto
+const MIN_VOLUME_24H  = 3_000_000;   // soglia ridotta per ampliare pool candidati
 const TOP_CANDIDATES  = 200;          // per ciclo: ruota su tutti via shuffle
-const CANDLES_5M      = 80;
-const CANDLES_1M      = 80;
-const FIXED_SL_PCT    = 0.50;  // SL fisso: ~€0.50 loss su A+ (10x, €100 pos)
-const FIXED_TP1_PCT   = 1.00;  // TP1 fisso: ~€1.00 gain — 1:2 RR garantito
-const FIXED_TP2_PCT   = 1.50;  // TP2 fisso: 1:3 RR
+const CANDLES_5M      = 120;
+const CANDLES_1M      = 150;
+const MAX_SL_PCT      = 2.0;   // SL al low/high del bounce candle (più ampio del wick trigger)
 const SIGNAL_COOLDOWN = 300_000;
 const MAX_LONG_CYCLE  = 3;
 const MAX_SHORT_CYCLE = 3;
@@ -81,9 +79,11 @@ export class ScannerService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
+    const apiKey = this.config.get('MEXC_API_KEY', '');
+    const secret = this.config.get('MEXC_API_SECRET', '');
+    const hasKeys = apiKey && apiKey !== 'your_api_key_here';
     this.exchange = new ccxt.mexc({
-      apiKey:          this.config.get('MEXC_API_KEY', ''),
-      secret:          this.config.get('MEXC_API_SECRET', ''),
+      ...(hasKeys ? { apiKey, secret } : {}),
       enableRateLimit: true,
       options:         { defaultType: 'swap' },
     });
@@ -103,7 +103,7 @@ export class ScannerService implements OnModuleInit {
     }
   }
 
-  @Cron('*/10 * * * * *')
+  @Cron('*/3 * * * * *')
   async scan() {
     if (this.isScanning || this.validFuturesSymbols.size === 0) return;
     this.isScanning = true;
@@ -190,38 +190,40 @@ export class ScannerService implements OnModuleInit {
 
   private selectBest(signals: ScannerSignal[]): ScannerSignal[] {
     const longs  = signals
-      .filter((s) => s.direction === 'LONG'  && s.score >= this.p.minEmitScore)
+      .filter((s) => s.direction === 'LONG'  && (s.grade === 'A+' || s.grade === 'A'))
       .sort((a, b) => b.score - a.score)
       .slice(0, MAX_LONG_CYCLE);
     const shorts = signals
-      .filter((s) => s.direction === 'SHORT' && s.score >= this.p.minEmitScore)
+      .filter((s) => s.direction === 'SHORT' && (s.grade === 'A+' || s.grade === 'A'))
       .sort((a, b) => b.score - a.score)
       .slice(0, MAX_SHORT_CYCLE);
     return [...longs, ...shorts];
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // STRATEGIA: "EMA34 Rebound" (ERB v7) — 2026-05-16
+  // STRATEGIA: "EMA34 4-Candle Bounce" (ERB v9) — 2026-05-18
   //
-  //   Principio: SOLO EMA34 + price action. Nessun RSI, MACD, volume come filtro.
-  //   Il prezzo tocca l'EMA34 e rimbalza nella direzione del trend.
+  //   Pattern 4 candele:
+  //   LONG:  n-5=RED, n-4=RED  (bounce su EMA34, almeno uno wick EMA34)
+  //          n-3=GREEN, n-2=GREEN (conferme, corpo ≥40%) → ENTRY al close n-2
+  //          SL = min(low n-5, low n-4)
   //
-  //   FILTRI (tutti basati su EMA34 e candele):
-  //   1. Lateral: max 2 crossings EMA34 in 20 candle → mercato laterale = no
-  //   2. Trend: EMA34 slope > 0.075% (6c) → pendenza marcata obbligatoria
-  //   3. Prossimità: LONG [-0.25%, +0.45%] / SHORT [-0.45%, +0.25%] da EMA34
-  //      (range allineato all'SL fisso: SL è sempre dall'altra parte dell'EMA34)
-  //   4. Touch: wick di una delle 3 candle recenti ha toccato EMA34
-  //   5. SL/TP fissi: SL 0.50% + TP1 1.00% (sempre 1:2 RR) → ~-€0.50/+€1.00
-  //   6. Dir: candle trigger (n-2) chiude nella direzione del trade
-  //   7. Body: corpo >= 30% → no doji / spinning top
-  //   8. Trig dist: close del trigger entro 0.35% da EMA34 (no ingressi tardivi)
+  //   SHORT: n-5=GREEN, n-4=GREEN (bounce su EMA34)
+  //          n-3=RED, n-2=RED (conferme, corpo ≥40%) → ENTRY al close n-2
+  //          SL = max(high n-5, high n-4)
   //
-  //   SCORING (grade: A+ ≥62, A ≥50, B ≥38, C <38 — max 72 pts):
-  //   • Slope EMA34          → 8-20 pts
-  //   • Distanza entry-EMA34 → 5-25 pts  ← fattore principale
-  //   • Wick verso EMA34     → 5-15 pts
-  //   • Corpo candle         → 6-12 pts
+  //   FILTRI:
+  //   1. Lateral: max 2 crossings EMA34 in 20 candle
+  //   2. Trend:   EMA34 slope > 0.045% su 6 candle
+  //   3. EMA stability: slope EMA34 non ha cambiato direzione ≥4 volte in 20c
+  //   4. Bounce wick: best wick delle 2 bounce candle entro 0.30% sopra/sotto EMA34
+  //   5. SL max 2.0% → leva = 5/slPct (€0.50 risk / €0.75 profit a TP1 1:1.5)
+  //
+  //   SCORING (grade: A+ ≥55, A ≥42, B ≥32, C <32 — max 65 pts):
+  //   • Slope EMA34           → 8-20 pts
+  //   • Profondità bounce EMA → 5-20 pts
+  //   • Corpi conferme (avg)  → 5-15 pts
+  //   • Volume conf2          → 3-10 pts
   // ═══════════════════════════════════════════════════════════════════════════
 
   private async analyzePair(ticker: ccxt.Ticker): Promise<ScannerSignal | null> {
@@ -244,32 +246,28 @@ export class ScannerService implements OnModuleInit {
       const v1 = raw1m.map(c => c[5] as number);
       const c5 = raw5m.map(c => c[4] as number);
 
-      const n     = c1.length;
-      const entry = ticker.last ?? c1.at(-1)!;
+      const n = c1.length;
 
       // ─── EMA34 su 1m ─────────────────────────────────────────────────────
       const ema34arr = this.indicators.emaArray(c1, 34);
-      const ema_n2   = ema34arr.at(-2)!;
-      const ema_n8   = ema34arr.at(-8)!;
+      if (ema34arr.length < 8) return null;
+      const ema_n2 = ema34arr.at(-2)!;
+      const ema_n4 = ema34arr.at(-4)!;
+      const ema_n8 = ema34arr.at(-8)!;
 
       // ─── FILTRO 1: LATERAL ────────────────────────────────────────────────
-      // Prezzo che oscilla ripetutamente sull'EMA34 = mercato laterale = scarto.
-      // Un rimbalzo valido genera 1-2 crossing al massimo.
       let crossings = 0;
       for (let j = 2; j <= 20; j++) {
         const prevAbove = c1[n - j - 1] > ema34arr[n - j - 1];
         const currAbove = c1[n - j]     > ema34arr[n - j];
         if (prevAbove !== currAbove) crossings++;
       }
-      // Un bounce valido genera max 2 crossing (scende a EMA, risale). >= 3 = oscillazione laterale.
       if (crossings >= 3) { this.dbg['F1_lateral'] = (this.dbg['F1_lateral'] ?? 0) + 1; return null; }
 
       // ─── FILTRO 2: TREND EMA34 (slope 6 candle) ──────────────────────────
-      // EMA34 deve essere decisamente direzionata. Soglia 0.075%: esclude trend piatti
-      // come il cerchio rosso, richiede la pendenza marcata delle frecce verdi.
       const slopePct   = (ema_n2 - ema_n8) / ema_n8 * 100;
-      const trendLong  = slopePct >  0.075;
-      const trendShort = slopePct < -0.075;
+      const trendLong  = slopePct >  0.08;
+      const trendShort = slopePct < -0.08;
       if (!trendLong && !trendShort) {
         this.dbg['F1_flat'] = (this.dbg['F1_flat'] ?? 0) + 1; return null;
       }
@@ -280,65 +278,89 @@ export class ScannerService implements OnModuleInit {
       const allowedDirs = (this.p.allowedDirections ?? 'LONG,SHORT').split(',');
       if (!allowedDirs.includes(direction)) return null;
 
-      // ─── FILTRO 3: PROSSIMITÀ EMA34 ───────────────────────────────────────
-      // Con SL fisso 0.50%, il prezzo deve essere entro quel range dall'EMA34:
-      // SL deve atterrare dall'altra parte dell'EMA34 (senso geometrico del bounce).
-      // LONG:  [-0.25%, +0.45%] — price vicino a EMA34, SL sempre sotto EMA34
-      // SHORT: [-0.45%, +0.25%] — price vicino a EMA34, SL sempre sopra EMA34
-      const emaDist    = (entry - ema_n2) / ema_n2 * 100;
-      const emaDistAbs = Math.abs(emaDist);
+      // ─── FILTRO EMA34 STABILITY ───────────────────────────────────────────
+      {
+        let emaReversals = 0;
+        let lastSign = 0;
+        for (let j = n - 22; j <= n - 3; j++) {
+          if (j < 1 || j >= ema34arr.length) continue;
+          const slope = ema34arr[j] - ema34arr[j - 1];
+          const sign = slope > 0 ? 1 : slope < 0 ? -1 : 0;
+          if (sign !== 0 && lastSign !== 0 && sign !== lastSign) emaReversals++;
+          if (sign !== 0) lastSign = sign;
+        }
+        if (emaReversals >= 4) { this.dbg['F_ema_osc'] = (this.dbg['F_ema_osc'] ?? 0) + 1; return null; }
+      }
+
+      // ─── FILTRO: TREND FRESCO — slope era già forte 20-26 candle fa? (=20-26 min) ─
+      // Soglia = stessa del trend corrente: trend stantio solo se ERA GIÀ sopra soglia
+      if (ema34arr.length >= 32) {
+        const ema_n20 = ema34arr.at(-20)!;
+        const ema_n26 = ema34arr.at(-26)!;
+        const slopeOld = ema_n26 > 0 ? (ema_n20 - ema_n26) / ema_n26 * 100 : 0;
+        if (isLong  && slopeOld >  0.08) { this.dbg['F_stale'] = (this.dbg['F_stale'] ?? 0) + 1; return null; }
+        if (!isLong && slopeOld < -0.08) { this.dbg['F_stale'] = (this.dbg['F_stale'] ?? 0) + 1; return null; }
+      }
 
       if (!this.diagSample) {
-        this.diagSample = `[pre-F3] ${sym} ${direction} slope=${slopePct.toFixed(3)}% emaDist=${emaDist.toFixed(2)}% cross=${crossings}`;
+        this.diagSample = `[pre-pat] ${sym} ${direction} slope=${slopePct.toFixed(3)}% cross=${crossings}`;
       }
 
-      if (isLong  && (emaDist < -0.25 || emaDist > 0.45)) {
-        this.dbg['F2_far'] = (this.dbg['F2_far'] ?? 0) + 1; return null;
+      // ─── 4-CANDLE BOUNCE PATTERN ──────────────────────────────────────────
+      // n-5, n-4 = due bounce candle (RED per LONG, GREEN per SHORT) — almeno 1 wick su EMA34
+      // n-3, n-2 = due conferme (GREEN per LONG, RED per SHORT) — corpo ≥40% → ENTRY al close n-2
+      const b1O = o1[n-5], b1C = c1[n-5], b1H = h1[n-5], b1L = l1[n-5];
+      const b2O = o1[n-4], b2C = c1[n-4], b2H = h1[n-4], b2L = l1[n-4];
+      const conf1O = o1[n-3], conf1C = c1[n-3], conf1H = h1[n-3], conf1L = l1[n-3];
+      const conf2O = o1[n-2], conf2C = c1[n-2], conf2H = h1[n-2], conf2L = l1[n-2];
+
+      const entry = conf2C;
+
+      if (isLong) {
+        if (b1C >= b1O)       { this.dbg['F3_pat_bounce'] = (this.dbg['F3_pat_bounce'] ?? 0) + 1; return null; }
+        if (b2C >= b2O)       { this.dbg['F3_pat_bounce'] = (this.dbg['F3_pat_bounce'] ?? 0) + 1; return null; }
+        if (conf1C <= conf1O) { this.dbg['F3_pat_conf']   = (this.dbg['F3_pat_conf']   ?? 0) + 1; return null; }
+        if (conf2C <= conf2O) { this.dbg['F3_pat_conf']   = (this.dbg['F3_pat_conf']   ?? 0) + 1; return null; }
+      } else {
+        if (b1C <= b1O)       { this.dbg['F3_pat_bounce'] = (this.dbg['F3_pat_bounce'] ?? 0) + 1; return null; }
+        if (b2C <= b2O)       { this.dbg['F3_pat_bounce'] = (this.dbg['F3_pat_bounce'] ?? 0) + 1; return null; }
+        if (conf1C >= conf1O) { this.dbg['F3_pat_conf']   = (this.dbg['F3_pat_conf']   ?? 0) + 1; return null; }
+        if (conf2C >= conf2O) { this.dbg['F3_pat_conf']   = (this.dbg['F3_pat_conf']   ?? 0) + 1; return null; }
       }
-      if (!isLong && (emaDist >  0.25 || emaDist < -0.45)) {
-        this.dbg['F2_far'] = (this.dbg['F2_far'] ?? 0) + 1; return null;
-      }
 
-      // ─── FILTRO 4: WICK → EMA34 ───────────────────────────────────────────
-      // Almeno una delle 3 candle recenti deve aver toccato/lambito l'EMA34.
-      // wickPct < -1.5% = EMA34 neanche sfiorata → non è un vero bounce.
-      const bestLow  = Math.min(l1[n-2], l1[n-3], l1[n-4]);
-      const bestHigh = Math.max(h1[n-2], h1[n-3], h1[n-4]);
-      const wickPct  = isLong
-        ? (ema_n2 - bestLow)  / ema_n2 * 100
-        : (bestHigh - ema_n2) / ema_n2 * 100;
-      if (wickPct < -1.5) { this.dbg['F2_no_touch'] = (this.dbg['F2_no_touch'] ?? 0) + 1; return null; }
+      // Corpi sostanziosi su tutte e 4 le candele (≥40%)
+      const b1Range    = b1H - b1L;    const b1Body    = b1Range > 0    ? Math.abs(b1C - b1O) / b1Range : 0;
+      const b2Range    = b2H - b2L;    const b2Body    = b2Range > 0    ? Math.abs(b2C - b2O) / b2Range : 0;
+      const conf1Range = conf1H - conf1L; const conf1Body = conf1Range > 0 ? Math.abs(conf1C - conf1O) / conf1Range : 0;
+      const conf2Range = conf2H - conf2L; const conf2Body = conf2Range > 0 ? Math.abs(conf2C - conf2O) / conf2Range : 0;
+      if (b1Body    < 0.40) { this.dbg['F3_body'] = (this.dbg['F3_body'] ?? 0) + 1; return null; }
+      if (b2Body    < 0.40) { this.dbg['F3_body'] = (this.dbg['F3_body'] ?? 0) + 1; return null; }
+      if (conf1Body < 0.40) { this.dbg['F3_body'] = (this.dbg['F3_body'] ?? 0) + 1; return null; }
+      if (conf2Body < 0.40) { this.dbg['F3_body'] = (this.dbg['F3_body'] ?? 0) + 1; return null; }
 
-      // ─── SL / TP fissi — RR sempre 1:2 ───────────────────────────────────
-      // SL e TP fissi per ogni trade: perdita e guadagno sempre identici in %.
-      // Per qualità/aggressività si agisce sulla leva, non sullo stop.
-      const atr14_1m = this.indicators.atr(h1, l1, c1, 14);
-      const atr1mPct = entry > 0 ? atr14_1m / entry * 100 : 0;
-      const slPct    = FIXED_SL_PCT;
-      const tp1Pct   = FIXED_TP1_PCT;
-      const tp2Pct   = FIXED_TP2_PCT;
+      // ─── BOUNCE CANDLE: best wick delle 2 bounce verso EMA34 ─────────────
+      // LONG:  min low dei 2 bounce entro 0.30% sopra EMA34 (o sotto = perfetto)
+      // SHORT: max high dei 2 bounce entro 0.30% sotto EMA34 (o sopra = perfetto)
+      const bestBounceLow  = Math.min(b1L, b2L);
+      const bestBounceHigh = Math.max(b1H, b2H);
+      const bounceLowToEma  = (bestBounceLow  - ema_n4) / ema_n4 * 100;
+      const bounceHighToEma = (ema_n4 - bestBounceHigh) / ema_n4 * 100;
+      if (isLong  && bounceLowToEma  > 0.30) { this.dbg['F_bounce_touch'] = (this.dbg['F_bounce_touch'] ?? 0) + 1; return null; }
+      if (!isLong && bounceHighToEma > 0.30) { this.dbg['F_bounce_touch'] = (this.dbg['F_bounce_touch'] ?? 0) + 1; return null; }
 
-      // Dati del candle n-2 (ultimo chiuso, candle di conferma bounce)
-      const trigO = o1[n - 2], trigC = c1[n - 2];
-      const trigH = h1[n - 2], trigL = l1[n - 2];
+      // ─── SL: extreme delle 2 bounce candle ───────────────────────────────
+      const dynSlLevel = isLong ? bestBounceLow : bestBounceHigh;
+      const slPct      = Math.max(Math.abs(entry - dynSlLevel) / entry * 100, 0.05);
+      if (slPct > MAX_SL_PCT) { this.dbg['SL_wide'] = (this.dbg['SL_wide'] ?? 0) + 1; return null; }
+      const tp1Pct = slPct * 2.0;
+      const tp2Pct = slPct * 3.0;
 
-      // ─── FILTRO 5: DIREZIONE CANDLE TRIGGER ───────────────────────────────
-      // Il candle di conferma deve chiudere nella direzione del bounce.
-      const trigRange     = trigH - trigL;
-      const trigBody      = trigRange > 0 ? Math.abs(trigC - trigO) / trigRange : 0;
-      const bullishCandle = trigC > trigO;
-      if ( isLong && !bullishCandle) { this.dbg['F3_dir'] = (this.dbg['F3_dir'] ?? 0) + 1; return null; }
-      if (!isLong &&  bullishCandle) { this.dbg['F3_dir'] = (this.dbg['F3_dir'] ?? 0) + 1; return null; }
-      if (trigBody < 0.30) { this.dbg['F3_body'] = (this.dbg['F3_body'] ?? 0) + 1; return null; }
+      // ─── VOLUME: ultima candela di conferma ───────────────────────────────
+      const refVols   = v1.slice(n - 22, n - 2);
+      const refAvgVol = refVols.reduce((a, b) => a + b, 0) / refVols.length;
+      const trigVolR  = refAvgVol > 0 ? v1[n - 2] / refAvgVol : 1;
 
-      // ─── FILTRO 6: TRIGGER CLOSE VICINO ALL'EMA34 ────────────────────────
-      // La candela di bounce deve essersi chiusa entro 0.35% dall'EMA34.
-      // Con SL fisso 0.50%, se il trigger è già oltre 0.35% il RR è compromesso.
-      const trigCloseDist = (trigC - ema_n2) / ema_n2 * 100;
-      if (isLong  && trigCloseDist > 0.35) { this.dbg['F2_trig_far'] = (this.dbg['F2_trig_far'] ?? 0) + 1; return null; }
-      if (!isLong && trigCloseDist < -0.35) { this.dbg['F2_trig_far'] = (this.dbg['F2_trig_far'] ?? 0) + 1; return null; }
-
-      // ─── SCORING (basato solo su qualità EMA34 bounce) ────────────────────
+      // ─── SCORING ──────────────────────────────────────────────────────────
       let score = 0;
       const reasons: string[] = [];
 
@@ -349,41 +371,41 @@ export class ScannerService implements OnModuleInit {
       else if (absSlope > 0.06) { score += 12; }
       else                      { score +=  8; }
 
-      // 2. Prossimità entry → EMA34 (5-25 pts) — più vicino = migliore RR
-      if      (emaDistAbs < 0.10) { score += 25; reasons.push(`EMA34 ${emaDist.toFixed(2)}%`); }
-      else if (emaDistAbs < 0.30) { score += 20; reasons.push(`EMA34 ${emaDist.toFixed(2)}%`); }
-      else if (emaDistAbs < 0.60) { score += 14; }
-      else                        { score +=  7; }
+      // 2. Qualità bounce su EMA34 (5-20 pts)
+      const bounceDepth = isLong ? -bounceLowToEma : -bounceHighToEma; // >0 = wick sotto/sopra EMA
+      if      (bounceDepth >  0.15) { score += 20; reasons.push(`Bounce ${bounceDepth.toFixed(2)}%`); }
+      else if (bounceDepth >  0.05) { score += 15; reasons.push(`Bounce EMA34`); }
+      else if (bounceDepth >= 0.0)  { score += 10; reasons.push(`Touch EMA34`); }
+      else                          { score +=  5; }
 
-      // 3. Wick verso EMA34 (5-15 pts) — mostra la pressione di rimbalzo
-      if      (wickPct > 0.10) { score += 15; reasons.push(`Wick EMA34 ${wickPct.toFixed(2)}%`); }
-      else if (wickPct > 0)    { score += 12; reasons.push(`Sfiorato EMA34`); }
-      else if (wickPct > -0.30){ score +=  9; }
-      else                     { score +=  5; }
+      // 3. Corpi di tutte e 4 le candele (5-15 pts)
+      const avgBody = (b1Body + b2Body + conf1Body + conf2Body) / 4;
+      if      (avgBody >= 0.70) { score += 15; reasons.push(`Corpi ${(avgBody*100).toFixed(0)}%`); }
+      else if (avgBody >= 0.55) { score += 11; reasons.push(`Corpi ${(avgBody*100).toFixed(0)}%`); }
+      else                      { score +=  5; }
 
-      // 4. Corpo candle trigger (6-12 pts) — già filtrato >= 30%
-      if      (trigBody >= 0.70) { score += 12; reasons.push(`Corpo ${(trigBody*100).toFixed(0)}%`); }
-      else if (trigBody >= 0.50) { score +=  9; reasons.push(`Corpo ${(trigBody*100).toFixed(0)}%`); }
-      else                       { score +=  6; }
+      // 4. Volume conf2 (3-10 pts)
+      if      (trigVolR >= 2.0) { score += 10; }
+      else if (trigVolR >= 1.5) { score +=  7; }
+      else                      { score +=  3; }
 
       this.dbg['_max'] = Math.max(this.dbg['_max'] ?? 0, score);
-      this.diagSample = `[OK] ${sym} ${direction} slope=${slopePct.toFixed(3)}% emaDist=${emaDist.toFixed(2)}% trigClose=${trigCloseDist.toFixed(2)}% wick=${wickPct.toFixed(2)}% body=${(trigBody*100).toFixed(0)}% cross=${crossings} score=${score}`;
+      this.diagSample = `[OK] ${sym} ${direction} slope=${slopePct.toFixed(3)}% depth=${bounceDepth.toFixed(2)}% body=${(avgBody*100).toFixed(0)}% vol=${trigVolR.toFixed(1)}x sl=${slPct.toFixed(2)}% tp1=${tp1Pct.toFixed(2)}% score=${score}`;
 
       if (score < this.p.minEmitScore) { this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1; return null; }
 
       const grade: ScannerSignal['grade'] =
-        score >= 62 ? 'A+' : score >= 50 ? 'A' : score >= 38 ? 'B' : 'C';
-      const suggestedLeverage =
-        grade === 'A+' ? 10 : grade === 'A' ? 8 : grade === 'B' ? 5 : 3;
+        score >= 55 ? 'A+' : score >= 42 ? 'A' : score >= 32 ? 'B' : 'C';
+      // Leva per €0.50 risk a €10 margin: 5/slPct
+      const suggestedLeverage = Math.min(Math.round(5 / slPct), 100);
 
-      const stopLoss    = parseFloat((entry * (isLong ? 1 - slPct / 100 : 1 + slPct / 100)).toPrecision(6));
+      const stopLoss    = parseFloat(dynSlLevel.toPrecision(6));
       const takeProfit1 = parseFloat((entry * (isLong ? 1 + tp1Pct / 100 : 1 - tp1Pct / 100)).toPrecision(6));
       const takeProfit2 = parseFloat((entry * (isLong ? 1 + tp2Pct / 100 : 1 - tp2Pct / 100)).toPrecision(6));
 
-      // Metriche informative per UI (non usate come filtri)
-      const refVols   = v1.slice(n - 22, n - 2);
-      const refAvgVol = refVols.reduce((a, b) => a + b, 0) / refVols.length;
-      const trigVolR  = refAvgVol > 0 ? v1[n - 2] / refAvgVol : 1;
+      // Metriche informative per UI
+      const atr14_1m = this.indicators.atr(h1, l1, c1, 14);
+      const atr1mPct = entry > 0 ? atr14_1m / entry * 100 : 0;
       const rsi1m    = this.indicators.rsi(c1, 14);
       const rsi5mVal = this.indicators.rsi(c5, 14);
       const macd1m   = this.indicators.macd(c1, 12, 26, 9);

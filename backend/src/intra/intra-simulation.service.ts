@@ -31,9 +31,11 @@ export class IntraSimulationService implements OnModuleInit {
   ) {}
 
   async onModuleInit() {
+    const apiKey = this.config.get<string>('MEXC_API_KEY', '');
+    const secret = this.config.get<string>('MEXC_API_SECRET', '');
+    const hasKeys = apiKey && apiKey !== 'your_api_key_here';
     this.exchange = new ccxt.mexc({
-      apiKey:          this.config.get<string>('MEXC_API_KEY'),
-      secret:          this.config.get<string>('MEXC_API_SECRET'),
+      ...(hasKeys ? { apiKey, secret } : {}),
       enableRateLimit: true,
       options: { defaultType: 'swap' },
     });

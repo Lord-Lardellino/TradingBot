@@ -11,12 +11,10 @@ import { SignalsModule } from './signals/signals.module';
 import { DashboardModule } from './dashboard/dashboard.module';
 import { SettingsModule } from './settings/settings.module';
 import { EventsModule } from './events/events.module';
-import { ScannerModule } from './scanner/scanner.module';
-import { SimulationModule } from './simulation/simulation.module';
 import { LiveModule } from './live/live.module';
 import { AiBrainModule } from './ai-brain/ai-brain.module';
-import { IntraModule } from './intra/intra.module';
-import { MtfScannerModule } from './mtf-scanner/mtf-scanner.module';
+import { GemmaModule } from './gemma/gemma.module';
+import { SmartScannerModule } from './smart-scanner/smart-scanner.module';
 
 @Module({
   imports: [
@@ -32,12 +30,10 @@ import { MtfScannerModule } from './mtf-scanner/mtf-scanner.module';
     DashboardModule,
     SettingsModule,
     EventsModule,
-    ScannerModule,
-    SimulationModule,
     LiveModule,
     AiBrainModule,
-    IntraModule,
-    MtfScannerModule,
+    GemmaModule,
+    SmartScannerModule,
   ],
 })
 export class AppModule {}
