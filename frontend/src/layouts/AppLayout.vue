@@ -102,6 +102,7 @@ const navItems: { to?: string; icon?: string; label?: string; section?: string }
 
   { section: 'Scanners' },
   { to: '/smart',      icon: 'pi-microchip-ai', label: 'Smart AI Scanner' },
+  { to: '/inst',       icon: 'pi-chart-line',   label: 'Inst5m Scanner' },
 
   { section: 'Altro' },
   { to: '/bots',       icon: 'pi-android',      label: 'Bot Manager' },

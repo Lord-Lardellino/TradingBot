@@ -24,6 +24,13 @@
         </p>
       </div>
       <div class="flex items-center gap-2">
+        <button @click="smartStore.toggleLive()"
+          :class="['flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs font-semibold transition-colors',
+            smartStore.analytics?.config?.liveEnabled
+              ? 'bg-red-500/20 border-red-500/30 text-red-400 hover:bg-red-500/30'
+              : 'bg-surface-200 border-white/5 text-gray-500 hover:text-gray-300']">
+          🔴 Smart Live {{ smartStore.analytics?.config?.liveEnabled ? 'ON' : 'OFF' }}
+        </button>
         <div class="flex items-center gap-2 px-3 py-1.5 rounded-lg border text-xs"
           :class="config?.enabled
             ? 'bg-green-500/10 border-green-500/30 text-green-400'
@@ -239,6 +246,35 @@
             />
           </div>
           <div>
+            <div class="text-xs text-gray-500 mb-1.5">Tipo ordine</div>
+            <Select
+              v-model="draft.orderType"
+              :options="[{label:'Limit (ratio esatto)', value:'limit'},{label:'Market (istantaneo)', value:'market'}]"
+              optionLabel="label" optionValue="value"
+              :disabled="configLoading"
+              size="small" fluid
+            />
+          </div>
+          <div>
+            <div class="text-xs text-gray-500 mb-1.5">Risk/Reward (TP)</div>
+            <InputNumber
+              v-model="draft.tpRr"
+              :min="1.0" :max="10.0" :step="0.5" :minFractionDigits="1" :maxFractionDigits="1"
+              :disabled="configLoading"
+              size="small" fluid
+            />
+          </div>
+          <div>
+            <div class="text-xs text-gray-500 mb-1.5">Strategia segnali</div>
+            <Select
+              v-model="draft.liveStrategy"
+              :options="[{label:'Smart AI Scanner (1m)', value:'smart'},{label:'Inst5m Scanner (5m)', value:'inst'}]"
+              optionLabel="label" optionValue="value"
+              :disabled="configLoading"
+              size="small" fluid
+            />
+          </div>
+          <div>
             <div class="text-xs text-gray-500 mb-1.5">Auto-chiusura SL/TP</div>
             <div class="flex items-center gap-2 h-[30px]">
               <ToggleSwitch
@@ -254,7 +290,7 @@
           <Button
             size="small" icon="pi pi-check" label="Salva Config"
             severity="secondary" :loading="configLoading"
-            @click="saveConfig({ marginPerTrade: draft.marginPerTrade, minGrade: draft.minGrade, maxConcurrent: draft.maxConcurrent })"
+            @click="saveConfig({ marginPerTrade: draft.marginPerTrade, minGrade: draft.minGrade, maxConcurrent: draft.maxConcurrent, orderType: draft.orderType, tpRr: draft.tpRr, liveStrategy: draft.liveStrategy })"
           />
         </div>
       </div>
@@ -497,6 +533,7 @@
 <script setup lang="ts">
 import { ref, computed, reactive, watch, onMounted, onUnmounted } from 'vue'
 import { useLiveStore } from '@/stores/live'
+import { useSmartScannerStore } from '@/stores/smart-scanner'
 import Button from 'primevue/button'
 import ToggleSwitch from 'primevue/toggleswitch'
 import Select from 'primevue/select'
@@ -504,6 +541,7 @@ import InputNumber from 'primevue/inputnumber'
 import ProgressSpinner from 'primevue/progressspinner'
 
 const store      = useLiveStore()
+const smartStore = useSmartScannerStore()
 const account    = computed(() => store.account)
 const positions  = computed(() => store.positions)
 const trades     = computed(() => store.trades)
@@ -513,13 +551,16 @@ const analytics  = computed(() => store.analytics)
 const loading    = computed(() => store.loading)
 const configLoading = computed(() => store.configLoading)
 
-const draft = reactive({ marginPerTrade: 5, minGrade: 'A+', maxConcurrent: 2, autoClose: true })
+const draft = reactive({ marginPerTrade: 5, minGrade: 'A+', maxConcurrent: 2, autoClose: true, orderType: 'limit', tpRr: 3.0, liveStrategy: 'smart' })
 watch(config, (cfg) => {
   if (!cfg) return
   draft.marginPerTrade = cfg.marginPerTrade
   draft.minGrade       = cfg.minGrade
   draft.maxConcurrent  = cfg.maxConcurrent
   draft.autoClose      = cfg.autoClose
+  draft.orderType      = cfg.orderType ?? 'limit'
+  draft.tpRr           = cfg.tpRr ?? 3.0
+  draft.liveStrategy   = cfg.liveStrategy ?? 'smart'
 }, { immediate: true })
 
 const closingId = ref<string | null>(null)

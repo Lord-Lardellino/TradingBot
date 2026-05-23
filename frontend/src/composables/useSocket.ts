@@ -58,6 +58,11 @@ export function useSocket() {
     socket.on('smart:positions',(data: any[]) => { import('@/stores/smart-scanner').then(m => m.useSmartScannerStore().updatePositions(data)) })
     socket.on('smart:status',   (data: any)   => { import('@/stores/smart-scanner').then(m => { Object.assign(m.useSmartScannerStore().status, data) }) })
     socket.on('smart:opt-log',  (data: any)   => { import('@/stores/smart-scanner').then(m => m.useSmartScannerStore().addOptLog(data)) })
+
+    socket.on('inst:signal',   (data: any)   => { import('@/stores/inst-scanner').then(m => m.useInstScannerStore().addLiveSignal(data)) })
+    socket.on('inst:trade',    (data: any)   => { import('@/stores/inst-scanner').then(m => m.useInstScannerStore().addLiveTrade(data)) })
+    socket.on('inst:positions',(data: any[]) => { import('@/stores/inst-scanner').then(m => m.useInstScannerStore().updatePositions(data)) })
+    socket.on('inst:status',   (data: any)   => { import('@/stores/inst-scanner').then(m => { Object.assign(m.useInstScannerStore().status, data) }) })
   }
 
   function disconnect() {

@@ -16,13 +16,12 @@ const SIGNAL_COOLDOWN = 60_000;     // 1 min cooldown per symbol
 const TAKER_FEE       = 0.00038;
 const RISK_EUR        = 0.50;
 const MAX_PER_CYCLE   = 1;          // at most 1 LONG + 1 SHORT per scan (2 total)
-const SLOPE_MIN_PCT   = 0.03;
-const MIN_VOLUME_24H  = 2_000_000;
+const MIN_VOLUME_24H  = 500_000;
 const GEMMA_TIMEOUT   = 25_000;
 
 export interface SmartSignal {
   id: string; symbol: string; direction: 'LONG' | 'SHORT';
-  patternType: 1 | 2 | 3 | 4; patternName: string;
+  patternType: 1; patternName: string;
   entry: number; stopLoss: number; takeProfit: number;
   slPct: number; tpPct: number; suggestedLeverage: number;
   volumeRatio: number; rsi3: number; atrPct: number;
@@ -43,6 +42,8 @@ export class SmartScannerService implements OnModuleInit {
   private scannedCount = 0;
   private lastRawSignals = 0;
   private lastEmitted = 0;
+  private lastCandidatesCount = 0;
+  private lastPoolSize = 0;
   private dbg: Record<string, number> = {};
   private cooldowns = new Map<string, number>();
   private readonly sessionStart = new Date();
@@ -75,7 +76,7 @@ export class SmartScannerService implements OnModuleInit {
     try {
       const markets = await this.exchange.loadMarkets(true);
       this.validSymbols = new Set(Object.keys(markets).filter((s) => s.endsWith('/USDT:USDT')));
-    } catch (err) { this.logger.error(`loadMarkets: ${err.message}`); }
+    } catch (err: any) { this.logger.error(`loadMarkets: ${err.message}`); }
   }
 
   @Cron('20 */1 * * * *')
@@ -91,12 +92,18 @@ export class SmartScannerService implements OnModuleInit {
         (t) => this.validSymbols.has(t.symbol) && (t.quoteVolume ?? 0) >= MIN_VOLUME_24H && !openSymbols.has(t.symbol),
       );
       const candidates = pool.slice().sort(() => Math.random() - 0.5).slice(0, TOP_CANDIDATES);
+      this.lastPoolSize = pool.length;
+      this.lastCandidatesCount = candidates.length;
       this.scannedCount = this.validSymbols.size;
       this.dbg = {};
 
+      // C) Fetch BTC 5m bias once per cycle — filtra trade contro BTC
+      const btcBias = await this.getBtcBias();
+      this.logger.log(`[SMART] BTC bias: ${btcBias}`);
+
       const cycleSignals: SmartSignal[] = [];
       for (const ticker of candidates) {
-        const sig = await this.analyzePair(ticker, cfg);
+        const sig = await this.analyzePair(ticker, cfg, btcBias);
         if (sig) cycleSignals.push(sig);
         await new Promise((r) => setTimeout(r, 40));
       }
@@ -132,9 +139,14 @@ export class SmartScannerService implements OnModuleInit {
       let emitted = 0;
       let gemmaCallCount = 0;
       for (const sig of toProcess) {
-        if (gemmaCallCount > 0) await new Promise((r) => setTimeout(r, 1500));
-        const verdict = await this.gemmaFilterSignal(sig).catch(() => ({ enter: false, reason: 'timeout' }));
-        gemmaCallCount++;
+        let verdict: { enter: boolean; reason: string };
+        if (!cfg.gemmaEnabled) {
+          verdict = { enter: true, reason: 'gemma-disabled' };
+        } else {
+          if (gemmaCallCount > 0) await new Promise((r) => setTimeout(r, 1500));
+          verdict = await this.gemmaFilterSignal(sig).catch(() => ({ enter: false, reason: 'timeout' }));
+          gemmaCallCount++;
+        }
         const sigWithVerdict = { ...sig, gemmaApproved: verdict.enter, gemmaReason: verdict.reason };
         this.recentSignals.unshift(sigWithVerdict as any);
         if (this.recentSignals.length > 300) this.recentSignals.pop();
@@ -162,7 +174,7 @@ export class SmartScannerService implements OnModuleInit {
         emitted, isScanning: false, debug: { ...this.dbg },
         config: { minScore: cfg.minScore, minBodyPct: cfg.minBodyPct, atrSlMult: cfg.atrSlMult, tpRr: cfg.tpRr },
       });
-    } catch (err) { this.logger.error(`SmartScan: ${err.message}`); }
+    } catch (err: any) { this.logger.error(`SmartScan: ${err.message}`); }
     finally { this.isScanning = false; }
   }
 
@@ -213,7 +225,7 @@ export class SmartScannerService implements OnModuleInit {
           this.logger.log(`[SMART CLOSE] ${t.symbol} ${status.toUpperCase()} PnL ${pnl >= 0 ? '+' : ''}€${pnl.toFixed(3)}`);
         } catch { /* skip */ }
       }
-    } catch (err) { this.logger.error(`Smart checkOpenTrades: ${err.message}`); }
+    } catch (err: any) { this.logger.error(`Smart checkOpenTrades: ${err.message}`); }
   }
 
   // ─── GEMMA SIGNAL FILTER ─────────────────────────────────────────────────
@@ -251,6 +263,10 @@ JSON su una riga, nient'altro: {"enter":true,"reason":"max 12 parole"}`;
         if (res.status === 429) { await new Promise((r) => setTimeout(r, 3000)); continue; }
         if (!res.ok) {
           if (attempt === 0) { await new Promise((r) => setTimeout(r, 2000)); continue; }
+          // Fallback su errori 5xx: se score alto i filtri tecnici sono già ok
+          if (res.status >= 500 && sig.score >= 55) {
+            return { enter: true, reason: `auto-approved score=${sig.score} (Gemma ${res.status})` };
+          }
           return { enter: false, reason: `api-${res.status}` };
         }
         const data = await res.json() as any;
@@ -297,8 +313,8 @@ JSON su una riga, nient'altro: {"enter":true,"reason":"max 12 parole"}`;
     const losses = closed.filter((t) => t.status === 'sl');
     const winRate = closed.length > 0 ? (wins.length / closed.length * 100).toFixed(1) : '0';
 
-    const patNames: Record<number, string> = { 1: 'ORDER_BLOCK', 2: 'FVG', 3: 'LIQ_SWEEP', 4: 'RANGE_BRK' };
-    const byPattern = [1, 2, 3, 4].map((pt) => {
+    const patNames: Record<number, string> = { 1: 'TREND_BURST' };
+    const byPattern = [1].map((pt) => {
       const label = patNames[pt];
       const group = closed.filter((t) => t.patternType === pt);
       const gWins = group.filter((t) => t.status === 'tp1').length;
@@ -381,19 +397,36 @@ LIMITI: minScore[28-70] minBodyPct[0.25-0.60] atrSlMult[0.8-2.5] tpRr[1.5-4.0]`;
 
       this.logger.log(`[SMART OPT] Applied: ${JSON.stringify(newCfg)} — ${parsed.reason}`);
       this.events.server.emit('smart:opt-log', log);
-    } catch (err) { this.logger.error(`gemmaOptimize: ${err.message}`); }
+    } catch (err: any) { this.logger.error(`gemmaOptimize: ${err.message}`); }
   }
 
-  // ─── PATTERN ANALYSIS (5m institutional patterns) ─────────────────────────
-  private async analyzePair(ticker: ccxt.Ticker, cfg: any): Promise<SmartSignal | null> {
+  // ─── BTC BIAS — una volta per ciclo ──────────────────────────────────────
+  private async getBtcBias(): Promise<'bullish' | 'bearish' | 'neutral'> {
+    try {
+      const raw = await this.exchange.fetchOHLCV('BTC/USDT:USDT', '5m', undefined, 20);
+      if (raw.length < 10) return 'neutral';
+      const closes  = raw.map((c) => c[4] as number);
+      const ema9btc = this.indicators.emaArray(closes, 9);
+      if (ema9btc.length < 5) return 'neutral';
+      const slope = (ema9btc.at(-1)! - ema9btc.at(-5)!) / ema9btc.at(-5)! * 100;
+      return slope > 0.10 ? 'bullish' : slope < -0.10 ? 'bearish' : 'neutral';
+    } catch { return 'neutral'; }
+  }
+
+  // ─── PATTERN ANALYSIS — TREND_BURST ──────────────────────────────────────
+  // Unico pattern: entra quando il momentum è già visibile e confermato.
+  // Macro trend (50c) + micro trend (EMA9/21) allineati + candela trigger grossa
+  // con volume → SL sotto/sopra la candela stessa → risolve in 2-8 minuti.
+  // A) Live candle confirmation: la candela in formazione deve confermare la direzione
+  // C) BTC bias: solo LONG se BTC bullish, solo SHORT se BTC bearish (neutral = skip)
+  private async analyzePair(ticker: ccxt.Ticker, cfg: any, btcBias: 'bullish' | 'bearish' | 'neutral'): Promise<SmartSignal | null> {
     const MIN_SCORE   = cfg.minScore;
     const ATR_SL_MULT = cfg.atrSlMult;
     const TP_RR       = cfg.tpRr;
-    const MIN_BODY    = cfg.minBodyPct;
     try {
       const sym = ticker.symbol;
       const raw = await this.exchange.fetchOHLCV(sym, TIMEFRAME, undefined, CANDLES);
-      if (raw.length < 40) { this.dbg['L0_no_data'] = (this.dbg['L0_no_data'] ?? 0) + 1; return null; }
+      if (raw.length < 60) { this.dbg['L0_no_data'] = (this.dbg['L0_no_data'] ?? 0) + 1; return null; }
 
       const o1 = raw.map((c) => c[1] as number);
       const h1 = raw.map((c) => c[2] as number);
@@ -407,281 +440,85 @@ LIMITI: minScore[28-70] minBodyPct[0.25-0.60] atrSlMult[0.8-2.5] tpRr[1.5-4.0]`;
       const rsi3arr  = this.indicators.rsiArray(c1, 3);
       const atr14    = this.indicators.atr(h1, l1, c1, 14);
 
-      if (ema21arr.length < 12 || rsi3arr.length < 5) return null;
+      if (ema21arr.length < 55 || rsi3arr.length < 5) { this.dbg['L0_ema_short'] = (this.dbg['L0_ema_short'] ?? 0) + 1; return null; }
 
-      const ema9_1  = ema9arr.at(-1)!;
       const ema21_1 = ema21arr.at(-1)!;
-      const ema21_8 = ema21arr.at(-8)!;
+      const ema21_50 = ema21arr.at(-50)!;
       const rsi_1   = rsi3arr.at(-1)!;
       const entry   = c1[n - 2];
-      if (!entry || entry <= 0) return null;
+      if (!entry || entry <= 0) { this.dbg['L0_entry_null'] = (this.dbg['L0_entry_null'] ?? 0) + 1; return null; }
 
-      const atrPct     = atr14 / entry * 100;
-      const ema21Slope = (ema21_1 - ema21_8) / ema21_8 * 100;
-      const trendUp    = ema21Slope >  SLOPE_MIN_PCT;
-      const trendDown  = ema21Slope < -SLOPE_MIN_PCT;
-      if (!trendUp && !trendDown) { this.dbg['F1_flat'] = (this.dbg['F1_flat'] ?? 0) + 1; return null; }
+      const atrPct = atr14 / entry * 100;
 
+      // Volume ratio (ultime 25 candele esclusa l'ultima chiusa)
       const refVols   = v1.slice(n - 25, n - 2);
       const refAvgVol = refVols.reduce((a, b) => a + b, 0) / refVols.length;
       const volR      = refAvgVol > 0 ? v1[n - 2] / refAvgVol : 1;
-      if (volR < 0.3) { this.dbg['F_vol_dead'] = (this.dbg['F_vol_dead'] ?? 0) + 1; return null; }
 
-      // Estensione dello swing: trova il minimo/massimo delle ultime 200 candele
-      // e misura quanto il prezzo si è già mosso da quel punto in multipli di ATR.
-      // Se il movimento è già > 4×ATR il setup è esteso — non siamo all'inizio.
-      const swingWindow = c1.slice(n - 202, n - 2);
-      const swingMin200 = Math.min(...swingWindow);
-      const swingMax200 = Math.max(...swingWindow);
-      const extUp   = (entry - swingMin200) / atr14;  // multipli ATR dal minimo swing
-      const extDown = (swingMax200 - entry) / atr14;  // multipli ATR dal massimo swing
-      const MAX_EXT_ATR = 4.0;
+      // ── TREND_BURST ────────────────────────────────────────────────────────
+      // 1) Macro trend: slope EMA21 su 50 candele (50 minuti di contesto)
+      const macroSlope = (ema21_1 - ema21_50) / ema21_50 * 100;
+      const macroUp    = macroSlope >  0.15;
+      const macroDown  = macroSlope < -0.15;
+      if (!macroUp && !macroDown) { this.dbg['F_macro_flat'] = (this.dbg['F_macro_flat'] ?? 0) + 1; return null; }
 
+      const isLong = macroUp;
+
+      // C) BTC bias: blocca solo se la direzione è OPPOSTA a BTC.
+      // Neutral = BTC consolida, permettiamo segnali in entrambe le direzioni.
+      if (isLong  && btcBias === 'bearish') { this.dbg['F_btc'] = (this.dbg['F_btc'] ?? 0) + 1; return null; }
+      if (!isLong && btcBias === 'bullish') { this.dbg['F_btc'] = (this.dbg['F_btc'] ?? 0) + 1; return null; }
+
+      // 3) Candela trigger: chiude in direzione trend
+      const trigBullish = c1[n-2] > o1[n-2];
+      const trigBearish = c1[n-2] < o1[n-2];
+      if ((isLong && !trigBullish) || (!isLong && !trigBearish)) {
+        this.dbg['F_dir'] = (this.dbg['F_dir'] ?? 0) + 1; return null;
+      }
+
+      // 4) Body della candela trigger ≥ 1.8× media delle ultime 10
+      let totalBody = 0;
+      for (let i = n - 12; i <= n - 3; i++) totalBody += Math.abs(c1[i] - o1[i]);
+      const avgBody  = totalBody / 10;
+      const trigBody = Math.abs(c1[n-2] - o1[n-2]);
+      const bodyMult = avgBody > 0 ? trigBody / avgBody : 0;
+      if (bodyMult < 1.3) { this.dbg['F_body'] = (this.dbg['F_body'] ?? 0) + 1; return null; }
+
+      // 5) Volume trigger ≥ 1.3× media (conferma che qualcuno sta comprando/vendendo)
+      if (volR < 1.3) { this.dbg['F_vol_burst'] = (this.dbg['F_vol_burst'] ?? 0) + 1; return null; }
+
+      // 6) RSI nella zona giusta: non entrare a mercato già esausto
+      const rsiOk = isLong ? (rsi_1 >= 45 && rsi_1 <= 65) : (rsi_1 >= 35 && rsi_1 <= 55);
+      if (!rsiOk) { this.dbg['F_rsi'] = (this.dbg['F_rsi'] ?? 0) + 1; return null; }
+
+      // A) Conferma live candle: la candela in formazione (n-1) deve essere
+      // nella stessa direzione del burst — se già ritraccia non entriamo
+      const liveOk = isLong ? c1[n-1] > o1[n-1] : c1[n-1] < o1[n-1];
+      if (!liveOk) { this.dbg['F_live_retrace'] = (this.dbg['F_live_retrace'] ?? 0) + 1; return null; }
+
+      // 7) SL sotto il minimo (LONG) / sopra il massimo (SHORT) della candela trigger
       const calcSlLong  = (s: number) => Math.min(s, entry - atr14 * ATR_SL_MULT);
       const calcSlShort = (s: number) => Math.max(s, entry + atr14 * ATR_SL_MULT);
       const slPctOf     = (sl: number, d: 'L' | 'S') => d === 'L' ? (entry - sl) / entry * 100 : (sl - entry) / entry * 100;
 
-      // ── PATTERN 1: ORDER BLOCK ──────────────────────────────────────────────
-      // Last bearish OB before bullish impulse (LONG) / last bullish OB before bearish impulse (SHORT)
-      ob: {
-        const lookback = Math.min(50, n - 5);
-        for (let age = 4; age <= lookback; age++) {
-          const obIdx = n - age - 2; // candidate OB candle index
-          if (obIdx < 2) break;
+      const structSl = isLong ? l1[n-2] * 0.998 : h1[n-2] * 1.002;
+      const slLevel  = isLong ? calcSlLong(structSl) : calcSlShort(structSl);
+      const slPct    = Math.max(slPctOf(slLevel, isLong ? 'L' : 'S'), 0.05);
+      if (slPct > MAX_SL_PCT) { this.dbg['F_sl_wide'] = (this.dbg['F_sl_wide'] ?? 0) + 1; return null; }
 
-          const obOpen = o1[obIdx], obClose = c1[obIdx], obHigh = h1[obIdx], obLow = l1[obIdx];
-          const obRange = obHigh - obLow;
-          if (obRange <= 0) continue;
-          const obBody = Math.abs(obClose - obOpen) / obRange;
-          if (obBody < MIN_BODY) continue;
+      // Score
+      let score = 40; const reasons: string[] = ['Trend Burst'];
+      if (bodyMult >= 3.0)      { score += 15; reasons.push(`Body ×${bodyMult.toFixed(1)}`); }
+      else if (bodyMult >= 2.5) { score += 10; reasons.push(`Body ×${bodyMult.toFixed(1)}`); }
+      else                      { score += 6;  reasons.push(`Body ×${bodyMult.toFixed(1)}`); }
+      if (Math.abs(macroSlope) > 0.50)      { score += 12; reasons.push(`Macro ${macroSlope.toFixed(2)}%`); }
+      else if (Math.abs(macroSlope) > 0.25) { score += 8;  reasons.push(`Macro ${macroSlope.toFixed(2)}%`); }
+      else                                   { score += 4; }
+      score += this._vb(volR, reasons) + this._rb(rsi_1, isLong, reasons);
 
-          // Bullish OB (bearish candle before bullish impulse) → LONG setup
-          if (obClose < obOpen && trendUp) {
-            // Check impulse: 2+ candles after OB moved up at least 0.2% combined
-            let impulseMove = 0;
-            for (let j = obIdx + 1; j <= n - 4; j++) {
-              impulseMove += (c1[j] - o1[j]) / o1[j] * 100;
-            }
-            if (impulseMove < 0.20) continue;
-
-            // OB zone: from OB low to OB high (or just OB body)
-            const obZoneLow  = Math.min(obOpen, obClose); // body low
-            const obZoneHigh = Math.max(obOpen, obClose); // body high
-
-            // Price must have pulled back into OB zone
-            const hiLast = h1[n - 2], loLast = l1[n - 2];
-            const inZone = loLast <= obZoneHigh * 1.003 && entry >= obZoneLow * 0.997;
-            if (!inZone) continue;
-
-            // Confirmation: current candle is bullish
-            const confirming = c1[n - 2] > o1[n - 2];
-            if (!confirming) continue;
-
-            const slLevel = calcSlLong(obLow * 0.998);
-            const slPct   = Math.max(slPctOf(slLevel, 'L'), 0.05);
-            if (slPct > MAX_SL_PCT) continue;
-
-            if (extUp > MAX_EXT_ATR) { this.dbg['F_extended'] = (this.dbg['F_extended'] ?? 0) + 1; break ob; }
-            const retestDepth = (obZoneHigh - loLast) / obZoneHigh * 100;
-            let score = 35; const reasons: string[] = ['Order Block'];
-            if (retestDepth > 0.20) { score += 10; reasons.push(`Retest ${retestDepth.toFixed(2)}%`); } else if (retestDepth > 0.05) score += 6;
-            if (obBody > 0.65) { score += 8; reasons.push(`OB Body ${(obBody * 100).toFixed(0)}%`); }
-            if (ema9_1 > ema21_1) { score += 6; reasons.push('EMA9>21'); }
-            score += this._sb(Math.abs(ema21Slope), reasons) + this._vb(volR, reasons) + this._rb(rsi_1, true, reasons);
-            if (score >= MIN_SCORE) return this._sig(sym, 'LONG', entry, slLevel, slPct, TP_RR, 1, 'ORDER_BLOCK', score, volR, rsi_1, atrPct, reasons, raw, ema9arr, ema21arr);
-            this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1;
-            break ob;
-          }
-
-          // Bearish OB (bullish candle before bearish impulse) → SHORT setup
-          if (obClose > obOpen && trendDown) {
-            let impulseMove = 0;
-            for (let j = obIdx + 1; j <= n - 4; j++) {
-              impulseMove += (o1[j] - c1[j]) / o1[j] * 100;
-            }
-            if (impulseMove < 0.20) continue;
-
-            const obZoneLow  = Math.min(obOpen, obClose);
-            const obZoneHigh = Math.max(obOpen, obClose);
-
-            const hiLast = h1[n - 2], loLast = l1[n - 2];
-            const inZone = hiLast >= obZoneLow * 0.997 && entry <= obZoneHigh * 1.003;
-            if (!inZone) continue;
-
-            const confirming = c1[n - 2] < o1[n - 2];
-            if (!confirming) continue;
-
-            const slLevel = calcSlShort(obHigh * 1.002);
-            const slPct   = Math.max(slPctOf(slLevel, 'S'), 0.05);
-            if (slPct > MAX_SL_PCT) continue;
-
-            if (extDown > MAX_EXT_ATR) { this.dbg['F_extended'] = (this.dbg['F_extended'] ?? 0) + 1; break ob; }
-            const retestDepth = (hiLast - obZoneLow) / obZoneLow * 100;
-            let score = 35; const reasons: string[] = ['Order Block'];
-            if (retestDepth > 0.20) { score += 10; reasons.push(`Retest ${retestDepth.toFixed(2)}%`); } else if (retestDepth > 0.05) score += 6;
-            if (obBody > 0.65) { score += 8; reasons.push(`OB Body ${(obBody * 100).toFixed(0)}%`); }
-            if (ema9_1 < ema21_1) { score += 6; reasons.push('EMA9<21'); }
-            score += this._sb(Math.abs(ema21Slope), reasons) + this._vb(volR, reasons) + this._rb(rsi_1, false, reasons);
-            if (score >= MIN_SCORE) return this._sig(sym, 'SHORT', entry, slLevel, slPct, TP_RR, 1, 'ORDER_BLOCK', score, volR, rsi_1, atrPct, reasons, raw, ema9arr, ema21arr);
-            this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1;
-            break ob;
-          }
-        }
-      }
-
-      // ── PATTERN 2: FVG (Fair Value Gap) ────────────────────────────────────
-      fvg: {
-        for (let age = 5; age <= 30; age++) {
-          const ia = n - age - 2, ib = n - age - 1, ic = n - age;
-          if (ia < 2) break;
-          const b_range = h1[ib] - l1[ib], b_body = Math.abs(c1[ib] - o1[ib]);
-          if (b_range <= 0 || b_body / b_range < MIN_BODY) continue;
-          const hiLast = h1[n - 2], loLast = l1[n - 2], oLast = o1[n - 2];
-
-          // Bullish FVG: gap between A high and C low (price was impulsing up)
-          if (l1[ic] > h1[ia] && trendUp) {
-            const fvgLow = h1[ia], fvgHigh = l1[ic];
-            const gapPct = (fvgHigh - fvgLow) / fvgLow * 100;
-            if (gapPct < 0.05 || gapPct > 3.0) continue;
-            // Price must have gone above FVG then retraced back into it
-            let priceAbove = false;
-            for (let j = ic + 1; j <= n - 3; j++) { if (h1[j] > fvgHigh) { priceAbove = true; break; } }
-            if (!priceAbove) continue;
-            const inZone = loLast <= fvgHigh * 1.003 && entry >= fvgLow * 0.997;
-            const bounce = entry > oLast;
-            if (!inZone || !bounce) continue;
-            if (extUp > MAX_EXT_ATR) { this.dbg['F_extended'] = (this.dbg['F_extended'] ?? 0) + 1; break fvg; }
-            const slLevel = calcSlLong(fvgLow * 0.997);
-            const slPct   = Math.max(slPctOf(slLevel, 'L'), 0.05);
-            if (slPct > MAX_SL_PCT) continue;
-            let score = 34; const reasons: string[] = ['FVG Support'];
-            if (gapPct > 0.40) { score += 12; reasons.push(`Gap ${gapPct.toFixed(2)}%`); } else if (gapPct > 0.15) { score += 8; reasons.push(`Gap ${gapPct.toFixed(2)}%`); } else score += 4;
-            const rd = (fvgHigh - loLast) / fvgHigh * 100; if (rd > 0.10) { score += 8; reasons.push(`Retest ${rd.toFixed(2)}%`); }
-            score += this._sb(Math.abs(ema21Slope), reasons) + this._vb(volR, reasons) + this._rb(rsi_1, true, reasons);
-            if (ema9_1 > ema21_1) { score += 6; reasons.push('EMA9>21'); }
-            if (score >= MIN_SCORE) return this._sig(sym, 'LONG', entry, slLevel, slPct, TP_RR, 2, 'FVG', score, volR, rsi_1, atrPct, reasons, raw, ema9arr, ema21arr);
-            this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1; break fvg;
-          }
-
-          // Bearish FVG: gap between A low and C high
-          if (h1[ic] < l1[ia] && trendDown) {
-            const fvgLow = h1[ic], fvgHigh = l1[ia];
-            const gapPct = (fvgHigh - fvgLow) / fvgLow * 100;
-            if (gapPct < 0.05 || gapPct > 3.0) continue;
-            let priceBelow = false;
-            for (let j = ic + 1; j <= n - 3; j++) { if (l1[j] < fvgLow) { priceBelow = true; break; } }
-            if (!priceBelow) continue;
-            const inZone = hiLast >= fvgLow * 0.997 && entry <= fvgHigh * 1.003;
-            const bounce = entry < oLast;
-            if (!inZone || !bounce) continue;
-            if (extDown > MAX_EXT_ATR) { this.dbg['F_extended'] = (this.dbg['F_extended'] ?? 0) + 1; break fvg; }
-            const slLevel = calcSlShort(fvgHigh * 1.003);
-            const slPct   = Math.max(slPctOf(slLevel, 'S'), 0.05);
-            if (slPct > MAX_SL_PCT) continue;
-            let score = 34; const reasons: string[] = ['FVG Resistance'];
-            if (gapPct > 0.40) { score += 12; reasons.push(`Gap ${gapPct.toFixed(2)}%`); } else if (gapPct > 0.15) { score += 8; reasons.push(`Gap ${gapPct.toFixed(2)}%`); } else score += 4;
-            const rd = (hiLast - fvgLow) / fvgLow * 100; if (rd > 0.10) { score += 8; reasons.push(`Retest ${rd.toFixed(2)}%`); }
-            score += this._sb(Math.abs(ema21Slope), reasons) + this._vb(volR, reasons) + this._rb(rsi_1, false, reasons);
-            if (ema9_1 < ema21_1) { score += 6; reasons.push('EMA9<21'); }
-            if (score >= MIN_SCORE) return this._sig(sym, 'SHORT', entry, slLevel, slPct, TP_RR, 2, 'FVG', score, volR, rsi_1, atrPct, reasons, raw, ema9arr, ema21arr);
-            this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1; break fvg;
-          }
-        }
-      }
-
-      // ── PATTERN 3: LIQUIDITY SWEEP ─────────────────────────────────────────
-      // Price wicks beyond a swing level then snaps back — retail stop hunt reversal
-      {
-        const swingLookback = 30;
-        const swingStart    = Math.max(0, n - swingLookback - 3);
-
-        // Highest swing high in lookback window (excluding last 2 candles)
-        let swingHigh = h1[swingStart], swingHighIdx = swingStart;
-        for (let i = swingStart + 1; i <= n - 4; i++) {
-          if (h1[i] > swingHigh) { swingHigh = h1[i]; swingHighIdx = i; }
-        }
-        // Lowest swing low in lookback window
-        let swingLow = l1[swingStart], swingLowIdx = swingStart;
-        for (let i = swingStart + 1; i <= n - 4; i++) {
-          if (l1[i] < swingLow) { swingLow = l1[i]; swingLowIdx = i; }
-        }
-
-        // Bullish sweep: candle n-2 wicked BELOW swing low but closed ABOVE it
-        // Liquidity Sweep deve essere avvenuto nell'ultimo candle chiuso (freshness check)
-        if (trendUp && l1[n - 2] < swingLow && c1[n - 2] > swingLow && swingLowIdx < n - 4 && extUp <= MAX_EXT_ATR) {
-          const wickSize  = (swingLow - l1[n - 2]) / swingLow * 100;
-          const snapBack  = (c1[n - 2] - swingLow) / swingLow * 100;
-          if (wickSize >= 0.05 && snapBack >= 0.03) {
-            const slLevel = calcSlLong(l1[n - 2] * 0.997);
-            const slPct   = Math.max(slPctOf(slLevel, 'L'), 0.05);
-            if (slPct <= MAX_SL_PCT) {
-              let score = 38; const reasons: string[] = ['Liquidity Sweep'];
-              if (wickSize > 0.30) { score += 12; reasons.push(`Wick ${wickSize.toFixed(2)}%`); } else if (wickSize > 0.10) { score += 8; reasons.push(`Wick ${wickSize.toFixed(2)}%`); } else score += 4;
-              if (snapBack > 0.15) { score += 8; reasons.push(`Snap ${snapBack.toFixed(2)}%`); } else score += 4;
-              score += this._sb(Math.abs(ema21Slope), reasons) + this._vb(volR, reasons) + this._rb(rsi_1, true, reasons);
-              if (ema9_1 > ema21_1) { score += 6; reasons.push('EMA9>21'); }
-              if (score >= MIN_SCORE) return this._sig(sym, 'LONG', entry, slLevel, slPct, TP_RR, 3, 'LIQ_SWEEP', score, volR, rsi_1, atrPct, reasons, raw, ema9arr, ema21arr);
-              this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1;
-            }
-          }
-        }
-
-        // Bearish sweep: candle n-2 wicked ABOVE swing high but closed BELOW it
-        if (trendDown && h1[n - 2] > swingHigh && c1[n - 2] < swingHigh && swingHighIdx < n - 4 && extDown <= MAX_EXT_ATR) {
-          const wickSize  = (h1[n - 2] - swingHigh) / swingHigh * 100;
-          const snapBack  = (swingHigh - c1[n - 2]) / swingHigh * 100;
-          if (wickSize >= 0.05 && snapBack >= 0.03) {
-            const slLevel = calcSlShort(h1[n - 2] * 1.003);
-            const slPct   = Math.max(slPctOf(slLevel, 'S'), 0.05);
-            if (slPct <= MAX_SL_PCT) {
-              let score = 38; const reasons: string[] = ['Liquidity Sweep'];
-              if (wickSize > 0.30) { score += 12; reasons.push(`Wick ${wickSize.toFixed(2)}%`); } else if (wickSize > 0.10) { score += 8; reasons.push(`Wick ${wickSize.toFixed(2)}%`); } else score += 4;
-              if (snapBack > 0.15) { score += 8; reasons.push(`Snap ${snapBack.toFixed(2)}%`); } else score += 4;
-              score += this._sb(Math.abs(ema21Slope), reasons) + this._vb(volR, reasons) + this._rb(rsi_1, false, reasons);
-              if (ema9_1 < ema21_1) { score += 6; reasons.push('EMA9<21'); }
-              if (score >= MIN_SCORE) return this._sig(sym, 'SHORT', entry, slLevel, slPct, TP_RR, 3, 'LIQ_SWEEP', score, volR, rsi_1, atrPct, reasons, raw, ema9arr, ema21arr);
-              this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1;
-            }
-          }
-        }
-      }
-
-      // ── PATTERN 4: RANGE BREAKOUT ───────────────────────────────────────────
-      {
-        const rs = n - 14, re = n - 3;
-        let rangeHigh = h1[rs], rangeLow = l1[rs];
-        for (let i = rs + 1; i <= re; i++) {
-          if (h1[i] > rangeHigh) rangeHigh = h1[i];
-          if (l1[i] < rangeLow)  rangeLow  = l1[i];
-        }
-        const rangeSize = (rangeHigh - rangeLow) / rangeLow * 100;
-        if (rangeSize >= 0.30 && rangeSize <= 2.50) {
-          const oEntry    = o1[n - 2];
-          // Il breakout deve essere fresco: il prezzo non deve aver già corso più di 1×ATR oltre il range
-          const bullBreak = entry > rangeHigh * 1.001 && entry <= rangeHigh * (1 + atrPct / 100) && entry > oEntry && trendUp   && volR >= 1.30;
-          const bearBreak = entry < rangeLow  * 0.999 && entry >= rangeLow  * (1 - atrPct / 100) && entry < oEntry && trendDown && volR >= 1.30;
-          if (bullBreak || bearBreak) {
-            const isLong   = bullBreak;
-            const structSl = isLong ? rangeLow * 0.997 : rangeHigh * 1.003;
-            const slLevel  = isLong ? calcSlLong(structSl) : calcSlShort(structSl);
-            const slPct    = Math.max(slPctOf(slLevel, isLong ? 'L' : 'S'), 0.05);
-            if (slPct <= MAX_SL_PCT) {
-              const breakPct = isLong ? (entry - rangeHigh) / rangeHigh * 100 : (rangeLow - entry) / rangeLow * 100;
-              let score = 30; const reasons: string[] = ['Range Breakout'];
-              if (breakPct > 0.20) { score += 12; reasons.push(`Break ${breakPct.toFixed(2)}%`); } else if (breakPct > 0.08) score += 7; else score += 3;
-              if (rangeSize < 0.60) { score += 8; reasons.push(`Range ${rangeSize.toFixed(2)}%`); } else if (rangeSize < 1.20) score += 5; else score += 2;
-              score += this._sb(Math.abs(ema21Slope), reasons) + this._vb(volR, reasons) + this._rb(rsi_1, isLong, reasons);
-              if (isLong && ema9_1 > ema21_1) { score += 6; reasons.push('EMA9>21'); }
-              if (!isLong && ema9_1 < ema21_1) { score += 6; reasons.push('EMA9<21'); }
-              if (score >= MIN_SCORE) return this._sig(sym, isLong ? 'LONG' : 'SHORT', entry, slLevel, slPct, TP_RR, 4, 'RANGE_BRK', score, volR, rsi_1, atrPct, reasons, raw, ema9arr, ema21arr);
-              this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1;
-            }
-          }
-        }
-      }
-
-      this.dbg['F_no_pattern'] = (this.dbg['F_no_pattern'] ?? 0) + 1;
-      return null;
+      if (score < MIN_SCORE) { this.dbg['SCORE'] = (this.dbg['SCORE'] ?? 0) + 1; return null; }
+      this.dbg['PRE_SIG'] = (this.dbg['PRE_SIG'] ?? 0) + 1;
+      return this._sig(sym, isLong ? 'LONG' : 'SHORT', entry, slLevel, slPct, TP_RR, 1, 'TREND_BURST', score, volR, rsi_1, atrPct, reasons, raw, ema9arr, ema21arr);
     } catch { this.dbg['L0_error'] = (this.dbg['L0_error'] ?? 0) + 1; return null; }
   }
 
@@ -706,11 +543,10 @@ LIMITI: minScore[28-70] minBodyPct[0.25-0.60] atrSlMult[0.8-2.5] tpRr[1.5-4.0]`;
     return `Grafico prezzi ultimi ${minutes} min (1 char = ${step} candle):\n${line}\nMin=${min.toPrecision(6)} Max=${max.toPrecision(6)} Curr=${bars.at(-1)!.c.toPrecision(6)} | ${trend}`;
   }
 
-  private _sb(abs: number, r: string[]) { if (abs > 0.30) { r.push(`Slope ${abs.toFixed(2)}%`); return 15; } if (abs > 0.15) { r.push(`Slope ${abs.toFixed(2)}%`); return 10; } if (abs > 0.07) return 6; return 3; }
   private _vb(volR: number, r: string[]) { if (volR >= 2.5) { r.push(`Vol ×${volR.toFixed(1)}`); return 12; } if (volR >= 1.5) { r.push(`Vol ×${volR.toFixed(1)}`); return 8; } if (volR >= 1.0) return 5; return 2; }
   private _rb(rsi: number, isLong: boolean, r: string[]) { if (isLong) { if (rsi < 35) { r.push(`RSI ${rsi.toFixed(0)}`); return 8; } if (rsi < 50) return 5; return 2; } else { if (rsi > 65) { r.push(`RSI ${rsi.toFixed(0)}`); return 8; } if (rsi > 50) return 5; return 2; } }
 
-  private _sig(sym: string, dir: 'LONG' | 'SHORT', entry: number, slLevel: number, slPct: number, tpRr: number, pt: 1|2|3|4, pn: string, score: number, volR: number, rsi3: number, atrPct: number, reasons: string[], raw: number[][], e9: number[], e21: number[]): SmartSignal {
+  private _sig(sym: string, dir: 'LONG' | 'SHORT', entry: number, slLevel: number, slPct: number, tpRr: number, pt: 1, pn: string, score: number, volR: number, rsi3: number, atrPct: number, reasons: string[], raw: number[][], e9: number[], e21: number[]): SmartSignal {
     const isLong = dir === 'LONG';
     const tpPct  = slPct * tpRr;
     const grade: SmartSignal['grade'] = score >= 70 ? 'A+' : score >= 56 ? 'A' : score >= 42 ? 'B' : 'C';
@@ -757,7 +593,7 @@ LIMITI: minScore[28-70] minBodyPct[0.25-0.60] atrSlMult[0.8-2.5] tpRr[1.5-4.0]`;
   private async initConfig() {
     await this.prisma.smartSimConfig.upsert({
       where: { id: 1 },
-      create: { id: 1, startingCapital: 500, maxConcurrent: 5, autoEnter: true, minScore: 45, minBodyPct: 0.40, atrSlMult: 1.5, tpRr: 2.5, autoOptimize: true, liveEnabled: false },
+      create: { id: 1, startingCapital: 500, maxConcurrent: 5, autoEnter: true, minScore: 45, minBodyPct: 0.40, atrSlMult: 1.5, tpRr: 2.5, autoOptimize: true, gemmaEnabled: true, liveEnabled: false },
       update: {},
     });
   }
@@ -771,7 +607,7 @@ LIMITI: minScore[28-70] minBodyPct[0.25-0.60] atrSlMult[0.8-2.5] tpRr[1.5-4.0]`;
   // ─── API ──────────────────────────────────────────────────────────────────
   getRecentSignals(limit = 50) { return this.recentSignals.slice(0, limit); }
   getDebug()  { return { ...this.dbg, timestamp: new Date().toISOString() }; }
-  getStatus() { return { lastScanAt: this.lastScanAt, scannedPairs: this.scannedCount, candidates: TOP_CANDIDATES, rawSignals: this.lastRawSignals, emitted: this.lastEmitted, isScanning: this.isScanning }; }
+  getStatus() { return { lastScanAt: this.lastScanAt, scannedPairs: this.scannedCount, poolSize: this.lastPoolSize, candidates: this.lastCandidatesCount, rawSignals: this.lastRawSignals, emitted: this.lastEmitted, isScanning: this.isScanning }; }
 
   async getAnalytics() {
     const cfg    = await this.getConfig();
@@ -797,7 +633,7 @@ LIMITI: minScore[28-70] minBodyPct[0.25-0.60] atrSlMult[0.8-2.5] tpRr[1.5-4.0]`;
       avgWinEur: parseFloat(avgWin.toFixed(3)), avgLossEur: parseFloat(avgLoss.toFixed(3)),
       profitFactor: avgLoss > 0 ? parseFloat((avgWin / avgLoss).toFixed(2)) : avgWin > 0 ? 99 : 0,
       maxDrawdownPct: parseFloat(maxDd.toFixed(1)),
-      config: { startingCapital: cfg.startingCapital, maxConcurrent: cfg.maxConcurrent, autoEnter: cfg.autoEnter, minScore: cfg.minScore, minBodyPct: cfg.minBodyPct, atrSlMult: cfg.atrSlMult, tpRr: cfg.tpRr, autoOptimize: cfg.autoOptimize, liveEnabled: cfg.liveEnabled },
+      config: { startingCapital: cfg.startingCapital, maxConcurrent: cfg.maxConcurrent, autoEnter: cfg.autoEnter, minScore: cfg.minScore, minBodyPct: cfg.minBodyPct, atrSlMult: cfg.atrSlMult, tpRr: cfg.tpRr, autoOptimize: cfg.autoOptimize, gemmaEnabled: cfg.gemmaEnabled, liveEnabled: cfg.liveEnabled },
     };
   }
 

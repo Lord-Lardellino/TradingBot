@@ -56,17 +56,9 @@
       <span :class="['text-[10px] font-mono px-2 py-1 rounded-full', store.analytics.config.autoOptimize ? 'bg-brand/20 text-brand' : 'bg-surface-200 text-gray-500']">
         🤖 Auto-tune {{ store.analytics.config.autoOptimize ? 'ON' : 'OFF' }}
       </span>
-      <button @click="store.toggleLive()"
-        :class="['text-[10px] font-mono px-2 py-1 rounded-full border transition-colors', store.analytics.config.liveEnabled ? 'bg-red-500/20 text-red-400 border-red-500/30 hover:bg-red-500/30' : 'bg-surface-200 text-gray-500 border-white/5 hover:text-gray-300']">
-        🔴 Live {{ store.analytics.config.liveEnabled ? 'ON' : 'OFF' }}
+      <button @click="toggleGemma" :class="['text-[10px] font-mono px-2 py-1 rounded-full cursor-pointer transition-colors', store.analytics.config.gemmaEnabled ? 'bg-brand/20 text-brand hover:bg-brand/30' : 'bg-yellow-500/20 text-yellow-400 hover:bg-yellow-500/30']">
+        ✨ Gemma {{ store.analytics.config.gemmaEnabled ? 'ON' : 'OFF' }}
       </button>
-    </div>
-
-    <!-- Live warning -->
-    <div v-if="store.analytics?.config?.liveEnabled"
-      class="flex items-center gap-2 px-4 py-2 rounded-xl bg-red-500/10 border border-red-500/30 text-red-400 text-xs font-medium">
-      <i class="pi pi-exclamation-triangle" />
-      ATTENZIONE: Gli ordini approvati da Gemma vengono eseguiti su MEXC con soldi reali!
     </div>
 
     <!-- Tabs -->
@@ -121,21 +113,34 @@
       </div>
       <div v-else class="space-y-2">
         <div v-for="t in store.trades" :key="t.id"
-          :class="['bg-surface-50 border rounded-xl p-3 flex flex-wrap gap-3 items-center text-sm', t.status === 'open' ? 'border-brand/30' : (t.pnl ?? 0) >= 0 ? 'border-profit/20' : 'border-loss/20']">
-          <span :class="['text-xs font-bold px-2 py-1 rounded-full', t.direction === 'LONG' ? 'bg-profit/20 text-profit' : 'bg-loss/20 text-loss']">{{ t.direction }}</span>
-          <span class="font-semibold text-white">{{ t.symbol.replace('/USDT:USDT', '') }}</span>
-          <span class="text-gray-400 text-xs">@ {{ t.entry }}</span>
-          <span :class="['text-xs font-mono px-2 py-0.5 rounded-full', t.status === 'open' ? 'bg-brand/20 text-brand' : (t.pnl ?? 0) >= 0 ? 'bg-profit/20 text-profit' : 'bg-loss/20 text-loss']">
-            {{ t.status === 'open' ? 'APERTO' : t.status.toUpperCase() }}
-          </span>
-          <div class="ml-auto flex gap-4 text-xs text-gray-400">
-            <span v-if="t.status === 'open' && t.unrealizedPnl !== undefined" :class="(t.unrealizedPnl ?? 0) >= 0 ? 'text-profit' : 'text-loss'">
-              {{ (t.unrealizedPnl ?? 0) >= 0 ? '+' : '' }}€{{ (t.unrealizedPnl ?? 0).toFixed(3) }}
+          :class="['bg-surface-50 border rounded-xl p-3 space-y-2 text-sm', t.status === 'open' ? 'border-brand/30' : (t.pnl ?? 0) >= 0 ? 'border-profit/20' : 'border-loss/20']">
+          <!-- Row 1: direction, symbol, status, pnl, grade, link -->
+          <div class="flex flex-wrap gap-3 items-center">
+            <span :class="['text-xs font-bold px-2 py-1 rounded-full', t.direction === 'LONG' ? 'bg-profit/20 text-profit' : 'bg-loss/20 text-loss']">{{ t.direction }}</span>
+            <a :href="`https://futures.mexc.com/exchange/${t.symbol.replace('/USDT:USDT', '_USDT')}`" target="_blank"
+               class="font-semibold text-white hover:text-brand transition-colors flex items-center gap-1">
+              {{ t.symbol.replace('/USDT:USDT', '') }}
+              <i class="pi pi-external-link text-[10px] text-gray-500" />
+            </a>
+            <span class="text-gray-400 text-xs">@ {{ t.entry }}</span>
+            <span :class="['text-xs font-mono px-2 py-0.5 rounded-full', t.status === 'open' ? 'bg-brand/20 text-brand' : (t.pnl ?? 0) >= 0 ? 'bg-profit/20 text-profit' : 'bg-loss/20 text-loss']">
+              {{ t.status === 'open' ? 'APERTO' : t.status.toUpperCase() }}
             </span>
-            <span v-else-if="t.pnl !== undefined" :class="(t.pnl ?? 0) >= 0 ? 'text-profit' : 'text-loss'">
-              {{ (t.pnl ?? 0) >= 0 ? '+' : '' }}€{{ (t.pnl ?? 0).toFixed(3) }}
-            </span>
-            <span>Grade <b class="text-white">{{ t.grade }}</b></span>
+            <div class="ml-auto flex gap-4 text-xs text-gray-400">
+              <span v-if="t.status === 'open' && t.unrealizedPnl !== undefined" :class="(t.unrealizedPnl ?? 0) >= 0 ? 'text-profit' : 'text-loss'">
+                {{ (t.unrealizedPnl ?? 0) >= 0 ? '+' : '' }}€{{ (t.unrealizedPnl ?? 0).toFixed(3) }}
+              </span>
+              <span v-else-if="t.pnl !== undefined" :class="(t.pnl ?? 0) >= 0 ? 'text-profit' : 'text-loss'">
+                {{ (t.pnl ?? 0) >= 0 ? '+' : '' }}€{{ (t.pnl ?? 0).toFixed(3) }}
+              </span>
+              <span>Grade <b class="text-white">{{ t.grade }}</b></span>
+            </div>
+          </div>
+          <!-- Row 2: SL / TP levels -->
+          <div class="flex gap-4 text-[11px] text-gray-500 pl-1">
+            <span>SL <b class="text-loss font-mono">{{ t.stopLoss }}</b></span>
+            <span>TP <b class="text-profit font-mono">{{ t.takeProfit1 }}</b></span>
+            <span class="text-gray-600">leva {{ t.leverage }}×</span>
           </div>
         </div>
       </div>
@@ -150,6 +155,13 @@
           <button @click="toggleAutoOptimize"
             :class="['w-10 h-5 rounded-full transition-colors relative', store.analytics?.config?.autoOptimize ? 'bg-brand' : 'bg-surface-200']">
             <span :class="['absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform', store.analytics?.config?.autoOptimize ? 'translate-x-5' : 'translate-x-0.5']" />
+          </button>
+        </div>
+        <div class="flex items-center gap-2">
+          <label class="text-xs text-gray-400">Filtro Gemma AI</label>
+          <button @click="toggleGemma"
+            :class="['w-10 h-5 rounded-full transition-colors relative', store.analytics?.config?.gemmaEnabled ? 'bg-brand' : 'bg-surface-200']">
+            <span :class="['absolute top-0.5 w-4 h-4 rounded-full bg-white transition-transform', store.analytics?.config?.gemmaEnabled ? 'translate-x-5' : 'translate-x-0.5']" />
           </button>
         </div>
         <button @click="store.triggerOptimize()" class="text-xs px-3 py-1.5 rounded-lg bg-brand/20 text-brand border border-brand/30 hover:bg-brand/30">
@@ -219,7 +231,10 @@ function patBadge(pt: number) {
   if (pt === 1) return 'bg-orange-500/20 text-orange-400'
   if (pt === 2) return 'bg-blue-500/20 text-blue-400'
   if (pt === 3) return 'bg-purple-500/20 text-purple-400'
-  return 'bg-teal-500/20 text-teal-400'
+  if (pt === 4) return 'bg-teal-500/20 text-teal-400'
+  if (pt === 5) return 'bg-green-500/20 text-green-400'
+  if (pt === 6) return 'bg-yellow-500/20 text-yellow-300'
+  return 'bg-gray-500/20 text-gray-400'
 }
 function gradeBadge(g: string) {
   if (g === 'A+') return 'text-yellow-400 font-bold'
@@ -233,6 +248,10 @@ function parsedChanges(raw: string) {
 async function toggleAutoOptimize() {
   const current = store.analytics?.config?.autoOptimize ?? true
   await store.updateConfig({ autoOptimize: !current })
+}
+async function toggleGemma() {
+  const current = store.analytics?.config?.gemmaEnabled ?? true
+  await store.updateConfig({ gemmaEnabled: !current })
 }
 
 onMounted(async () => {

@@ -30,6 +30,12 @@ const router = createRouter({
           meta: { title: 'Smart Scanner' },
         },
         {
+          path: 'inst',
+          name: 'inst',
+          component: () => import('@/pages/InstScanner.vue'),
+          meta: { title: 'Inst5m Scanner' },
+        },
+        {
           path: 'bots',
           name: 'bots',
           component: () => import('@/pages/BotConfig.vue'),

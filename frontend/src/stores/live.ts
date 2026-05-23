@@ -73,6 +73,9 @@ export interface LiveTradingConfig {
   marginPerTrade: number
   minGrade: string
   maxConcurrent: number
+  orderType: string
+  tpRr: number
+  liveStrategy: string
 }
 
 export interface LiveTradingAnalytics {

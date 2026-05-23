@@ -162,11 +162,12 @@ model LiveTrade {
   positionSize  Float
   contracts     Float
   orderId       String?
+  limitOrderId  String?   // pending limit order ID (before fill)
   slOrderId     String?   // MEXC native stop-loss order ID
   tpOrderId     String?   // MEXC native take-profit order ID
   grade         String
   score         Int
-  status        String    @default("open") // open | tp | sl | manual | error
+  status        String    @default("open") // pending | open | tp | sl | manual | error | expired
   closePrice    Float?
   pnl           Float?
   feesOpen      Float?    // fee effettiva apertura
@@ -183,6 +184,9 @@ model LiveConfig {
   marginPerTrade  Float    @default(5)
   minGrade        String   @default("A+")
   maxConcurrent   Int      @default(2)
+  orderType       String   @default("limit")  // "limit" | "market"
+  tpRr            Float    @default(3.0)      // Risk/Reward ratio per il TP
+  liveStrategy    String   @default("smart")  // "smart" | "inst" — quale scanner alimenta il live
   updatedAt       DateTime @updatedAt
 }
 
@@ -411,6 +415,7 @@ model SmartSimConfig {
   atrSlMult       Float    @default(1.2)
   tpRr            Float    @default(2.0)
   autoOptimize    Boolean  @default(true)
+  gemmaEnabled    Boolean  @default(true)
   liveEnabled     Boolean  @default(false)
   updatedAt       DateTime @updatedAt
 }
@@ -458,5 +463,44 @@ model SolSimConfig {
   marginPerTrade  Float    @default(10)
   maxConcurrent   Int      @default(1)
   autoEnter       Boolean  @default(true)
+  updatedAt       DateTime @updatedAt
+}
+
+// ── Inst5m Scanner — Liquidity Sweep + FVG + BOS su 5m, 760 coppie ──────────
+
+model InstSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String    // LONG | SHORT
+  patternType   Int       // 1=LIQ_SWEEP 2=FVG_FILL 3=BOS_RETEST
+  patternName   String
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  grade         String
+  score         Int
+  status        String    @default("open") // open | tp1 | sl | manual
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model InstSimConfig {
+  id              Int      @id @default(1)
+  startingCapital Float    @default(500)
+  maxConcurrent   Int      @default(5)
+  autoEnter       Boolean  @default(true)
+  minScore        Int      @default(50)
+  atrSlMult       Float    @default(0.5)
+  tpRr            Float    @default(3.0)
+  liveEnabled     Boolean  @default(false)
   updatedAt       DateTime @updatedAt
 }

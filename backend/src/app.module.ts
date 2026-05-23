@@ -15,6 +15,7 @@ import { LiveModule } from './live/live.module';
 import { AiBrainModule } from './ai-brain/ai-brain.module';
 import { GemmaModule } from './gemma/gemma.module';
 import { SmartScannerModule } from './smart-scanner/smart-scanner.module';
+import { InstScannerModule } from './inst-scanner/inst-scanner.module';
 
 @Module({
   imports: [
@@ -34,6 +35,7 @@ import { SmartScannerModule } from './smart-scanner/smart-scanner.module';
     AiBrainModule,
     GemmaModule,
     SmartScannerModule,
+    InstScannerModule,
   ],
 })
 export class AppModule {}
