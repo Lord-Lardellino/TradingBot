@@ -4,6 +4,11 @@ import { ConfigService } from '@nestjs/config';
 import * as ccxt from 'ccxt';
 import { PrismaService } from '../prisma/prisma.service';
 import { EventsGateway } from '../events/events.gateway';
+
+const MAX_TRIGGER_FILL_MS = 15_000;
+const MAX_WORSE_ENTRY_PCT = 0.08;
+const MIN_LIVE_RR_FACTOR = 0.98;
+
 export interface TradeSignal {
   symbol: string; direction: 'LONG' | 'SHORT'; grade: string;
   entry: number; slPct: number; tp1Pct: number; suggestedLeverage: number;
@@ -57,7 +62,7 @@ export class LiveTradingService implements OnModuleInit {
     const exists = await this.prisma.liveConfig.findUnique({ where: { id: 1 } });
     if (!exists) {
       await this.prisma.liveConfig.create({
-        data: { id: 1, enabled: false, autoClose: true, marginPerTrade: 5, minGrade: 'A+', maxConcurrent: 2, orderType: 'limit', tpRr: 3.0 } as any,
+        data: { id: 1, enabled: false, autoClose: true, marginPerTrade: 5, minGrade: 'A', maxConcurrent: 5, orderType: 'market', tpRr: 2.0 } as any,
       });
     }
   }
@@ -66,7 +71,7 @@ export class LiveTradingService implements OnModuleInit {
     let cfg = await this.prisma.liveConfig.findUnique({ where: { id: 1 } });
     if (!cfg) {
       cfg = await this.prisma.liveConfig.create({
-        data: { id: 1, enabled: false, autoClose: true, marginPerTrade: 5, minGrade: 'A+', maxConcurrent: 2, orderType: 'limit', tpRr: 3.0 } as any,
+        data: { id: 1, enabled: false, autoClose: true, marginPerTrade: 5, minGrade: 'A', maxConcurrent: 5, orderType: 'market', tpRr: 2.0 } as any,
       });
     }
     return {
@@ -75,8 +80,8 @@ export class LiveTradingService implements OnModuleInit {
       marginPerTrade: cfg.marginPerTrade,
       minGrade:       cfg.minGrade,
       maxConcurrent:  cfg.maxConcurrent,
-      orderType:      cfg.orderType ?? 'limit',
-      tpRr:           (cfg as any).tpRr ?? 3.0,
+      orderType:      'market',
+      tpRr:           (cfg as any).tpRr ?? 2.0,
       liveStrategy:   (cfg as any).liveStrategy ?? 'smart',
     };
   }
@@ -84,7 +89,7 @@ export class LiveTradingService implements OnModuleInit {
   async updateConfig(data: Partial<LiveConfigData>) {
     return this.prisma.liveConfig.upsert({
       where:  { id: 1 },
-      create: { id: 1, enabled: false, autoClose: true, marginPerTrade: 5, minGrade: 'A+', maxConcurrent: 2, tpRr: 3.0, ...data } as any,
+      create: { id: 1, enabled: false, autoClose: true, marginPerTrade: 5, minGrade: 'A', maxConcurrent: 5, orderType: 'market', tpRr: 2.0, ...data } as any,
       update: data,
     });
   }
@@ -92,6 +97,100 @@ export class LiveTradingService implements OnModuleInit {
   // ─── Entry ───────────────────────────────────────────────────────────────────
   // orderType='limit': GTC a signal.entry, scade dopo 10 min
   // orderType='market': entra subito, SL/TP piazzati immediatamente
+
+  private executionStats(direction: 'LONG' | 'SHORT', entry: number, stopLoss: number, takeProfit: number) {
+    const slDist = direction === 'LONG' ? entry - stopLoss : stopLoss - entry;
+    const tpDist = direction === 'LONG' ? takeProfit - entry : entry - takeProfit;
+    return {
+      slPct: entry > 0 ? slDist / entry * 100 : -1,
+      tpPct: entry > 0 ? tpDist / entry * 100 : -1,
+      rr:    slDist > 0 ? tpDist / slDist : -1,
+    };
+  }
+
+  private validateTriggerFill(signal: TradeSignal, fillPrice: number, stopLoss: number, takeProfit: number) {
+    if (!Number.isFinite(fillPrice) || fillPrice <= 0) return { ok: false, reason: 'fill_invalid' };
+
+    const worsePct = signal.direction === 'LONG'
+      ? (fillPrice - signal.entry) / signal.entry * 100
+      : (signal.entry - fillPrice) / signal.entry * 100;
+    if (worsePct > MAX_WORSE_ENTRY_PCT) return { ok: false, reason: `entry_slip_${worsePct.toFixed(4)}pct` };
+
+    const stats = this.executionStats(signal.direction, fillPrice, stopLoss, takeProfit);
+    const expectedRr = signal.slPct > 0 ? signal.tp1Pct / signal.slPct : 0;
+    if (stats.slPct <= 0 || stats.tpPct <= 0 || stats.rr < expectedRr * MIN_LIVE_RR_FACTOR) {
+      return { ok: false, reason: `rr_bad_live_${stats.rr.toFixed(3)}_expected_${expectedRr.toFixed(3)}` };
+    }
+
+    return { ok: true, reason: 'ok' };
+  }
+
+  private async closeRejectedFill(args: {
+    id: string;
+    signal: TradeSignal;
+    fillPrice: number;
+    stopLoss: number;
+    takeProfit: number;
+    leverage: number;
+    margin: number;
+    positionSize: number;
+    contracts: number;
+    orderId?: string;
+    feesOpen: number;
+    reason: string;
+  }) {
+    const side = args.signal.direction === 'LONG' ? 'sell' : 'buy';
+    let status = 'bad_fill';
+    let closePrice = args.fillPrice;
+    let feesClose = args.positionSize * 0.00038;
+    let closedAt: Date | undefined = new Date();
+
+    try {
+      const order = await this.exchange.createOrder(args.signal.symbol, 'market', side, args.contracts, undefined, { reduceOnly: true });
+      closePrice = Number(order.average ?? order.price ?? closePrice);
+      feesClose = Number(order.fee?.cost ?? feesClose);
+    } catch (e: any) {
+      status = 'open';
+      closedAt = undefined;
+      this.logger.error(`[LIVE] BAD FILL close failed ${args.signal.symbol}: ${e?.message}`);
+    }
+
+    const priceDiff = args.signal.direction === 'LONG'
+      ? (closePrice - args.fillPrice) / args.fillPrice
+      : (args.fillPrice - closePrice) / args.fillPrice;
+    const pnl = status === 'bad_fill'
+      ? parseFloat((args.positionSize * priceDiff - args.feesOpen - feesClose).toFixed(4))
+      : null;
+
+    const createData: any = {
+      id: args.id,
+      symbol: args.signal.symbol,
+      direction: args.signal.direction,
+      entry: parseFloat(args.fillPrice.toFixed(8)),
+      stopLoss: args.stopLoss,
+      takeProfit: args.takeProfit,
+      leverage: args.leverage,
+      marginEur: parseFloat(args.margin.toFixed(4)),
+      positionSize: parseFloat(args.positionSize.toFixed(4)),
+      contracts: args.contracts,
+      orderId: args.orderId,
+      limitOrderId: args.orderId,
+      grade: args.signal.grade,
+      score: args.signal.score ?? 0,
+      feesOpen: parseFloat(args.feesOpen.toFixed(6)),
+      feesClose: parseFloat(feesClose.toFixed(6)),
+      closePrice: parseFloat(closePrice.toFixed(8)),
+      pnl,
+      status,
+      note: args.reason,
+      ...(closedAt ? { closedAt } : {}),
+    };
+    const { id: _id, ...updateData } = createData;
+
+    const trade = await this.prisma.liveTrade.upsert({ where: { id: args.id }, create: createData, update: updateData });
+    this.logger.warn(`[LIVE] BAD FILL ${args.signal.symbol}: ${args.reason} | fill=${args.fillPrice} entry=${args.signal.entry}`);
+    this.events.emitLiveTrade(trade);
+  }
 
   async enterTrade(signal: TradeSignal): Promise<void> {
     const cfg = await this.getConfig();
@@ -141,17 +240,26 @@ export class LiveTradingService implements OnModuleInit {
       ]);
 
       const feesEst = notional * 0.00038;
+      const effectiveOrderType = 'market';
 
-      if (cfg.orderType === 'market') {
+      if (effectiveOrderType === 'market') {
         // ── MARKET: entra subito, poi fetch position per positionId, poi SL/TP ──
         const order     = await this.exchange.createOrder(signal.symbol, 'market', side, amount);
-        const fillPrice = Number(order.average ?? order.price ?? signal.entry);
+        let fillPrice = Number(order.average ?? order.price ?? signal.entry);
         const orderId   = String(order.id ?? '');
+        let liveSlPrice = parseFloat(this.exchange.priceToPrecision(
+          signal.symbol,
+          isLong ? fillPrice * (1 - totalSlFrac) : fillPrice * (1 + totalSlFrac),
+        ));
+        let liveTpPrice = parseFloat(this.exchange.priceToPrecision(
+          signal.symbol,
+          isLong ? fillPrice * (1 + totalTpFrac) : fillPrice * (1 - totalTpFrac),
+        ));
 
         // Attendi posizione visibile (MEXC può avere delay ~1-2s)
         let pos: any = null;
-        for (let attempt = 0; attempt < 5; attempt++) {
-          await new Promise(r => setTimeout(r, 1000));
+        for (let attempt = 0; attempt < 12; attempt++) {
+          await new Promise(r => setTimeout(r, 250));
           const positions = await this.exchange.fetchPositions([signal.symbol]);
           pos = positions.find(p =>
             p.symbol === signal.symbol &&
@@ -163,39 +271,81 @@ export class LiveTradingService implements OnModuleInit {
 
         const positionId = pos?.info?.positionId;
         const posVol     = Math.abs(Number(pos?.contracts ?? amount));
+        const positionEntry = Number(pos?.entryPrice ?? pos?.info?.openAvgPrice ?? 0);
+        if (Number.isFinite(positionEntry) && positionEntry > 0) {
+          fillPrice = positionEntry;
+          liveSlPrice = parseFloat(this.exchange.priceToPrecision(
+            signal.symbol,
+            isLong ? fillPrice * (1 - totalSlFrac) : fillPrice * (1 + totalSlFrac),
+          ));
+          liveTpPrice = parseFloat(this.exchange.priceToPrecision(
+            signal.symbol,
+            isLong ? fillPrice * (1 + totalTpFrac) : fillPrice * (1 - totalTpFrac),
+          ));
+        }
 
         if (!positionId) {
           this.logger.warn(`[LIVE] positionId non trovato per ${signal.symbol} — SL/TP non piazzati`);
+          await this.closeRejectedFill({
+            id, signal, fillPrice,
+            stopLoss: liveSlPrice, takeProfit: liveTpPrice,
+            leverage, margin, positionSize: notional,
+            contracts: posVol, orderId, feesOpen: feesEst,
+            reason: 'position_id_missing',
+          });
+          return;
         }
 
         // Piazza SL/TP nativi con positionId
+        const fillGuard = this.validateTriggerFill(signal, fillPrice, liveSlPrice, liveTpPrice);
+        if (!fillGuard.ok) {
+          await this.closeRejectedFill({
+            id, signal, fillPrice,
+            stopLoss: liveSlPrice, takeProfit: liveTpPrice,
+            leverage, margin, positionSize: notional,
+            contracts: posVol, orderId, feesOpen: feesEst,
+            reason: fillGuard.reason,
+          });
+          return;
+        }
+
         let slOrderId: string | undefined;
         for (let attempt = 0; attempt < 3; attempt++) {
           const extraBuf = attempt * 0.002;
           const retrySL  = isLong
-            ? parseFloat(this.exchange.priceToPrecision(signal.symbol, slPrice * (1 - extraBuf)))
-            : parseFloat(this.exchange.priceToPrecision(signal.symbol, slPrice * (1 + extraBuf)));
+            ? parseFloat(this.exchange.priceToPrecision(signal.symbol, liveSlPrice * (1 - extraBuf)))
+            : parseFloat(this.exchange.priceToPrecision(signal.symbol, liveSlPrice * (1 + extraBuf)));
           try {
             const res: any = await (this.exchange as any).contractPrivatePostStoporderPlace({
               symbol:          mexcSymbol,
               positionId,
               vol:             posVol,
-              stopLossPrice:   attempt === 0 ? slPrice : retrySL,
-              takeProfitPrice: tpPrice,
+              stopLossPrice:   attempt === 0 ? liveSlPrice : retrySL,
+              takeProfitPrice: liveTpPrice,
             });
             slOrderId = String(res?.data ?? '');
-            this.logger.log(`[LIVE] 🚀 MARKET ${side.toUpperCase()} ${signal.symbol} @ ${fillPrice} | SL ${slPrice} | TP ${tpPrice} | posId ${positionId} | stopOrderId ${slOrderId}`);
+            this.logger.log(`[LIVE] MARKET ${side.toUpperCase()} ${signal.symbol} @ ${fillPrice} | SL ${liveSlPrice} | TP ${liveTpPrice} | posId ${positionId} | stopOrderId ${slOrderId}`);
             break;
           } catch (e: any) {
             if (attempt < 2) await new Promise(r => setTimeout(r, 800));
             else this.logger.warn(`[LIVE] SL/TP failed market ${signal.symbol}: ${e?.message?.slice(0, 100)}`);
           }
         }
+        if (!slOrderId) {
+          await this.closeRejectedFill({
+            id, signal, fillPrice,
+            stopLoss: liveSlPrice, takeProfit: liveTpPrice,
+            leverage, margin, positionSize: notional,
+            contracts: posVol, orderId, feesOpen: feesEst,
+            reason: 'protection_failed',
+          });
+          return;
+        }
 
         const trade = await this.prisma.liveTrade.create({
           data: {
             id, symbol: signal.symbol, direction: signal.direction,
-            entry: parseFloat(fillPrice.toFixed(8)), stopLoss: slPrice, takeProfit: tpPrice,
+            entry: parseFloat(fillPrice.toFixed(8)), stopLoss: liveSlPrice, takeProfit: liveTpPrice,
             leverage, marginEur: parseFloat(margin.toFixed(4)),
             positionSize: parseFloat(notional.toFixed(4)), contracts: posVol,
             orderId, slOrderId, tpOrderId: slOrderId,
@@ -212,7 +362,7 @@ export class LiveTradingService implements OnModuleInit {
         const limitPrice = parseFloat(this.exchange.priceToPrecision(signal.symbol, signal.entry));
         const order      = await this.exchange.createOrder(
           signal.symbol, 'limit', side, amount, limitPrice,
-          { timeInForce: 'GTC', stopLossPrice: slPrice, takeProfitPrice: tpPrice },
+          { timeInForce: 'IOC', stopLossPrice: slPrice, takeProfitPrice: tpPrice },
         );
         this.logger.log(`[LIVE] order.id=${JSON.stringify(order.id)} info=${JSON.stringify(order.info)}`);
         const rawId        = order.info?.data ?? order.info?.orderId ?? order.info?.order_id ?? order.id;
@@ -250,7 +400,7 @@ export class LiveTradingService implements OnModuleInit {
 
   // ─── Check pending limit orders ogni 15s ──────────────────────────────────────
 
-  @Cron('*/15 * * * * *')
+  @Cron('*/5 * * * * *')
   async checkPendingOrders() {
     const pending = await this.prisma.liveTrade.findMany({ where: { status: 'pending' } });
     if (!pending.length) return;
@@ -260,7 +410,7 @@ export class LiveTradingService implements OnModuleInit {
       const mexcSymbol = this.markets[trade.symbol]?.id ?? trade.symbol.split('/')[0] + '_USDT';
 
       // Scaduto dopo 5 minuti → cancella ordine e marca expired
-      if (age > 10 * 60 * 1000) {
+      if (false && age > 10 * 60 * 1000) {
         if (trade.limitOrderId) {
           try {
             await this.exchange.cancelOrder(trade.limitOrderId, trade.symbol);
@@ -284,11 +434,50 @@ export class LiveTradingService implements OnModuleInit {
           Math.abs(Number(p.contracts ?? 0)) > 0 &&
           (isLong ? p.side === 'long' : p.side === 'short'),
         );
-        if (!pos) continue; // non ancora riempito
+        if (!pos) {
+          if (age > MAX_TRIGGER_FILL_MS) {
+            if (trade.limitOrderId) {
+              try { await this.exchange.cancelOrder(trade.limitOrderId, trade.symbol); }
+              catch (e: any) { this.logger.warn(`[LIVE] Cancel ${trade.symbol}: ${e?.message?.slice(0, 80)}`); }
+            }
+            const expired = await this.prisma.liveTrade.update({
+              where: { id: trade.id },
+              data: { status: 'expired', closedAt: new Date(), note: `no_fill_${MAX_TRIGGER_FILL_MS / 1000}s` },
+            });
+            this.events.emitLiveTrade(expired);
+          }
+          continue;
+        }
 
         const posVol     = Math.abs(Number(pos.contracts ?? trade.contracts));
         const fillPrice  = Number(pos.entryPrice ?? pos.info?.openAvgPrice ?? trade.entry);
         const positionId = pos.info?.positionId;
+
+        const signal: TradeSignal = {
+          symbol: trade.symbol,
+          direction: trade.direction as 'LONG' | 'SHORT',
+          grade: trade.grade,
+          entry: trade.entry,
+          slPct: Math.abs((trade.entry - trade.stopLoss) / trade.entry * 100),
+          tp1Pct: Math.abs((trade.takeProfit - trade.entry) / trade.entry * 100),
+          suggestedLeverage: trade.leverage,
+          score: trade.score,
+        };
+        const fillGuard = age <= MAX_TRIGGER_FILL_MS
+          ? this.validateTriggerFill(signal, fillPrice, trade.stopLoss, trade.takeProfit)
+          : { ok: false, reason: `late_fill_${Math.round(age / 1000)}s` };
+        if (!fillGuard.ok) {
+          await this.closeRejectedFill({
+            id: trade.id, signal, fillPrice,
+            stopLoss: trade.stopLoss, takeProfit: trade.takeProfit,
+            leverage: trade.leverage, margin: trade.marginEur,
+            positionSize: trade.positionSize, contracts: posVol,
+            orderId: trade.limitOrderId ?? trade.orderId ?? undefined,
+            feesOpen: trade.feesOpen ?? trade.positionSize * 0.00038,
+            reason: fillGuard.reason,
+          });
+          continue;
+        }
 
         // Piazza SL/TP nativi con positionId
         let slOrderId: string | undefined;

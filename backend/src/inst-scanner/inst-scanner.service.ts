@@ -10,15 +10,40 @@ import { LiveTradingService } from '../live/live-trading.service';
 const TIMEFRAME       = '5m';
 const CANDLES         = 100;          // ~8h di contesto
 const MIN_VOLUME_24H  = 80_000;       // bassa soglia: più coppie, più segnali
-const MIN_TRIGGER_VOL_R = 1.0;        // evita trigger sotto-volume: troppi falsi breakout
+const MIN_TRIGGER_VOL_R = 0.08;       // non bloccante: la strategia e' price action su EMA34
 const SIGNAL_COOLDOWN = 5 * 60_000;  // 5 min = 1 candela 5m → no duplicati
+const SCAN_PAIR_LIMIT = 100;
 const BATCH_SIZE      = 5;            // batch piccoli — meno connessioni parallele, meno fetch_err
+const BATCH_DELAY_MS  = 100;
+const CANDLE_MS       = 5 * 60_000;
+const CLOSE_CONFIRM_DELAY_MS = 250;
+const MAX_CLOSE_CONFIRM_LAG_MS = 3_000;
+const FETCH_RETRIES   = 3;
+const FETCH_RETRY_DELAY_MS = 250;
+const EMA_PERIOD = 34;
+const EMA_SLOPE_LOOKBACK = 5;
+const MIN_EMA_SLOPE_ATR = 0.05;
+const STRONG_EMA_SLOPE_ATR = 0.12;
+const MIN_TRIGGER_BODY_ATR = 0.55;
+const MAX_TRIGGER_BODY_ATR = 2.20;
+const MIN_BODY_RANGE_RATIO = 0.68;
+const MAX_CLOSE_WICK_RANGE = 0.08;
+const MAX_CLOSE_WICK_ATR = 0.05;
+const MAX_OPPOSITE_WICK_RANGE = 0.45;
+const LONG_CLOSE_POS_MIN = 0.88;
+const SHORT_CLOSE_POS_MAX = 0.12;
+const EMA_TOUCH_ATR = 0.55;
+const MIN_EMA_DISTANCE_ATR = 0.10;
+const MAX_EMA_DISTANCE_ATR = 2.60;
 const TAKER_FEE       = 0.00038;
 const RISK_EUR        = 2.0;
 const MAX_FEE_TO_RISK = 0.55;
 
-const PT_MOMENTUM      = 1;  // pullback/bounce ordinato sulla SMA34
-const PT_IMPULSE_BREAK = 2;  // rottura impulsiva pulita, senza pullback stretto
+const PT_EMA34_IMPULSE = 1;
+const MAX_IMPULSE_BODY_ATR = MAX_TRIGGER_BODY_ATR;      // legacy method only, not used by scanner
+const MAX_IMPULSE_SMA_DIST_ATR = MAX_EMA_DISTANCE_ATR; // legacy method only, not used by scanner
+const PT_MOMENTUM = PT_EMA34_IMPULSE;                  // legacy method only, not used by scanner
+const PT_IMPULSE_BREAK = PT_EMA34_IMPULSE;             // legacy method only, not used by scanner
 
 export interface InstSignal {
   id: string;
@@ -39,6 +64,7 @@ export interface InstSignal {
   grade: 'A+' | 'A' | 'B';
   reasons: string[];
   timestamp: string;
+  triggerTs: number;
   mexcUrl: string;
   sparkline: { t: number; o: number; h: number; l: number; c: number }[];
   ema9spark: number[];
@@ -88,14 +114,14 @@ export class InstScannerService implements OnModuleInit {
       enableRateLimit: true,
       options: { defaultType: 'swap' },
     });
-    // Istanza veloce senza rate limiter per fetch OHLCV pubblici in parallelo
+    // Istanza separata per OHLCV pubblici in batch.
     this.fastExchange = new ccxt.mexc({
-      enableRateLimit: false,
+      enableRateLimit: true,
       options: { defaultType: 'swap' },
     });
     await this.loadMarkets();
     await this.initConfig();
-    this.logger.log(`[INST5m] ${this.validSymbols.size} coppie · TF=5m · scan ogni 1min · 3 pattern istituzionali`);
+    this.logger.log(`[INST5m] ${this.validSymbols.size} coppie · TF=5m · EMA34_IMPULSE only`);
   }
 
   @Cron('0 0 * * * *')
@@ -112,11 +138,13 @@ export class InstScannerService implements OnModuleInit {
   }
 
   // ── SCAN 4s prima della chiusura candela 5m — ordine nella finestra ±1s dal close
-  @Cron('44 4,9,14,19,24,29,34,39,44,49,54,59 * * * *')
+  @Cron('25 4,9,14,19,24,29,34,39,44,49,54,59 * * * *')
   async scan() {
     if (this.isScanning || this.validSymbols.size === 0) return;
     this.isScanning = true;
     try {
+      const scanStartedAt = Date.now();
+      const targetCloseAt = Math.floor(scanStartedAt / CANDLE_MS) * CANDLE_MS + CANDLE_MS + CLOSE_CONFIRM_DELAY_MS;
       const cfg = await this.getConfig();
       // tickers dalla cache (già pronti), openSymbols in parallelo con config
       const tickers = Object.keys(this.tickerCache).length > 0
@@ -128,7 +156,7 @@ export class InstScannerService implements OnModuleInit {
       const candidates = Object.values(tickers)
         .filter(t => this.validSymbols.has(t.symbol) && (t.quoteVolume ?? 0) >= MIN_VOLUME_24H && !openSymbols.has(t.symbol))
         .sort((a, b) => (b.quoteVolume ?? 0) - (a.quoteVolume ?? 0))
-        .slice(0, 25);
+        .slice(0, SCAN_PAIR_LIMIT);
       this.scannedCount = candidates.length;
       this.dbg = {};
       this.trendCandidates = [];
@@ -152,9 +180,10 @@ export class InstScannerService implements OnModuleInit {
         const results = await Promise.all(
           batch.map(async ticker => {
             try {
-              const raw = await this.fastExchange.fetchOHLCV(ticker.symbol, TIMEFRAME, undefined, CANDLES);
+              const raw = await this.fetchOHLCVWithRetry(ticker.symbol, TIMEFRAME, CANDLES, 'fetch_err');
+              if (!raw) return null;
               try {
-                return this.analyzePair(ticker.symbol, raw, cfg, btcBias);
+                return this.analyzePair(ticker.symbol, raw, cfg, btcBias, 'forming');
               } catch {
                 this.dbg['analyze_err'] = (this.dbg['analyze_err'] ?? 0) + 1;
                 return null;
@@ -166,41 +195,86 @@ export class InstScannerService implements OnModuleInit {
           }),
         );
         results.forEach(sig => sig && cycleSignals.push(sig));
-        await new Promise(r => setTimeout(r, 120));
+        await this.sleep(BATCH_DELAY_MS);
       }
       this.lastRawSignals = cycleSignals.length;
       this.logger.log(`[INST5m DBG] raw=${cycleSignals.length} ${JSON.stringify(this.dbg)}`);
 
-      // Best LONG + best SHORT per ciclo
-      const bestLong  = cycleSignals.filter(s => s.direction === 'LONG').sort((a, b) => b.score - a.score)[0];
-      const bestShort = cycleSignals.filter(s => s.direction === 'SHORT').sort((a, b) => b.score - a.score)[0];
-      const best = [bestLong, bestShort].filter(Boolean) as InstSignal[];
-
-      const toProcess = best.filter(sig => {
+      const preSelected = cycleSignals.sort((a, b) => b.score - a.score).filter(sig => {
         const last = this.cooldowns.get(sig.symbol) ?? 0;
         return Date.now() - last >= SIGNAL_COOLDOWN;
       });
+      this.dbg['preselected'] = preSelected.length;
+
+      if (preSelected.length) {
+        const waitToClose = targetCloseAt - Date.now();
+        if (waitToClose > 0) {
+          await this.sleep(waitToClose);
+        }
+        const closeLag = Date.now() - targetCloseAt;
+        if (closeLag > MAX_CLOSE_CONFIRM_LAG_MS) {
+          this.dbg['late_confirm_skip'] = preSelected.length;
+          this.logger.warn(`[INST5m SKIP] conferma in ritardo ${closeLag}ms su ${preSelected.length} segnali`);
+          this.lastEmitted = 0;
+          this._emitStatus(cfg, candidates.length, cycleSignals.length, 0);
+          return;
+        }
+      }
+
+      const toProcess: InstSignal[] = [];
+      for (let i = 0; i < preSelected.length; i += BATCH_SIZE) {
+        const batch = preSelected.slice(i, i + BATCH_SIZE);
+        const confirmedBatch = await Promise.all(
+          batch.map(async pre => {
+            const raw = await this.fetchOHLCVWithRetry(pre.symbol, TIMEFRAME, CANDLES, 'confirm_fetch_err');
+            if (!raw) return null;
+            try {
+              const confirmed = this.analyzePair(pre.symbol, raw, cfg, btcBias, 'closed', pre.triggerTs);
+              if (confirmed && confirmed.direction === pre.direction) {
+                this.dbg['confirm_ok'] = (this.dbg['confirm_ok'] ?? 0) + 1;
+                return confirmed;
+              }
+              this.dbg['confirm_fail'] = (this.dbg['confirm_fail'] ?? 0) + 1;
+              return null;
+            } catch {
+              this.dbg['confirm_analyze_err'] = (this.dbg['confirm_analyze_err'] ?? 0) + 1;
+              return null;
+            }
+          }),
+        );
+        confirmedBatch.forEach(sig => sig && toProcess.push(sig));
+        if (i + BATCH_SIZE < preSelected.length) await this.sleep(25);
+      }
+      if (preSelected.length) {
+        this.logger.log(`[INST5m CONFIRM] pre=${preSelected.length} ok=${toProcess.length} lag=${Date.now() - targetCloseAt}ms`);
+      }
       for (const sig of toProcess) this.cooldowns.set(sig.symbol, Date.now());
 
       let emitted = 0;
+      const liveSlots = Math.max(0, cfg.maxConcurrent - openCount);
+      const liveEntries: Promise<void>[] = [];
       for (const sig of toProcess) {
         this.recentSignals.unshift(sig);
         if (this.recentSignals.length > 200) this.recentSignals.pop();
         this.events.emitInstSignal(sig);
-        if (cfg.autoEnter) {
-          await this.enterSimTrade(sig, cfg).catch(() => {});
-        }
-        if (cfg.liveEnabled) {
-          await this.liveTrading.enterTrade({
+        if (cfg.liveEnabled && liveEntries.length < liveSlots) {
+          liveEntries.push(this.liveTrading.enterTrade({
             symbol: sig.symbol, direction: sig.direction, grade: sig.grade,
             entry: sig.entry, slPct: sig.slPct, tp1Pct: sig.tpPct,
             suggestedLeverage: sig.suggestedLeverage, score: sig.score,
             stopLossPrice: sig.stopLoss,
             takeProfitPrice: sig.takeProfit1,
-          }).catch(err => this.logger.error(`[INST LIVE] ${err.message}`));
+          }).catch(err => this.logger.error(`[INST LIVE] ${err.message}`)));
+        }
+        if (cfg.autoEnter) {
+          await this.enterSimTrade(sig, cfg).catch(() => {});
         }
         emitted++;
         this.logger.log(`[INST5m ✅] ${sig.direction} ${sig.symbol} ${sig.patternName} score=${sig.score} grade=${sig.grade}`);
+      }
+      if (liveEntries.length) {
+        this.dbg['live_queued'] = liveEntries.length;
+        await Promise.all(liveEntries);
       }
       this.lastEmitted = emitted;
       this._emitStatus(cfg, candidates.length, cycleSignals.length, emitted);
@@ -272,8 +346,246 @@ export class InstScannerService implements OnModuleInit {
     } catch (err: any) { this.logger.error(`Inst checkOpen: ${err.message}`); }
   }
 
+  // Single strategy: EMA34 impulse at trigger-candle close.
+  private analyzePair(
+    sym: string,
+    raw: number[][],
+    cfg: any,
+    _btcBias: string,
+    triggerMode: 'forming' | 'closed' = 'forming',
+    expectedTriggerTs?: number,
+  ): InstSignal | null {
+    const n = raw.length;
+    if (n < EMA_PERIOD + EMA_SLOPE_LOOKBACK + 25) {
+      this.dbg['no_data'] = (this.dbg['no_data'] ?? 0) + 1;
+      return null;
+    }
+
+    const o = raw.map(r => r[1] as number);
+    const h = raw.map(r => r[2] as number);
+    const l = raw.map(r => r[3] as number);
+    const c = raw.map(r => r[4] as number);
+    const v = raw.map(r => r[5] as number);
+
+    let ti = n - 1;
+    if (triggerMode === 'closed') {
+      if (expectedTriggerTs) {
+        const idx = raw.findIndex(r => Number(r[0]) === expectedTriggerTs);
+        if (idx < 0) {
+          this.dbg['confirm_missing_trigger'] = (this.dbg['confirm_missing_trigger'] ?? 0) + 1;
+          return null;
+        }
+        if (Date.now() < expectedTriggerTs + CANDLE_MS) {
+          this.dbg['confirm_not_closed'] = (this.dbg['confirm_not_closed'] ?? 0) + 1;
+          return null;
+        }
+        ti = idx;
+        this.dbg['closed_trigger_ts'] = (this.dbg['closed_trigger_ts'] ?? 0) + 1;
+      } else {
+        const lastTs = raw[n - 1][0] as number;
+        const lastClosed = Date.now() >= lastTs + CANDLE_MS;
+        ti = lastClosed ? n - 1 : n - 2;
+        this.dbg[lastClosed ? 'closed_n1' : 'closed_n2'] = (this.dbg[lastClosed ? 'closed_n1' : 'closed_n2'] ?? 0) + 1;
+      }
+    }
+    if (ti < EMA_PERIOD + EMA_SLOPE_LOOKBACK + 20) {
+      this.dbg['no_history'] = (this.dbg['no_history'] ?? 0) + 1;
+      return null;
+    }
+
+    const cO = o[ti], cH = h[ti], cL = l[ti], entry = c[ti];
+    if (!Number.isFinite(entry) || entry <= 0) return null;
+
+    const hHist = h.slice(0, ti + 1);
+    const lHist = l.slice(0, ti + 1);
+    const cHist = c.slice(0, ti + 1);
+    const atr14 = this.indicators.atr(hHist, lHist, cHist, 14);
+    if (!Number.isFinite(atr14) || atr14 <= 0) return null;
+    const atrPct = atr14 / entry * 100;
+
+    const ema34arr = this.indicators.emaArray(cHist, EMA_PERIOD);
+    const emaOffset = EMA_PERIOD - 1;
+    const emaAt = (idx: number) => ema34arr[idx - emaOffset] ?? NaN;
+    const ema34 = emaAt(ti);
+    const emaPrev = emaAt(ti - EMA_SLOPE_LOOKBACK);
+    if (!Number.isFinite(ema34) || !Number.isFinite(emaPrev)) {
+      this.dbg['no_ema34'] = (this.dbg['no_ema34'] ?? 0) + 1;
+      return null;
+    }
+
+    const emaSlopeAtr = (ema34 - emaPrev) / atr14;
+    const emaRising = emaSlopeAtr >= MIN_EMA_SLOPE_ATR;
+    const emaFalling = emaSlopeAtr <= -MIN_EMA_SLOPE_ATR;
+
+    const body = Math.abs(entry - cO);
+    const candleRange = cH - cL;
+    if (candleRange <= 0) return null;
+    const bodyAtr = body / atr14;
+    const bodyRange = body / candleRange;
+    const closePos = (entry - cL) / candleRange;
+
+    const upperWick = cH - Math.max(cO, entry);
+    const lowerWick = Math.min(cO, entry) - cL;
+    const maxCloseWick = Math.min(candleRange * MAX_CLOSE_WICK_RANGE, atr14 * MAX_CLOSE_WICK_ATR);
+    const bodyOk = bodyAtr >= MIN_TRIGGER_BODY_ATR && bodyAtr <= MAX_TRIGGER_BODY_ATR && bodyRange >= MIN_BODY_RANGE_RATIO;
+
+    const longCloseClean = closePos >= LONG_CLOSE_POS_MIN && upperWick <= maxCloseWick;
+    const shortCloseClean = closePos <= SHORT_CLOSE_POS_MAX && lowerWick <= maxCloseWick;
+    const longOppositeWickOk = lowerWick <= candleRange * MAX_OPPOSITE_WICK_RANGE;
+    const shortOppositeWickOk = upperWick <= candleRange * MAX_OPPOSITE_WICK_RANGE;
+
+    const longSide = entry > ema34;
+    const shortSide = entry < ema34;
+    const emaDistLong = (entry - ema34) / atr14;
+    const emaDistShort = (ema34 - entry) / atr14;
+    const longDistOk = emaDistLong >= MIN_EMA_DISTANCE_ATR && emaDistLong <= MAX_EMA_DISTANCE_ATR;
+    const shortDistOk = emaDistShort >= MIN_EMA_DISTANCE_ATR && emaDistShort <= MAX_EMA_DISTANCE_ATR;
+
+    const prevEma = emaAt(ti - 1);
+    const crossLong = Number.isFinite(prevEma) && c[ti - 1] <= prevEma && entry > ema34;
+    const crossShort = Number.isFinite(prevEma) && c[ti - 1] >= prevEma && entry < ema34;
+
+    let recentTouchLong = false;
+    let recentTouchShort = false;
+    for (let i = 1; i <= 8; i++) {
+      const idx = ti - i;
+      const e = emaAt(idx);
+      if (!Number.isFinite(e)) continue;
+      if (l[idx] <= e + atr14 * EMA_TOUCH_ATR && c[idx] >= e - atr14 * 0.80) recentTouchLong = true;
+      if (h[idx] >= e - atr14 * EMA_TOUCH_ATR && c[idx] <= e + atr14 * 0.80) recentTouchShort = true;
+    }
+
+    const recentHigh = Math.max(...h.slice(Math.max(0, ti - 5), ti));
+    const recentLow = Math.min(...l.slice(Math.max(0, ti - 5), ti));
+    const breaksRecentHigh = entry > recentHigh;
+    const breaksRecentLow = entry < recentLow;
+    const prevEmaDistance = Number.isFinite(prevEma) ? Math.abs((c[ti - 1] - prevEma) / atr14) : Infinity;
+    const contextLong = recentTouchLong || crossLong || (breaksRecentHigh && prevEmaDistance <= 1.0);
+    const contextShort = recentTouchShort || crossShort || (breaksRecentLow && prevEmaDistance <= 1.0);
+
+    const volumeWindow = v.slice(ti - 20, ti);
+    const avgVol = volumeWindow.reduce((a, b) => a + b, 0) / volumeWindow.length;
+    const volR = avgVol > 0 ? v[ti] / avgVol : 1;
+
+    const longSignal =
+      longSide && emaRising && contextLong && longDistOk &&
+      entry > cO && bodyOk && longCloseClean && longOppositeWickOk;
+    const shortSignal =
+      shortSide && emaFalling && contextShort && shortDistOk &&
+      entry < cO && bodyOk && shortCloseClean && shortOppositeWickOk;
+
+    if (emaRising || emaFalling) this.dbg['ema_slope_ok'] = (this.dbg['ema_slope_ok'] ?? 0) + 1;
+    if (longSide || shortSide) this.dbg['ema_side_ok'] = (this.dbg['ema_side_ok'] ?? 0) + 1;
+    if (bodyOk) this.dbg['body_ok'] = (this.dbg['body_ok'] ?? 0) + 1;
+    if (longCloseClean || shortCloseClean) this.dbg['wick_ok'] = (this.dbg['wick_ok'] ?? 0) + 1;
+    if (contextLong || contextShort) this.dbg['ema_context_ok'] = (this.dbg['ema_context_ok'] ?? 0) + 1;
+    if (longDistOk || shortDistOk) this.dbg['dist_ok'] = (this.dbg['dist_ok'] ?? 0) + 1;
+
+    const candidateLong = longSide && emaRising && entry > cO;
+    const candidateShort = shortSide && emaFalling && entry < cO;
+    if (candidateLong || candidateShort) {
+      const dir = candidateLong ? 'L' : 'S';
+      const contextOk = candidateLong ? contextLong : contextShort;
+      const distOk = candidateLong ? longDistOk : shortDistOk;
+      const cleanClose = candidateLong ? longCloseClean : shortCloseClean;
+      const oppositeOk = candidateLong ? longOppositeWickOk : shortOppositeWickOk;
+      if (!contextOk) this.trendCandidates.push({ sym, dir, reason: 'no_ema_context' });
+      else if (!distOk) this.trendCandidates.push({ sym, dir, reason: `dist_${(candidateLong ? emaDistLong : emaDistShort).toFixed(2)}ATR` });
+      else if (!bodyOk) this.trendCandidates.push({ sym, dir, reason: `body_${bodyAtr.toFixed(2)}ATR_range_${bodyRange.toFixed(2)}` });
+      else if (!cleanClose) this.trendCandidates.push({ sym, dir, reason: 'close_wick' });
+      else if (!oppositeOk) this.trendCandidates.push({ sym, dir, reason: 'opposite_wick' });
+    }
+
+    if (!longSignal && !shortSignal) {
+      this.dbg['no_pattern'] = (this.dbg['no_pattern'] ?? 0) + 1;
+      return null;
+    }
+
+    this.dbg['raw_ema34_impulse'] = (this.dbg['raw_ema34_impulse'] ?? 0) + 1;
+    const isLong = longSignal;
+    const direction = isLong ? 'LONG' : 'SHORT';
+    const dir = isLong ? 'L' : 'S';
+    const nearMiss = (reason: string) => { this.nearMisses.push({ sym, dir, reason }); };
+
+    const slLevel = cO;
+    const slPct = isLong
+      ? (entry - slLevel) / entry * 100
+      : (slLevel - entry) / entry * 100;
+    if (slPct <= 0) return null;
+
+    const estimatedRoundTripFee = (RISK_EUR / (slPct / 100)) * TAKER_FEE * 2;
+    if (estimatedRoundTripFee > RISK_EUR * MAX_FEE_TO_RISK) {
+      this.dbg['fee_too_high'] = (this.dbg['fee_too_high'] ?? 0) + 1;
+      nearMiss(`fee_${estimatedRoundTripFee.toFixed(2)}`);
+      return null;
+    }
+
+    let score = 45;
+    const reasons: string[] = ['EMA34_IMPULSE'];
+    const absSlope = Math.abs(emaSlopeAtr);
+    if (absSlope >= STRONG_EMA_SLOPE_ATR) { score += 16; reasons.push(`EMA34Slope_${absSlope.toFixed(2)}ATR`); }
+    else { score += 10; reasons.push(`EMA34Slope_${absSlope.toFixed(2)}ATR`); }
+
+    if (bodyAtr >= 0.80 && bodyAtr <= 1.60) { score += 14; reasons.push(`Body_${bodyAtr.toFixed(2)}ATR`); }
+    else { score += 8; reasons.push(`Body_${bodyAtr.toFixed(2)}ATR`); }
+
+    score += 14;
+    reasons.push('NoCloseWick');
+
+    if (crossLong || crossShort) { score += 8; reasons.push('CrossEMA34'); }
+    else { score += 6; reasons.push('PullbackEMA34'); }
+
+    const dist = isLong ? emaDistLong : emaDistShort;
+    if (dist >= 0.35 && dist <= 1.80) { score += 5; reasons.push(`Dist_${dist.toFixed(2)}ATR`); }
+    else { score += 2; reasons.push(`Dist_${dist.toFixed(2)}ATR`); }
+
+    const closeWick = isLong ? upperWick : lowerWick;
+    if (closeWick <= maxCloseWick * 0.5) score += 4;
+    if (volR >= 1.8) { score += 5; reasons.push(`Vol_${volR.toFixed(1)}`); }
+    else if (volR >= 1.3) { score += 3; reasons.push(`Vol_${volR.toFixed(1)}`); }
+
+    if (score < cfg.minScore) {
+      this.dbg['score_low'] = (this.dbg['score_low'] ?? 0) + 1;
+      nearMiss(`score_${score}<${cfg.minScore}`);
+      return null;
+    }
+
+    const grade: 'A+' | 'A' | 'B' = score >= 82 ? 'A+' : score >= 70 ? 'A' : 'B';
+    const tpPct = slPct * cfg.tpRr;
+    const tp1 = isLong ? entry * (1 + tpPct / 100) : entry * (1 - tpPct / 100);
+    const leverage = Math.min(15, Math.max(3, Math.round(1 / (slPct / 100) * 0.35)));
+    const ticker = sym.replace('/USDT:USDT', '');
+    const sparkStart = Math.max(0, ti - 59);
+    const sparkline = raw.slice(sparkStart, ti + 1).map(r => ({ t: r[0] as number, o: r[1] as number, h: r[2] as number, l: r[3] as number, c: r[4] as number }));
+    const emaSpark = ema34arr.slice(Math.max(0, ema34arr.length - sparkline.length));
+
+    this.dbg['PRE_SIG'] = (this.dbg['PRE_SIG'] ?? 0) + 1;
+
+    return {
+      id: `inst_${sym}_${raw[ti][0]}`,
+      symbol: sym,
+      direction,
+      patternType: PT_EMA34_IMPULSE,
+      patternName: 'EMA34_IMPULSE',
+      entry,
+      stopLoss: parseFloat(slLevel.toPrecision(8)),
+      takeProfit1: parseFloat(tp1.toPrecision(8)),
+      slPct: parseFloat(slPct.toFixed(3)),
+      tpPct: parseFloat(tpPct.toFixed(3)),
+      suggestedLeverage: leverage,
+      volumeRatio: parseFloat(volR.toFixed(2)),
+      rsi14: 0,
+      atrPct: parseFloat(atrPct.toFixed(3)),
+      score, grade, reasons,
+      timestamp: new Date().toISOString(),
+      triggerTs: raw[ti][0] as number,
+      mexcUrl: `https://futures.mexc.com/exchange/${ticker}_USDT`,
+      sparkline, ema9spark: [], ema21spark: [], ema50spark: emaSpark,
+    };
+  }
+
   // ── ANALISI PATTERN SU SINGOLA COPPIA — PRICE ACTION PURA ──────────────────
-  private analyzePair(sym: string, raw: number[][], cfg: any, _btcBias: string): InstSignal | null {
+  private analyzePairLegacyDisabled(sym: string, raw: number[][], cfg: any, _btcBias: string, triggerMode: 'forming' | 'closed' = 'forming'): any {
     const n = raw.length;
     if (n < 30) { this.dbg['no_data'] = (this.dbg['no_data'] ?? 0) + 1; return null; }
 
@@ -283,11 +595,17 @@ export class InstScannerService implements OnModuleInit {
     const c = raw.map(r => r[4] as number);
     const v = raw.map(r => r[5] as number);
 
-    // Indice dinamico: se siamo entro 8s dalla chiusura, usa n-1 (candela in formazione)
-    const TF_MS = 5 * 60_000;
-    const lastTs = raw[n-1][0] as number;
-    const timeUntilClose = (lastTs + TF_MS) - Date.now();
-    const ti = timeUntilClose <= 10_000 ? n - 1 : n - 2; // trigger index
+    // In conferma MEXC a volte non ha ancora pubblicato la nuova candela.
+    // Usa l'ultima candela se risulta già chiusa, altrimenti la penultima.
+    const lastTs = raw[n - 1][0] as number;
+    const lastClosed = Date.now() >= lastTs + CANDLE_MS;
+    const ti = triggerMode === 'closed'
+      ? (lastClosed ? n - 1 : n - 2)
+      : n - 1;
+    if (triggerMode === 'closed') {
+      this.dbg[lastClosed ? 'closed_n1' : 'closed_n2'] = (this.dbg[lastClosed ? 'closed_n1' : 'closed_n2'] ?? 0) + 1;
+    }
+    if (ti < 38) { this.dbg['no_history'] = (this.dbg['no_history'] ?? 0) + 1; return null; }
 
     const entry = c[ti];
     if (!entry || entry <= 0) return null;
@@ -313,14 +631,14 @@ export class InstScannerService implements OnModuleInit {
     if (sma34 <= 0) { this.dbg['no_sma34'] = (this.dbg['no_sma34'] ?? 0) + 1; return null; }
 
     const smaSlope   = sma34 - sma34_5;
-    const smaRising  = smaSlope >=  atr14 * 0.05;
-    const smaFalling = smaSlope <= -atr14 * 0.05;
+    const smaRising  = smaSlope >=  atr14 * 0.03;
+    const smaFalling = smaSlope <= -atr14 * 0.03;
     // LONG: cattura bounce (cL > sma34) e cross dal basso (cC > sma34, cL <= sma34)
     // SHORT: solo candele interamente sotto SMA (cH < sma34) — evita falsi segnali sopra SMA
-    const longTrend  = cC > sma34 && smaRising;
-    const shortTrend = cC < sma34 && smaFalling;
-    const isCrossLong  = longTrend && cL <= sma34;
-    const isCrossShort = shortTrend && cH >= sma34;
+    const isCrossLong  = cC > sma34 && cL <= sma34;
+    const isCrossShort = cC < sma34 && cH >= sma34;
+    const longTrend  = cC > sma34 && (smaRising || isCrossLong);
+    const shortTrend = cC < sma34 && (smaFalling || isCrossShort);
 
     // Wick sul lato debole
     const lowerWick = Math.min(cO, cC) - cL;
@@ -341,16 +659,20 @@ export class InstScannerService implements OnModuleInit {
     const smaDistLong  = (cC - sma34) / atr14;
     const smaDistShort = (sma34 - cC) / atr14;
     const volumeOk = volR >= MIN_TRIGGER_VOL_R;
-    const triggerLong  = cC > cO && body >= atr14 * 0.5 && closePos >= 0.70 && weakLong;
-    const triggerShort = cC < cO && body >= atr14 * 0.5 && closePos <= 0.30 && weakShort;
+    const triggerLong  = cC > cO && body >= atr14 * 0.45 && closePos >= 0.65 && weakLong;
+    const triggerShort = cC < cO && body >= atr14 * 0.45 && closePos <= 0.35 && weakShort;
     const trendMomentum = longTrend
       ? triggerLong  && (isCrossLong  || hadPullbackLong  || prevBullish >= 1)
       : triggerShort && (isCrossShort || hadPullbackShort || prevBearish >= 1);
 
-    const momLong  = volumeOk && longTrend  && trendMomentum && hadPullbackLong  && body <= atr14 * 1.2 && triggerLong;
-    const momShort = volumeOk && shortTrend && trendMomentum && hadPullbackShort && body <= atr14 * 1.2 && triggerShort;
-    const impulseLong  = volumeOk && longTrend  && trendMomentum && body >= atr14 * 0.9 && body <= atr14 * 1.6 && closePos >= 0.85 && weakLong  && smaDistLong  <= 2.2;
-    const impulseShort = volumeOk && shortTrend && trendMomentum && body >= atr14 * 0.9 && body <= atr14 * 1.6 && closePos <= 0.15 && weakShort && smaDistShort <= 2.2;
+    const cleanLong  = volumeOk && longTrend  && triggerLong  && body <= atr14 * MAX_IMPULSE_BODY_ATR && smaDistLong  <= MAX_IMPULSE_SMA_DIST_ATR;
+    const cleanShort = volumeOk && shortTrend && triggerShort && body <= atr14 * MAX_IMPULSE_BODY_ATR && smaDistShort <= MAX_IMPULSE_SMA_DIST_ATR;
+    const momLong  = cleanLong  && trendMomentum && hadPullbackLong  && body <= atr14 * 1.2;
+    const momShort = cleanShort && trendMomentum && hadPullbackShort && body <= atr14 * 1.2;
+    const impulseLong  = cleanLong  && trendMomentum && body >= atr14 * 0.9 && closePos >= 0.85;
+    const impulseShort = cleanShort && trendMomentum && body >= atr14 * 0.9 && closePos <= 0.15;
+    const cleanPushLong  = cleanLong  && body >= atr14 * 0.6;
+    const cleanPushShort = cleanShort && body >= atr14 * 0.6;
 
     // Debug granulare
     if (longTrend || shortTrend)  this.dbg['trend_ok']  = (this.dbg['trend_ok']  ?? 0) + 1;
@@ -362,19 +684,20 @@ export class InstScannerService implements OnModuleInit {
     if (trendBody)               this.dbg['body_ok']  = (this.dbg['body_ok']  ?? 0) + 1;
     if (momLong || momShort)     this.dbg['raw_mom']  = (this.dbg['raw_mom']  ?? 0) + 1;
     if (impulseLong || impulseShort) this.dbg['raw_impulse'] = (this.dbg['raw_impulse'] ?? 0) + 1;
+    if (cleanPushLong || cleanPushShort) this.dbg['raw_clean_push'] = (this.dbg['raw_clean_push'] ?? 0) + 1;
 
     // Trend candidates: track perché ogni coppia con trend fallisce
     if (longTrend || shortTrend) {
       const dir = longTrend ? 'L' : 'S';
       if (!trendMomentum)                                      this.trendCandidates.push({ sym, dir, reason: 'no_mom' });
-      else if (longTrend && !hadPullbackLong && !impulseLong)  this.trendCandidates.push({ sym, dir, reason: `no_pullback (×${smaDistLong.toFixed(1)}ATR)` });
-      else if (shortTrend && !hadPullbackShort && !impulseShort) this.trendCandidates.push({ sym, dir, reason: `no_pullback (×${smaDistShort.toFixed(1)}ATR)` });
+      else if (longTrend && !hadPullbackLong && !impulseLong && !cleanPushLong)  this.trendCandidates.push({ sym, dir, reason: `no_pullback (×${smaDistLong.toFixed(1)}ATR)` });
+      else if (shortTrend && !hadPullbackShort && !impulseShort && !cleanPushShort) this.trendCandidates.push({ sym, dir, reason: `no_pullback (×${smaDistShort.toFixed(1)}ATR)` });
       else if (!trendWick)                                     this.trendCandidates.push({ sym, dir, reason: 'wick_fail' });
       else if (body < atr14*0.5)                               this.trendCandidates.push({ sym, dir, reason: `body_small ×${(body/atr14).toFixed(1)}` });
       else if (longTrend && !triggerLong)                      this.trendCandidates.push({ sym, dir, reason: 'bad_trigger_wick_close' });
       else if (shortTrend && !triggerShort)                    this.trendCandidates.push({ sym, dir, reason: 'bad_trigger_wick_close' });
       else if (!volumeOk)                                      this.trendCandidates.push({ sym, dir, reason: `vol_low ×${volR.toFixed(1)}` });
-      else if (!(momLong || momShort || impulseLong || impulseShort)) this.trendCandidates.push({ sym, dir, reason: 'close_pos' });
+      else if (!(momLong || momShort || impulseLong || impulseShort || cleanPushLong || cleanPushShort)) this.trendCandidates.push({ sym, dir, reason: 'close_pos' });
     }
 
     let isLong: boolean;
@@ -383,6 +706,8 @@ export class InstScannerService implements OnModuleInit {
 
     if      (impulseLong)  { isLong = true;  patternType = PT_IMPULSE_BREAK; patternName = 'IMPULSE_BREAK'; }
     else if (impulseShort) { isLong = false; patternType = PT_IMPULSE_BREAK; patternName = 'IMPULSE_BREAK'; }
+    else if (cleanPushLong)  { isLong = true;  patternType = PT_IMPULSE_BREAK; patternName = 'CLEAN_PUSH'; }
+    else if (cleanPushShort) { isLong = false; patternType = PT_IMPULSE_BREAK; patternName = 'CLEAN_PUSH'; }
     else if (momLong)      { isLong = true;  patternType = PT_MOMENTUM;      patternName = 'MOMENTUM'; }
     else if (momShort)     { isLong = false; patternType = PT_MOMENTUM;      patternName = 'MOMENTUM'; }
     else { this.dbg['no_pattern'] = (this.dbg['no_pattern'] ?? 0) + 1; return null; }
@@ -397,8 +722,7 @@ export class InstScannerService implements OnModuleInit {
       ? (entry - slLevel) / entry * 100
       : (slLevel - entry) / entry * 100;
 
-    // Max 2× ATR — esclude spike già esplosi, entry troppo tardiva
-    if (body > atr14 * 1.6) {
+    if (body > atr14 * MAX_IMPULSE_BODY_ATR) {
       this.dbg['too_big'] = (this.dbg['too_big'] ?? 0) + 1; _nm('body_too_big'); return null;
     }
 
@@ -411,24 +735,18 @@ export class InstScannerService implements OnModuleInit {
       return null;
     }
 
-    // Candela in formazione (n-1) non deve contraddire la direzione — evita entry su rimbalzi
-    if (ti === n - 2) {
-      const fBody = Math.abs(c[n-1] - o[n-1]);
-      if ( isLong && c[n-1] < o[n-1] && fBody > atr14 * 0.25) { this.dbg['forming_contra'] = (this.dbg['forming_contra'] ?? 0) + 1; _nm('forming_bearish'); return null; }
-      if (!isLong && c[n-1] > o[n-1] && fBody > atr14 * 0.25) { this.dbg['forming_contra'] = (this.dbg['forming_contra'] ?? 0) + 1; _nm('forming_bullish'); return null; }
-    }
-
     // ── SCORING ──────────────────────────────────────────────────────────────
     // Range body effettivo: 0.5–1.2×ATR (imposto dai filtri sopra)
     // Sweet spot pre-breakout: 0.6–0.9×ATR — corpo non troppo piccolo, non già esploso
-    let score = patternName === 'IMPULSE_BREAK' ? 42 : 40;
+    let score = patternName === 'MOMENTUM' ? 40 : 42;
     const reasons: string[] = [patternName];
 
     const bodyMult = body / atr14;
-    if (patternName === 'IMPULSE_BREAK') {
+    if (patternName !== 'MOMENTUM') {
       if      (bodyMult >= 1.05 && bodyMult <= 1.35) { score += 20; reasons.push(`ImpulseBody×${bodyMult.toFixed(2)}`); }
       else if (bodyMult >= 0.90 && bodyMult <  1.05) { score += 14; reasons.push(`Body×${bodyMult.toFixed(2)}`); }
-      else if (bodyMult >  1.35 && bodyMult <= 1.60) { score +=  8; reasons.push(`ExtendedBody×${bodyMult.toFixed(2)}`); }
+      else if (bodyMult >  1.35 && bodyMult <= 1.80) { score +=  8; reasons.push(`ExtendedBody×${bodyMult.toFixed(2)}`); }
+      else if (bodyMult >  1.80 && bodyMult <= MAX_IMPULSE_BODY_ATR) { score +=  4; reasons.push(`WideImpulse×${bodyMult.toFixed(2)}`); }
     } else {
       if      (bodyMult >= 0.85 && bodyMult <= 1.05) { score += 20; reasons.push(`Body×${bodyMult.toFixed(2)} sweet`); }
       else if (bodyMult >= 0.65 && bodyMult <  0.85) { score += 12; reasons.push(`Body×${bodyMult.toFixed(2)}`); }
@@ -517,6 +835,28 @@ export class InstScannerService implements OnModuleInit {
     this.events.emitInstTrade(trade);
   }
 
+  private async fetchOHLCVWithRetry(symbol: string, timeframe: string, limit: number, failKey: string): Promise<number[][] | null> {
+    let lastErr: any = null;
+    for (let attempt = 1; attempt <= FETCH_RETRIES; attempt++) {
+      try {
+        return await this.fastExchange.fetchOHLCV(symbol, timeframe, undefined, limit) as number[][];
+      } catch (err: any) {
+        lastErr = err;
+        if (attempt < FETCH_RETRIES) {
+          this.dbg[`${failKey}_retry`] = (this.dbg[`${failKey}_retry`] ?? 0) + 1;
+          await this.sleep(FETCH_RETRY_DELAY_MS * attempt);
+        }
+      }
+    }
+    this.dbg[failKey] = (this.dbg[failKey] ?? 0) + 1;
+    this.logger.warn(`[INST5m FETCH] ${symbol} ${failKey}: ${lastErr?.message?.slice(0, 120) ?? 'unknown'}`);
+    return null;
+  }
+
+  private sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
   private async getOpenSymbolsSet(): Promise<Set<string>> {
     const open = await this.prisma.instSimulatedTrade.findMany({
       where: { status: 'open', openedAt: { gte: this.sessionStart } },
@@ -544,7 +884,7 @@ export class InstScannerService implements OnModuleInit {
     const exists = await this.prisma.instSimConfig.findUnique({ where: { id: 1 } });
     if (!exists) {
       await this.prisma.instSimConfig.create({
-        data: { id: 1, startingCapital: 500, maxConcurrent: 5, autoEnter: true, minScore: 40, atrSlMult: 0.5, tpRr: 3.0, liveEnabled: false },
+        data: { id: 1, startingCapital: 500, maxConcurrent: 5, autoEnter: true, minScore: 40, atrSlMult: 0.5, tpRr: 2.0, liveEnabled: false },
       });
     }
   }
@@ -553,7 +893,7 @@ export class InstScannerService implements OnModuleInit {
     let cfg = await this.prisma.instSimConfig.findUnique({ where: { id: 1 } });
     if (!cfg) {
       cfg = await this.prisma.instSimConfig.create({
-        data: { id: 1, startingCapital: 500, maxConcurrent: 5, autoEnter: true, minScore: 50, atrSlMult: 0.5, tpRr: 3.0, liveEnabled: false },
+        data: { id: 1, startingCapital: 500, maxConcurrent: 5, autoEnter: true, minScore: 50, atrSlMult: 0.5, tpRr: 2.0, liveEnabled: false },
       });
     }
     return cfg;
@@ -562,7 +902,7 @@ export class InstScannerService implements OnModuleInit {
   async updateConfig(data: any) {
     return this.prisma.instSimConfig.upsert({
       where: { id: 1 },
-      create: { id: 1, startingCapital: 500, maxConcurrent: 5, autoEnter: true, minScore: 50, atrSlMult: 0.5, tpRr: 3.0, liveEnabled: false, ...data },
+      create: { id: 1, startingCapital: 500, maxConcurrent: 5, autoEnter: true, minScore: 50, atrSlMult: 0.5, tpRr: 2.0, liveEnabled: false, ...data },
       update: data,
     });
   }
