@@ -7,3 +7,5 @@ dist/
 backend-log.txt
 frontend-log.txt
 .claude/
+.tmp/
+backups/

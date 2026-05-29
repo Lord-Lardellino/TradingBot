@@ -6,7 +6,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { EventsGateway } from '../events/events.gateway';
 
 const MAX_TRIGGER_FILL_MS = 15_000;
-const MAX_WORSE_ENTRY_PCT = 0.08;
+const MAX_WORSE_ENTRY_PCT = 0.25;
 const MIN_LIVE_RR_FACTOR = 0.98;
 
 export interface TradeSignal {
@@ -15,6 +15,11 @@ export interface TradeSignal {
   score?: number;
   stopLossPrice?: number;   // prezzo SL assoluto calcolato dallo scanner
   takeProfitPrice?: number; // prezzo TP assoluto calcolato dallo scanner
+  riskUsdt?: number;        // opzionale: rischio fisso in USDT per strategie dedicate
+  feeRate?: number;         // fee stimata per lato; 0 per coppie zero-fee
+  source?: string;          // tag separato per analytics/filtri live
+  sourceMaxConcurrent?: number;
+  bypassGlobalConfig?: boolean;
 }
 
 export interface LiveConfigData {
@@ -33,6 +38,8 @@ export class LiveTradingService implements OnModuleInit {
   private readonly logger = new Logger(LiveTradingService.name);
   private exchange: ccxt.mexc;
   private markets: Record<string, any> = {};
+  // cache leverage per evitare chiamate API ripetute (TTL 30 min)
+  private leverageCache = new Map<string, { leverage: number; ts: number }>();
 
   constructor(
     private prisma: PrismaService,
@@ -108,6 +115,11 @@ export class LiveTradingService implements OnModuleInit {
     };
   }
 
+  private feeRateForTrade(trade: any) {
+    if (trade?.feeRate !== undefined && trade?.feeRate !== null) return Number(trade.feeRate);
+    return String(trade?.note ?? '').startsWith('POL_ZERO') ? 0 : 0.00038;
+  }
+
   private validateTriggerFill(signal: TradeSignal, fillPrice: number, stopLoss: number, takeProfit: number) {
     if (!Number.isFinite(fillPrice) || fillPrice <= 0) return { ok: false, reason: 'fill_invalid' };
 
@@ -142,7 +154,7 @@ export class LiveTradingService implements OnModuleInit {
     const side = args.signal.direction === 'LONG' ? 'sell' : 'buy';
     let status = 'bad_fill';
     let closePrice = args.fillPrice;
-    let feesClose = args.positionSize * 0.00038;
+    let feesClose = args.positionSize * (args.signal.feeRate ?? 0.00038);
     let closedAt: Date | undefined = new Date();
 
     try {
@@ -177,12 +189,13 @@ export class LiveTradingService implements OnModuleInit {
       limitOrderId: args.orderId,
       grade: args.signal.grade,
       score: args.signal.score ?? 0,
+      feeRate: args.signal.feeRate ?? 0.00038,
       feesOpen: parseFloat(args.feesOpen.toFixed(6)),
       feesClose: parseFloat(feesClose.toFixed(6)),
       closePrice: parseFloat(closePrice.toFixed(8)),
       pnl,
       status,
-      note: args.reason,
+      note: args.signal.source ? `${args.signal.source}:${args.reason}` : args.reason,
       ...(closedAt ? { closedAt } : {}),
     };
     const { id: _id, ...updateData } = createData;
@@ -194,13 +207,20 @@ export class LiveTradingService implements OnModuleInit {
 
   async enterTrade(signal: TradeSignal): Promise<void> {
     const cfg = await this.getConfig();
-    if (!cfg.enabled) return;
+    if (!cfg.enabled && !signal.bypassGlobalConfig) return;
 
     const gradeOrder = ['A+', 'A', 'B', 'C'];
-    if (gradeOrder.indexOf(signal.grade) > gradeOrder.indexOf(cfg.minGrade)) return;
+    if (!signal.bypassGlobalConfig && gradeOrder.indexOf(signal.grade) > gradeOrder.indexOf(cfg.minGrade)) return;
 
-    const activeCount = await this.prisma.liveTrade.count({ where: { status: { in: ['open', 'pending'] } } });
-    if (activeCount >= cfg.maxConcurrent) return;
+    if (signal.source) {
+      const sourceOpen = await this.prisma.liveTrade.count({
+        where: { note: { startsWith: signal.source }, status: { in: ['open', 'pending'] } },
+      });
+      if (sourceOpen >= (signal.sourceMaxConcurrent ?? 1)) return;
+    } else {
+      const activeCount = await this.prisma.liveTrade.count({ where: { status: { in: ['open', 'pending'] } } });
+      if (activeCount >= cfg.maxConcurrent) return;
+    }
 
     const already = await this.prisma.liveTrade.findFirst({
       where: { symbol: signal.symbol, status: { in: ['open', 'pending'] } },
@@ -209,9 +229,32 @@ export class LiveTradingService implements OnModuleInit {
 
     const id           = `live_${signal.symbol}_${Date.now()}`;
     const market       = this.markets[signal.symbol];
-    const leverage     = signal.suggestedLeverage;
-    const notional     = 1.0 / (signal.slPct / 100); // rischia sempre €1 a SL
-    const margin       = notional / leverage;
+    const riskUsdt     = signal.riskUsdt ?? 1.0;
+    const feeRate      = signal.feeRate ?? 0.00038;
+    // include fees: perdita a SL = notional*slPct + notional*2*feeRate = riskUsdt
+    const sizedNotional = riskUsdt / (signal.slPct / 100 + 2 * feeRate);
+
+    // leva dinamica: usa il balance USDT attuale
+    let availUsdt = 10; // fallback
+    try {
+      const res  = await (this.exchange as any).contractPrivateGetAccountAssets();
+      const data = res?.data;
+      // MEXC ritorna array di valute — cerco USDT specificamente
+      let raw: any = null;
+      if (Array.isArray(data)) {
+        raw = data.find((d: any) => d.currency === 'USDT') ?? null;
+      } else if (data && typeof data === 'object') {
+        raw = data['USDT'] ?? data;
+      }
+      if (raw) availUsdt = Number(raw.availableBalance ?? raw.available ?? 0) || 10;
+    } catch { /* usa fallback */ }
+    const maxConc      = signal.sourceMaxConcurrent ?? cfg.maxConcurrent ?? 3;
+    const marginBudget = Math.max(0.5, availUsdt / (maxConc + 1));
+    const maxLev       = Number(market?.limits?.leverage?.max ?? 125) || 125;
+    // safeLev: SL deve scattare prima della liquidazione (buffer 20%)
+    const safeLev      = Math.floor(0.8 / (signal.slPct / 100));
+    const leverage     = Math.max(1, Math.min(Math.ceil(sizedNotional / marginBudget), safeLev, maxLev, 100));
+    const margin       = sizedNotional / leverage;
     const contractSize = market?.contractSize ?? 1;
     const isLong       = signal.direction === 'LONG';
     const side         = isLong ? 'buy' : 'sell';
@@ -226,7 +269,7 @@ export class LiveTradingService implements OnModuleInit {
     const tpPrice = parseFloat(this.exchange.priceToPrecision(signal.symbol, adjTP));
 
     try {
-      let amount = notional / (signal.entry * contractSize);
+      let amount = sizedNotional / (signal.entry * contractSize);
       const minAmount = market?.limits?.amount?.min ?? 0;
       if (minAmount > 0 && amount < minAmount) {
         this.logger.warn(`[LIVE] ${signal.symbol}: amount ${amount.toFixed(6)} < min ${minAmount} — skip`);
@@ -234,18 +277,38 @@ export class LiveTradingService implements OnModuleInit {
       }
       amount = parseFloat(this.exchange.amountToPrecision(signal.symbol, amount));
 
-      await Promise.allSettled([
-        this.exchange.setMarginMode('isolated', signal.symbol),
-        this.exchange.setLeverage(leverage, signal.symbol),
-      ]);
+      // setMarginMode isolated — MEXC richiede leverage come parametro aggiuntivo
+      const levCacheKey = `${signal.symbol}_${signal.direction}`;
+      const levCached   = this.leverageCache.get(levCacheKey);
+      const levTtl      = 30 * 60 * 1000;
+      if (!levCached || levCached.leverage !== leverage || Date.now() - levCached.ts > levTtl) {
+        try {
+          await this.exchange.setMarginMode('isolated', signal.symbol, { leverage });
+          this.logger.log(`[LIVE] setMarginMode isolated ${signal.symbol} leverage=${leverage}x`);
+        } catch (e: any) {
+          this.logger.warn(`[LIVE] setMarginMode ${signal.symbol}: ${e?.message?.slice(0, 80)}`);
+          // fallback: setLeverage con openType isolated
+          try {
+            await this.exchange.setLeverage(leverage, signal.symbol, {
+              openType: 1,
+              positionType: isLong ? 1 : 2,
+            });
+          } catch { /* tollerato */ }
+        }
+        this.leverageCache.set(levCacheKey, { leverage, ts: Date.now() });
+        this.logger.log(`[LIVE] leverage ${signal.symbol} → ${leverage}x isolated`);
+      } else {
+        this.logger.log(`[LIVE] leverage ${signal.symbol} → ${leverage}x (cached)`);
+      }
 
-      const feesEst = notional * 0.00038;
+      const feesEst = sizedNotional * feeRate;
       const effectiveOrderType = 'market';
 
       if (effectiveOrderType === 'market') {
         // ── MARKET: entra subito, poi fetch position per positionId, poi SL/TP ──
         const order     = await this.exchange.createOrder(signal.symbol, 'market', side, amount);
         let fillPrice = Number(order.average ?? order.price ?? signal.entry);
+        const openFee = Number(order.fee?.cost ?? feesEst);
         const orderId   = String(order.id ?? '');
         let liveSlPrice = parseFloat(this.exchange.priceToPrecision(
           signal.symbol,
@@ -289,8 +352,8 @@ export class LiveTradingService implements OnModuleInit {
           await this.closeRejectedFill({
             id, signal, fillPrice,
             stopLoss: liveSlPrice, takeProfit: liveTpPrice,
-            leverage, margin, positionSize: notional,
-            contracts: posVol, orderId, feesOpen: feesEst,
+            leverage, margin, positionSize: sizedNotional,
+            contracts: posVol, orderId, feesOpen: openFee,
             reason: 'position_id_missing',
           });
           return;
@@ -302,8 +365,8 @@ export class LiveTradingService implements OnModuleInit {
           await this.closeRejectedFill({
             id, signal, fillPrice,
             stopLoss: liveSlPrice, takeProfit: liveTpPrice,
-            leverage, margin, positionSize: notional,
-            contracts: posVol, orderId, feesOpen: feesEst,
+            leverage, margin, positionSize: sizedNotional,
+            contracts: posVol, orderId, feesOpen: openFee,
             reason: fillGuard.reason,
           });
           return;
@@ -335,8 +398,8 @@ export class LiveTradingService implements OnModuleInit {
           await this.closeRejectedFill({
             id, signal, fillPrice,
             stopLoss: liveSlPrice, takeProfit: liveTpPrice,
-            leverage, margin, positionSize: notional,
-            contracts: posVol, orderId, feesOpen: feesEst,
+            leverage, margin, positionSize: sizedNotional,
+            contracts: posVol, orderId, feesOpen: openFee,
             reason: 'protection_failed',
           });
           return;
@@ -347,10 +410,12 @@ export class LiveTradingService implements OnModuleInit {
             id, symbol: signal.symbol, direction: signal.direction,
             entry: parseFloat(fillPrice.toFixed(8)), stopLoss: liveSlPrice, takeProfit: liveTpPrice,
             leverage, marginEur: parseFloat(margin.toFixed(4)),
-            positionSize: parseFloat(notional.toFixed(4)), contracts: posVol,
+            positionSize: parseFloat(sizedNotional.toFixed(4)), contracts: posVol,
             orderId, slOrderId, tpOrderId: slOrderId,
             grade: signal.grade, score: signal.score ?? 0,
-            feesOpen: parseFloat(feesEst.toFixed(6)), status: 'open',
+            feeRate,
+            feesOpen: parseFloat(openFee.toFixed(6)), status: 'open',
+            ...(signal.source ? { note: signal.source } : {}),
           },
         });
         this.events.emitLiveTrade(trade);
@@ -373,10 +438,12 @@ export class LiveTradingService implements OnModuleInit {
             id, symbol: signal.symbol, direction: signal.direction,
             entry: limitPrice, stopLoss: slPrice, takeProfit: tpPrice,
             leverage, marginEur: parseFloat(margin.toFixed(4)),
-            positionSize: parseFloat(notional.toFixed(4)), contracts: amount,
+            positionSize: parseFloat(sizedNotional.toFixed(4)), contracts: amount,
             limitOrderId, orderId: limitOrderId,
             grade: signal.grade, score: signal.score ?? 0,
+            feeRate,
             feesOpen: parseFloat(feesEst.toFixed(6)), status: 'pending',
+            ...(signal.source ? { note: signal.source } : {}),
           },
         });
         this.logger.log(`[LIVE] ⏳ LIMIT ${side.toUpperCase()} ${signal.symbol} | ${amount} @ ${limitPrice} | SL ${slPrice} | TP ${tpPrice} | expire 10min`);
@@ -389,10 +456,11 @@ export class LiveTradingService implements OnModuleInit {
         data: {
           id, symbol: signal.symbol, direction: signal.direction,
           entry: signal.entry, stopLoss: slPrice, takeProfit: tpPrice,
-          leverage, marginEur: cfg.marginPerTrade,
-          positionSize: cfg.marginPerTrade * leverage,
+          leverage, marginEur: parseFloat(margin.toFixed(4)),
+          positionSize: parseFloat(sizedNotional.toFixed(4)),
           contracts: 0, grade: signal.grade, score: signal.score ?? 0,
-          status: 'error', note: e?.message?.slice(0, 200),
+          feeRate,
+          status: 'error', note: signal.source ? `${signal.source}:${e?.message?.slice(0, 180)}` : e?.message?.slice(0, 200),
         },
       });
     }
@@ -473,7 +541,7 @@ export class LiveTradingService implements OnModuleInit {
             leverage: trade.leverage, margin: trade.marginEur,
             positionSize: trade.positionSize, contracts: posVol,
             orderId: trade.limitOrderId ?? trade.orderId ?? undefined,
-            feesOpen: trade.feesOpen ?? trade.positionSize * 0.00038,
+            feesOpen: trade.feesOpen ?? trade.positionSize * this.feeRateForTrade(trade),
             reason: fillGuard.reason,
           });
           continue;
@@ -553,6 +621,7 @@ export class LiveTradingService implements OnModuleInit {
         p => p.symbol === trade.symbol && Math.abs(Number(p.contracts ?? 0)) > 0,
       );
       if (mexcPos) {
+        continue; // RR fisso: SL/TP nativi restano quelli iniziali.
         // Break-Even automatico — 50% verso TP → SL si sposta a entry
         const markPrice = Number(mexcPos.markPrice ?? mexcPos.info?.markPrice ?? 0);
         if (markPrice > 0) {
@@ -606,7 +675,7 @@ export class LiveTradingService implements OnModuleInit {
         if (cp > 0) {
           closePrice          = cp;
           pnl                 = parseFloat(Number(hist.realised ?? hist.realizedPnl ?? 0).toFixed(4));
-          feesClose           = parseFloat((trade.positionSize * 0.00038).toFixed(6));
+          feesClose           = parseFloat((trade.positionSize * this.feeRateForTrade(trade)).toFixed(6));
           resolvedFromHistory = true;
           this.logger.log(`[LIVE] positionHistory OK ${trade.symbol}: close=${cp} realised=${hist.realised ?? hist.realizedPnl}`);
         }
@@ -655,9 +724,9 @@ export class LiveTradingService implements OnModuleInit {
       const priceDiff = trade.direction === 'LONG'
         ? (closePrice - entryRef) / entryRef
         : (entryRef - closePrice) / entryRef;
-      const fc = feesClose ?? (trade.positionSize * 0.00038);
+      const fc = feesClose ?? (trade.positionSize * this.feeRateForTrade(trade));
       pnl       = parseFloat((trade.positionSize * priceDiff - (trade.feesOpen ?? 0) - fc).toFixed(4));
-      feesClose = parseFloat((feesClose ?? (trade.positionSize * 0.00038)).toFixed(6));
+      feesClose = parseFloat((feesClose ?? (trade.positionSize * this.feeRateForTrade(trade))).toFixed(6));
     }
 
     await this.prisma.liveTrade.update({
@@ -734,7 +803,7 @@ export class LiveTradingService implements OnModuleInit {
       );
 
       const closePrice = Number(order.average ?? order.price ?? 0);
-      const actualFee  = Number(order.fee?.cost ?? (trade.positionSize * 0.00038));
+      const actualFee  = Number(order.fee?.cost ?? (trade.positionSize * this.feeRateForTrade(trade)));
       const priceDiff  = trade.direction === 'LONG'
         ? (closePrice - trade.entry) / trade.entry
         : (trade.entry - closePrice) / trade.entry;

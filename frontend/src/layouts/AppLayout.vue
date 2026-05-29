@@ -97,20 +97,11 @@ const { connected } = useSocket()
 const sidebarOpen = ref(false)
 
 const navItems: { to?: string; icon?: string; label?: string; section?: string }[] = [
-  { to: '/dashboard',  icon: 'pi-home',         label: 'Dashboard' },
-  { to: '/live',       icon: 'pi-dollar',       label: 'Live Trading' },
-
-  { section: 'Scanners' },
-  { to: '/smart',      icon: 'pi-microchip-ai', label: 'Smart AI Scanner' },
-  { to: '/inst',       icon: 'pi-chart-line',   label: 'Inst5m Scanner' },
-  { to: '/inst-15m',  icon: 'pi-chart-line',   label: 'Inst15m Scanner' },
-  { to: '/inst-1h',          icon: 'pi-chart-line',   label: 'Inst1h Scanner' },
-  { to: '/scanner-monitor',  icon: 'pi-eye',          label: 'Scanner Monitor' },
+  { to: '/funding-arb',  icon: 'pi-dollar',        label: '💰 Funding Arb' },
 
   { section: 'Altro' },
-  { to: '/bots',       icon: 'pi-android',      label: 'Bot Manager' },
-  { to: '/trades',     icon: 'pi-list',         label: 'Trade History' },
-  { to: '/settings',   icon: 'pi-cog',          label: 'Settings' },
+  { to: '/trades',      icon: 'pi-list',         label: 'Trade History' },
+  { to: '/settings',    icon: 'pi-cog',          label: 'Settings' },
 ]
 </script>
 

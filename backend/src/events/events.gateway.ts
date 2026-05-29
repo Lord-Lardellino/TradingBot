@@ -118,4 +118,60 @@ export class EventsGateway implements OnGatewayConnection, OnGatewayDisconnect {
   emitInstPositions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
     this.server.emit('inst:positions', positions);
   }
+
+  emitSweepStarSignal(signal: any) { this.server.emit('sweep-star:signal', signal); }
+  emitSweepStarStatus(status: any) { this.server.emit('sweep-star:status', status); }
+  emitSweepStarTrade(trade: any)   { this.server.emit('sweep-star:trade', trade); }
+  emitSweepStarPositions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
+    this.server.emit('sweep-star:positions', positions);
+  }
+
+  emitImpulse100Signal(signal: any) { this.server.emit('impulse-100:signal', signal); }
+  emitImpulse100Status(status: any) { this.server.emit('impulse-100:status', status); }
+  emitImpulse100Trade(trade: any)   { this.server.emit('impulse-100:trade', trade); }
+  emitImpulse100Positions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
+    this.server.emit('impulse-100:positions', positions);
+  }
+
+  emitMtfScalperSignal(signal: any) { this.server.emit('mtf-scalper:signal', signal); }
+  emitMtfScalperStatus(status: any) { this.server.emit('mtf-scalper:status', status); }
+  emitMtfScalperTrade(trade: any)   { this.server.emit('mtf-scalper:trade', trade); }
+  emitMtfScalperPositions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
+    this.server.emit('mtf-scalper:positions', positions);
+  }
+
+  emitFootprintSignal(signal: any)  { this.server.emit('footprint:signal', signal); }
+  emitFootprintStatus(status: any)  { this.server.emit('footprint:status', status); }
+  emitFootprintTrade(trade: any)    { this.server.emit('footprint:trade', trade); }
+  emitFootprintPositions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
+    this.server.emit('footprint:positions', positions);
+  }
+
+  emitEngulfingSignal(signal: any) { this.server.emit('engulfing:signal', signal); }
+  emitEngulfingStatus(status: any) { this.server.emit('engulfing:status', status); }
+  emitEngulfingTrade(trade: any)   { this.server.emit('engulfing:trade', trade); }
+  emitEngulfingPositions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
+    this.server.emit('engulfing:positions', positions);
+  }
+
+  emitFibSignal(signal: any)    { this.server.emit('fib:signal', signal); }
+  emitFibStatus(status: any)    { this.server.emit('fib:status', status); }
+  emitFibTrade(trade: any)      { this.server.emit('fib:trade', trade); }
+  emitFibPositions(positions: { id: string; currentPrice: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
+    this.server.emit('fib:positions', positions);
+  }
+
+  emitEma34Signal(signal: any) { this.server.emit('ema34:signal', signal); }
+  emitEma34Status(status: any) { this.server.emit('ema34:status', status); }
+  emitEma34Trade(trade: any)   { this.server.emit('ema34:trade', trade); }
+  emitEma34Positions(positions: { id: string; currentPrice: number; currentR: number; trailingSl: number; unrealizedPnl: number; unrealizedPnlPct: number }[]) {
+    this.server.emit('ema34:positions', positions);
+  }
+
+  emitStarSignal(signal: any)         { this.server.emit('star:signal',    signal); }
+  emitStarStatus(status: any)         { this.server.emit('star:status',    status); }
+  emitStarTrade(trade: any)           { this.server.emit('star:trade',     trade); }
+  emitStarPositions(positions: any[]) { this.server.emit('star:positions', positions); }
+
+  emitFundingRates(rates: any[])  { this.server.emit('funding:rates',  rates); }
 }

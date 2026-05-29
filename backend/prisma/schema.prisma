@@ -170,6 +170,7 @@ model LiveTrade {
   status        String    @default("open") // pending | open | tp | sl | manual | error | expired
   closePrice    Float?
   pnl           Float?
+  feeRate       Float?
   feesOpen      Float?    // fee effettiva apertura
   feesClose     Float?    // fee effettiva chiusura
   openedAt      DateTime  @default(now())
@@ -191,6 +192,26 @@ model LiveConfig {
 }
 
 // ── Multi-TF Scanner — ERB v7 su 5m / 15m / 1h ──────────────────────────────
+
+model PolLiveConfig {
+  id                  Int      @id @default(1)
+  enabled             Boolean  @default(true)
+  liveEnabled         Boolean  @default(false)
+  symbol              String   @default("POL/USDT:USDT")
+  riskUsdt            Float    @default(2)
+  tpRr                Float    @default(2)
+  leverage            Int      @default(50)
+  maxConcurrent       Int      @default(1)
+  minBodyRangeRatio   Float    @default(0.75)
+  maxCloseWickRange   Float    @default(0.04)
+  maxOppositeWickRange Float   @default(0.06)
+  minRangeAtr         Float    @default(0.50)
+  minSlPct            Float    @default(0.15)
+  maxSlPct            Float    @default(0.90)
+  maxSpreadPct        Float    @default(0.03)
+  breakoutLookback    Int      @default(10)
+  updatedAt           DateTime @updatedAt
+}
 
 model MtfSimulatedTrade {
   id            String    @id
@@ -432,6 +453,450 @@ model SmartOptLog {
 
 // ── SOL Scalper — single-asset EMA34 bounce su SOL/USDT 1m ──────────────────
 
+model SweepStarSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String    // LONG | SHORT
+  patternType   Int       // 1=SWEEP_STAR_LONG 2=SWEEP_STAR_SHORT
+  patternName   String
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  grade         String
+  score         Int
+  status        String    @default("open") // open | tp1 | sl | manual
+  closePrice    Float?
+  pnl           Float?
+  feeRate       Float     @default(0.00038)
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model SweepStarConfig {
+  id                   Int      @id @default(1)
+  startingCapital      Float    @default(500)
+  riskUsdt             Float    @default(2)
+  tpRr                 Float    @default(2.5)
+  leverage             Int      @default(50)
+  maxConcurrent        Int      @default(3)
+  autoEnter            Boolean  @default(true)
+  liveEnabled          Boolean  @default(false)
+  minScore             Int      @default(90)
+  topPairs             Int      @default(100)
+  liquidityLookback    Int      @default(20)
+  minBodyRangeRatio    Float    @default(0.80)
+  maxCloseWickRange    Float    @default(0.025)
+  maxOppositeWickRange Float    @default(0.06)
+  minSweepWickRange    Float    @default(0.35)
+  minConfirmBodyAtr    Float    @default(0.45)
+  minVolumeRatio       Float    @default(0.90)
+  minSlPct             Float    @default(0.20)
+  maxSlPct             Float    @default(0.90)
+  maxSpreadPct         Float    @default(0.03)
+  feeRate              Float    @default(0.00038)
+  updatedAt            DateTime @updatedAt
+}
+
+model Impulse100SimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String    // LONG | SHORT
+  patternName   String
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  grade         String
+  score         Int
+  status        String    @default("open") // open | tp1 | sl | manual
+  closePrice    Float?
+  pnl           Float?
+  feeRate       Float     @default(0.00038)
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model Impulse100Config {
+  id                   Int      @id @default(1)
+  startingCapital      Float    @default(500)
+  riskUsdt             Float    @default(2)
+  tpRr                 Float    @default(2)
+  leverage             Int      @default(50)
+  maxMarginUsdt        Float    @default(10)
+  maxConcurrent        Int      @default(3)
+  maxSignalsPerScan    Int      @default(3)
+  enabled              Boolean  @default(true)
+  autoEnter            Boolean  @default(true)
+  liveEnabled          Boolean  @default(false)
+  minScore             Int      @default(70)
+  topPairs             Int      @default(100)
+  breakLookback        Int      @default(2)
+  minBodyRangeRatio    Float    @default(0.62)
+  maxCloseWickRange    Float    @default(0.080)
+  maxOppositeWickRange Float    @default(0.080)
+  minRangeAtr          Float    @default(0.35)
+  maxRangeAtr          Float    @default(1.80)
+  minSlPct             Float    @default(0.10)
+  maxSlPct             Float    @default(0.90)
+  maxSpreadPct         Float    @default(0.03)
+  minVolume24h         Float    @default(500000)
+  cooldownMinutes      Int      @default(30)
+  feeRate              Float    @default(0.00038)
+  updatedAt            DateTime @updatedAt
+}
+
+// ── MTF Scalper — EMA9/21/200(5m) + EMA200(30m) HTF bias ────────────────────
+
+model MtfScalperSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String    // LONG | SHORT
+  entry         Float
+  stopLoss      Float
+  takeProfit1   Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  grade         String
+  score         Int
+  status        String    @default("open") // open | tp1 | sl | manual
+  closePrice    Float?
+  pnl           Float?
+  feeRate       Float     @default(0.00038)
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model MtfScalperConfig {
+  id                Int      @id @default(1)
+  startingCapital   Float    @default(500)
+  riskUsdt          Float    @default(2)
+  tpRr              Float    @default(2)
+  leverage          Int      @default(50)
+  maxConcurrent     Int      @default(3)
+  maxSignalsPerScan Int      @default(3)
+  enabled           Boolean  @default(true)
+  autoEnter         Boolean  @default(true)
+  liveEnabled       Boolean  @default(false)
+  minScore          Int      @default(65)
+  topPairs          Int      @default(100)
+  minBodyRatio      Float    @default(0.45)
+  maxCloseWick      Float    @default(0.20)
+  minRangeAtr       Float    @default(0.40)
+  maxRangeAtr       Float    @default(2.00)
+  minSlPct          Float    @default(0.10)
+  maxSlPct          Float    @default(0.90)
+  maxSpreadPct      Float    @default(0.03)
+  minVolume24h      Float    @default(500000)
+  cooldownMinutes   Int      @default(30)
+  feeRate           Float    @default(0.00038)
+  updatedAt         DateTime @updatedAt
+}
+
+model EngulfingSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String
+  entry         Float
+  stopLoss      Float
+  takeProfit    Float
+  slPct         Float
+  tpPct         Float
+  leverage      Int
+  riskEur       Float
+  positionSize  Float
+  marginEur     Float
+  score         Int
+  grade         String
+  engulfRatio   Float
+  volumeRatio   Float
+  feeRate       Float     @default(0.0006)
+  status        String    @default("open")
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model EngulfingConfig {
+  id                Int      @id @default(1)
+  startingCapital   Float    @default(500)
+  riskUsdt          Float    @default(2)
+  tpRr              Float    @default(2.5)
+  leverage          Int      @default(50)
+  maxConcurrent     Int      @default(3)
+  maxSignalsPerScan Int      @default(3)
+  enabled           Boolean  @default(true)
+  autoEnter         Boolean  @default(true)
+  liveEnabled       Boolean  @default(false)
+  minScore          Int      @default(60)
+  topPairs          Int      @default(100)
+  minEngulfRatio    Float    @default(1.0)
+  minBodyRatio      Float    @default(0.50)
+  minVolumeRatio    Float    @default(1.2)
+  minSlPct          Float    @default(0.20)
+  maxSlPct          Float    @default(2.00)
+  maxSpreadPct      Float    @default(0.03)
+  minVolume24h      Float    @default(500000)
+  cooldownMinutes   Int      @default(30)
+  updatedAt         DateTime @updatedAt
+}
+
+// ── Footprint + VWAP — 1m, 10 coppie fisse, delta trades ────────────────────
+
+model FootprintSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String
+  entry         Float
+  stopLoss      Float
+  takeProfit    Float
+  slPct         Float
+  tpPct         Float
+  leverage      Int
+  riskUsdt      Float
+  positionSize  Float
+  marginUsdt    Float
+  score         Int
+  grade         String
+  // Consolidation range
+  rangeHigh     Float     @default(0)
+  rangeLow      Float     @default(0)
+  rangeSize     Float     @default(0)   // % altezza del range
+  volumeRatio   Float     @default(0)   // volume breakout / avg range
+  // Flow data
+  vwap          Float     @default(0)
+  delta         Float     @default(0)
+  deltaRatio    Float     @default(0)
+  feeRate       Float     @default(0.0006)
+  status        String    @default("open")
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model FootprintConfig {
+  id                 Int      @id @default(1)
+  startingCapital    Float    @default(50)
+  riskUsdt           Float    @default(1)
+  tpRangeMultiplier  Float    @default(1.5)  // TP = rangeHeight × questo
+  leverage           Int      @default(20)
+  maxConcurrent      Int      @default(2)
+  enabled            Boolean  @default(true)
+  autoEnter          Boolean  @default(true)
+  liveEnabled        Boolean  @default(false)
+  minScore           Int      @default(50)
+  // Breakout config
+  rangeLookback      Int      @default(6)    // candele per rilevare consolidation
+  rangeThresholdPct  Float    @default(0.50) // range massimo % per definire consolidation
+  minRangePct        Float    @default(0.12) // range minimo % (evita micro-range)
+  minDeltaRatio      Float    @default(0.20) // delta minimo per conferma
+  minVolumeRatio     Float    @default(1.20) // volume breakout vs media range
+  minSlPct           Float    @default(0.08)
+  maxSlPct           Float    @default(2.00)
+  cooldownMinutes    Int      @default(5)
+  updatedAt          DateTime @updatedAt
+}
+
+// ── Fibonacci Retracement Scanner — 1m, 10 coppie fisse ─────────────────────
+
+model FibSimulatedTrade {
+  id            String    @id
+  symbol        String
+  direction     String    // LONG | SHORT
+  entry         Float
+  stopLoss      Float
+  takeProfit    Float
+  slPct         Float
+  tpPct         Float
+  leverage      Int
+  riskUsdt      Float
+  positionSize  Float
+  marginUsdt    Float
+  score         Int
+  grade         String
+  // Fibonacci data
+  swingHigh     Float     @default(0)
+  swingLow      Float     @default(0)
+  swingRange    Float     @default(0)   // % swing size
+  fibLevel      Float     @default(0)   // es. 0.618
+  fibLevelName  String    @default("")  // es. "61.8%"
+  fibPrice      Float     @default(0)   // prezzo esatto del livello
+  // Flow data
+  vwap          Float     @default(0)
+  volumeRatio   Float     @default(0)
+  delta         Float     @default(0)
+  deltaRatio    Float     @default(0)
+  feeRate       Float     @default(0.0006)
+  status        String    @default("open")
+  closePrice    Float?
+  pnl           Float?
+  fees          Float     @default(0)
+  capitalBefore Float
+  capitalAfter  Float?
+  openedAt      DateTime  @default(now())
+  closedAt      DateTime?
+}
+
+model FibConfig {
+  id              Int      @id @default(1)
+  startingCapital Float    @default(50)
+  riskUsdt        Float    @default(1)
+  tpRr            Float    @default(2.0)
+  leverage        Int      @default(20)
+  maxConcurrent   Int      @default(2)
+  enabled         Boolean  @default(true)
+  autoEnter       Boolean  @default(true)
+  liveEnabled     Boolean  @default(false)
+  minScore        Int      @default(50)
+  swingPivotN     Int      @default(3)    // N candele per pivot detection
+  minSwingPct     Float    @default(0.25) // swing minimo % per essere valido
+  proxPct         Float    @default(0.15) // proximity % al livello fib
+  minVolumeRatio  Float    @default(1.10)
+  minDeltaRatio   Float    @default(0.15)
+  minSlPct        Float    @default(0.08)
+  maxSlPct        Float    @default(2.00)
+  cooldownMinutes Int      @default(5)
+  updatedAt       DateTime @updatedAt
+}
+
+// ── EMA34 Retest Scanner — 1m, top 50 coppie volume, trailing stop server-side ─
+
+model Ema34SimulatedTrade {
+  id               String    @id
+  symbol           String
+  direction        String    // LONG | SHORT
+  entry            Float
+  stopLoss         Float
+  takeProfit       Float
+  slPct            Float
+  tpPct            Float
+  leverage         Int
+  riskUsdt         Float
+  positionSize     Float
+  marginUsdt       Float
+  score            Int
+  grade            String
+  // EMA34 data
+  ema34            Float     @default(0)
+  emaSlope         Float     @default(0)
+  crossAgo         Int       @default(0)
+  // Flow
+  volumeRatio      Float     @default(0)
+  deltaRatio       Float     @default(0)
+  trailingSlPrice  Float     @default(0)   // SL corrente dopo trailing
+  feeRate          Float     @default(0.0006)
+  status           String    @default("open")
+  closePrice       Float?
+  pnl              Float?
+  fees             Float     @default(0)
+  capitalBefore    Float
+  capitalAfter     Float?
+  openedAt         DateTime  @default(now())
+  closedAt         DateTime?
+}
+
+model Ema34Config {
+  id                    Int      @id @default(1)
+  startingCapital       Float    @default(50)
+  riskUsdt              Float    @default(1)
+  tpRr                  Float    @default(2.0)
+  leverage              Int      @default(20)
+  maxConcurrent         Int      @default(3)
+  enabled               Boolean  @default(true)
+  autoEnter             Boolean  @default(true)
+  minScore              Int      @default(45)
+  minEmaSlope           Float    @default(0.015)
+  emaSlopeConsistencyN  Int      @default(5)
+  minAdx                Float    @default(20)
+  minCrossAgo           Int      @default(8)
+  maxCrossAgo           Int      @default(30)
+  proxPct               Float    @default(0.20)
+  minBodyRatio          Float    @default(0.45)
+  minVolumeRatio        Float    @default(1.0)
+  minSlPct              Float    @default(0.05)
+  maxSlPct              Float    @default(1.50)
+  cooldownMinutes       Int      @default(5)
+  liveEnabled           Boolean  @default(false)
+  updatedAt             DateTime @updatedAt
+}
+
+model StarSimulatedTrade {
+  id             String    @id
+  symbol         String
+  direction      String
+  entry          Float
+  stopLoss       Float
+  takeProfit     Float
+  slPct          Float
+  tpPct          Float
+  leverage       Int
+  riskUsdt       Float
+  positionSize   Float
+  marginUsdt     Float
+  score          Int
+  grade          String
+  emaSlope       Float     @default(0)
+  starCount      Int       @default(1)
+  volumeRatio    Float     @default(0)
+  feeRate        Float     @default(0.0006)
+  status         String    @default("open")
+  closePrice     Float?
+  pnl            Float?
+  fees           Float     @default(0)
+  capitalBefore  Float
+  capitalAfter   Float?
+  openedAt       DateTime  @default(now())
+  closedAt       DateTime?
+}
+
+model StarConfig {
+  id                   Int      @id @default(1)
+  startingCapital      Float    @default(50)
+  riskUsdt             Float    @default(0.1)
+  tpRr                 Float    @default(1.5)
+  maxConcurrent        Int      @default(3)
+  enabled              Boolean  @default(true)
+  autoEnter            Boolean  @default(true)
+  liveEnabled          Boolean  @default(false)
+  minScore             Int      @default(45)
+  minEmaSlope          Float    @default(0.05)
+  emaSlopeConsistencyN Int      @default(10)
+  minAdx               Float    @default(18)
+  minTrigBodyRatio     Float    @default(0.55)
+  maxStarBodyRatio     Float    @default(0.45)
+  minFirstBodyRatio    Float    @default(0.50)
+  minVolumeRatio       Float    @default(1.0)
+  minSlPct             Float    @default(0.05)
+  maxSlPct             Float    @default(1.50)
+  cooldownMinutes      Int      @default(5)
+  updatedAt            DateTime @updatedAt
+}
+
 model SolSimulatedTrade {
   id            String    @id
   symbol        String
@@ -581,4 +1046,27 @@ model Inst1hSimConfig {
   tpRr            Float    @default(1.5)
   liveEnabled     Boolean  @default(false)
   updatedAt       DateTime @updatedAt
+}
+
+model FundingArbConfig {
+  id                    Int      @id @default(1)
+  autoTradeEnabled      Boolean  @default(true)
+  maxOpenPositions      Int      @default(5)
+  capitalPerPosition    Float    @default(1)
+  leveragePerPosition   Int      @default(1)
+  updatedAt             DateTime @updatedAt
+}
+
+model FundingArbPosition {
+  id              String    @id @default(cuid())
+  symbol          String
+  entryPrice      Float
+  quantity        Float
+  fundingRate     Float
+  status          String    @default("open")
+  closePrice      Float?
+  closePnl        Float?
+  closeReason     String?
+  entryTime       DateTime  @default(now())
+  closeTime       DateTime?
 }

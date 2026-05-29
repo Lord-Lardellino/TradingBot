@@ -26,12 +26,13 @@ const MIN_EMA_SLOPE_ATR = 0.05;
 const STRONG_EMA_SLOPE_ATR = 0.12;
 const MIN_TRIGGER_BODY_ATR = 0.55;
 const MAX_TRIGGER_BODY_ATR = 2.20;
-const MIN_BODY_RANGE_RATIO = 0.68;
-const MAX_CLOSE_WICK_RANGE = 0.08;
-const MAX_CLOSE_WICK_ATR = 0.05;
-const MAX_OPPOSITE_WICK_RANGE = 0.45;
-const LONG_CLOSE_POS_MIN = 0.88;
-const SHORT_CLOSE_POS_MAX = 0.12;
+const MIN_BODY_RANGE_RATIO = 0.70;
+const MAX_CLOSE_WICK_RANGE = 0.045;
+const MAX_CLOSE_WICK_ATR = 0.030;
+const MAX_OPPOSITE_WICK_RANGE = 0.08;
+const MAX_OPPOSITE_WICK_ATR = 0.055;
+const LONG_CLOSE_POS_MIN = 0.92;
+const SHORT_CLOSE_POS_MAX = 0.08;
 const EMA_TOUCH_ATR = 0.55;
 const MIN_EMA_DISTANCE_ATR = 0.10;
 const MAX_EMA_DISTANCE_ATR = 2.60;
@@ -431,8 +432,9 @@ export class InstScannerService implements OnModuleInit {
 
     const longCloseClean = closePos >= LONG_CLOSE_POS_MIN && upperWick <= maxCloseWick;
     const shortCloseClean = closePos <= SHORT_CLOSE_POS_MAX && lowerWick <= maxCloseWick;
-    const longOppositeWickOk = lowerWick <= candleRange * MAX_OPPOSITE_WICK_RANGE;
-    const shortOppositeWickOk = upperWick <= candleRange * MAX_OPPOSITE_WICK_RANGE;
+    const maxOppositeWick = Math.min(candleRange * MAX_OPPOSITE_WICK_RANGE, atr14 * MAX_OPPOSITE_WICK_ATR);
+    const longOppositeWickOk = lowerWick <= maxOppositeWick;
+    const shortOppositeWickOk = upperWick <= maxOppositeWick;
 
     const longSide = entry > ema34;
     const shortSide = entry < ema34;

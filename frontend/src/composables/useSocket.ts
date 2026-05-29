@@ -73,6 +73,16 @@ export function useSocket() {
     socket.on('inst1h:trade',    (data: any)   => { import('@/stores/inst-scanner-1h').then(m => m.useInst1hStore().addLiveTrade(data)) })
     socket.on('inst1h:positions',(data: any[]) => { import('@/stores/inst-scanner-1h').then(m => m.useInst1hStore().updatePositions(data)) })
     socket.on('inst1h:status',   (data: any)   => { import('@/stores/inst-scanner-1h').then(m => { Object.assign(m.useInst1hStore().status, data) }) })
+
+    socket.on('sweep-star:signal',    (data: any)   => { import('@/stores/sweep-star').then(m => m.useSweepStarStore().addLiveSignal(data)) })
+    socket.on('sweep-star:trade',     (data: any)   => { import('@/stores/sweep-star').then(m => m.useSweepStarStore().addLiveTrade(data)) })
+    socket.on('sweep-star:positions', (data: any[]) => { import('@/stores/sweep-star').then(m => m.useSweepStarStore().updatePositions(data)) })
+    socket.on('sweep-star:status',    (data: any)   => { import('@/stores/sweep-star').then(m => m.useSweepStarStore().updateStatus(data)) })
+
+    socket.on('impulse-100:signal',    (data: any)   => { import('@/stores/impulse-100').then(m => m.useImpulse100Store().addLiveSignal(data)) })
+    socket.on('impulse-100:trade',     (data: any)   => { import('@/stores/impulse-100').then(m => m.useImpulse100Store().addLiveTrade(data)) })
+    socket.on('impulse-100:positions', (data: any[]) => { import('@/stores/impulse-100').then(m => m.useImpulse100Store().updatePositions(data)) })
+    socket.on('impulse-100:status',    (data: any)   => { import('@/stores/impulse-100').then(m => m.useImpulse100Store().updateStatus(data)) })
   }
 
   function disconnect() {
