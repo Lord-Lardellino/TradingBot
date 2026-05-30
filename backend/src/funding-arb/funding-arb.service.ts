@@ -59,24 +59,24 @@ export class FundingArbService implements OnModuleInit {
       }
 
       // 2. Controlla pair positivi — se niente posizione aperta, ENTRA
-      const positive = this.rates.filter(r => r.fundingRate > 0 && r.hasSpot && !openPos.some(p => p.symbol === r.symbol));
+      // FILTRO LIQUIDITÀ: solo coppie con volume 24h decente (esclude shitcoin
+      // illiquide con APR 500% dove lo spread mangia il funding) e APR sensato.
+      const MIN_VOL_24H = 500_000;   // $500k volume minimo
+      const MAX_APR     = 300;       // sopra 300% APR = quasi sempre rate instabile/illiquido
+      const positive = this.rates.filter(r =>
+        r.fundingRate > 0 &&
+        r.hasSpot &&
+        r.vol24h > MIN_VOL_24H &&
+        r.aprPct <= MAX_APR &&
+        !openPos.some(p => p.symbol === r.symbol)
+      );
       const maxSlots = (cfg.maxOpenPositions ?? 5) - openPos.length;
-      const toEnter = positive.slice(0, maxSlots);
+      const toEnter = positive.slice(0, maxSlots);  // già ordinate per APR desc
 
       for (const rate of toEnter) {
         try {
-          const res = await this.enterPosition(rate.symbol, cfg.capitalPerPosition ?? 2, cfg.leveragePerPosition ?? 2);
-          // Salva in DB
-          await this.prisma.fundingArbPosition.create({
-            data: {
-              symbol: rate.symbol,
-              entryPrice: rate.price,
-              quantity: res.spotQuantity,
-              fundingRate: rate.fundingRate,
-              status: 'open',
-              entryTime: new Date(),
-            },
-          });
+          // enterPosition salva già nel DB
+          const res = await this.enterPosition(rate.symbol, cfg.capitalPerPosition ?? 15, cfg.leveragePerPosition ?? 1);
           this.logger.log(`[FUNDING AUTO] ${rate.symbol}: ENTRY OK · notional=${res.notional}\\$ · daily+${res.dailyProfit}\\$`);
         } catch (e: any) {
           this.logger.warn(`[FUNDING AUTO] ${rate.symbol}: entry failed: ${e?.message?.slice(0, 50)}`);
@@ -316,6 +316,18 @@ export class FundingArbService implements OnModuleInit {
       this.logger.log(
         `[FUNDING ENTRY] ${base} · spot=${spotQuantity} coin (${capitalUsdt}$) · short=${futuresContracts} contratti (cs=${contractSize}) = ${futuresQuantity} coin · leva=${leverage}x · marginFut=${marginFutures.toFixed(2)}$ · liq=${liquidationPct}% · daily+${dailyProfit.toFixed(4)}$`
       );
+
+      // Salva nel DB (sia per entry manuale che automatica → il cron le conta correttamente)
+      await this.prisma.fundingArbPosition.create({
+        data: {
+          symbol,
+          entryPrice: rate.price,
+          quantity: spotQuantity,
+          fundingRate: rate.fundingRate,
+          status: 'open',
+          entryTime: new Date(entryTs),
+        },
+      }).catch((e: any) => this.logger.warn(`[FUNDING] DB save ${base}: ${e?.message?.slice(0, 40)}`));
 
       return {
         symbol,
