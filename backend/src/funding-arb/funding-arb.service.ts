@@ -428,6 +428,98 @@ export class FundingArbService implements OnModuleInit {
     };
   }
 
+  // ── Analytics REALI letti direttamente da MEXC (non dal DB inaffidabile) ──
+  async getAnalytics() {
+    const openPos = await this.prisma.fundingArbPosition.findMany({ where: { status: 'open' } });
+
+    // 1. FUNDING realmente incassato (cumulativo, da MEXC funding records)
+    let fundingReceived = 0;
+    let fundingCount = 0;
+    try {
+      const fr: any = await (this.swapExchange as any).contractPrivateGetPositionFundingRecords({ page_size: 100 });
+      const recs = fr?.data?.resultList || [];
+      fundingCount = recs.length;
+      fundingReceived = recs.reduce((s: number, r: any) => s + Number(r.funding || 0), 0);
+    } catch (e: any) {
+      this.logger.warn(`[ANALYTICS] funding records: ${e?.message?.slice(0, 40)}`);
+    }
+
+    // 2. Posizioni futures REALI + spot balance → gap delta-neutral + funding/giorno
+    let spotValue = 0, futNotional = 0, dailyFundingEst = 0;
+    const legs: any[] = [];
+    try {
+      const positions = (await this.swapExchange.fetchPositions()).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
+      const balance = await this.spotExchange.fetchBalance();
+      for (const p of positions) {
+        const m = this.swapExchange.market(p.symbol);
+        const cs = Number((m as any)?.contractSize ?? 1) || 1;
+        const coin = Number(p.contracts) * cs;
+        const price = Number(p.markPrice || p.entryPrice);
+        const fNot = coin * price;
+        futNotional += fNot;
+
+        const base = p.symbol.replace('/USDT:USDT', '');
+        const spotQty = Number((balance.total as any)?.[base] ?? 0);
+        const sVal = spotQty * price;
+        spotValue += sVal;
+
+        const rate = this.rates.find(r => r.symbol === p.symbol);
+        const dEst = rate ? fNot * (rate.dailyPct / 100) : 0;
+        dailyFundingEst += dEst;
+
+        legs.push({
+          base,
+          spotValue: +sVal.toFixed(2),
+          futNotional: +fNot.toFixed(2),
+          gap: +(sVal - fNot).toFixed(3),
+          aprPct: rate?.aprPct ?? 0,
+          dailyFunding: +dEst.toFixed(4),
+        });
+      }
+    } catch (e: any) {
+      this.logger.warn(`[ANALYTICS] positions/balance: ${e?.message?.slice(0, 40)}`);
+    }
+
+    // 3. Fee pagate sulle coppie attualmente aperte (trade recenti)
+    let feesPaid = 0;
+    for (const pos of openPos) {
+      try {
+        const trades = await this.swapExchange.fetchMyTrades(pos.symbol, undefined, 100);
+        for (const t of trades) feesPaid += Number(t.fee?.cost ?? 0);
+        const spotSym = pos.symbol.replace('/USDT:USDT', '/USDT');
+        const st = await this.spotExchange.fetchMyTrades(spotSym, undefined, 100);
+        for (const t of st) {
+          const fc = t.fee?.currency, fcost = Number(t.fee?.cost ?? 0);
+          if (fc === 'USDT') feesPaid += fcost;
+          else if (fc) { const rr = this.rates.find(r => r.base === fc); if (rr) feesPaid += fcost * rr.price; }
+        }
+      } catch {}
+    }
+
+    const gap = spotValue - futNotional;
+    const netPnl = fundingReceived - feesPaid;
+
+    return {
+      fundingReceived: +fundingReceived.toFixed(4),
+      fundingCount,
+      feesPaid: +feesPaid.toFixed(4),
+      netPnl: +netPnl.toFixed(4),
+      dailyFundingEst: +dailyFundingEst.toFixed(4),
+      spotValue: +spotValue.toFixed(2),
+      futNotional: +futNotional.toFixed(2),
+      gap: +gap.toFixed(3),
+      openCount: openPos.length,
+      legs,
+    };
+  }
+
+  // ── Pulisci lo storico DB (cancella le posizioni chiuse di test) ──────────
+  async cleanHistory() {
+    const res = await this.prisma.fundingArbPosition.deleteMany({ where: { status: 'closed' } });
+    this.logger.log(`[FUNDING] storico DB pulito: ${res.count} posizioni chiuse rimosse`);
+    return { removed: res.count };
+  }
+
   // ── Vendi TUTTO lo spot reale sul wallet MEXC (esclude USDT/stablecoin) ───
   async closeAllSpot() {
     const STABLES = new Set(['USDT', 'USDC', 'USD', 'BUSD', 'DAI', 'TUSD']);

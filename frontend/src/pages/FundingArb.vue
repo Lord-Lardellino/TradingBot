@@ -28,6 +28,10 @@
           class="px-3 py-1.5 rounded text-sm font-medium bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 transition">
           💜 Chiudi Futures
         </button>
+        <button @click="cleanHistory" :disabled="loading"
+          class="px-3 py-1.5 rounded text-sm font-medium bg-surface-200 text-gray-400 hover:bg-surface-300 transition">
+          🧹 Pulisci storico
+        </button>
         <button @click="resetAll" :disabled="loading"
           class="px-3 py-1.5 rounded text-sm font-medium bg-red-600/20 text-red-400 hover:bg-red-600/30 transition">
           ⚠️ Reset
@@ -75,23 +79,38 @@
       </div>
     </div>
 
-    <!-- PnL Stats -->
-    <div v-if="positionsData" class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+    <!-- PnL Stats REALI (da MEXC) -->
+    <div v-if="analytics" class="grid grid-cols-2 sm:grid-cols-5 gap-3">
       <div class="stat-card border border-emerald-500/20">
-        <div class="text-xs text-gray-500 mb-1">Realized PnL</div>
-        <div class="text-2xl font-bold font-mono" :class="positionsData.totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'">
-          {{ positionsData.totalPnl >= 0 ? '+' : '' }}{{ positionsData.totalPnl.toFixed(4) }}$
+        <div class="text-xs text-gray-500 mb-1">💰 Funding incassato</div>
+        <div class="text-xl font-bold font-mono" :class="analytics.fundingReceived >= 0 ? 'text-emerald-400' : 'text-red-400'">
+          {{ analytics.fundingReceived >= 0 ? '+' : '' }}{{ analytics.fundingReceived.toFixed(4) }}$
         </div>
+        <div class="text-[10px] text-gray-600 mt-0.5">{{ analytics.fundingCount }} settlement reali</div>
+      </div>
+      <div class="stat-card border border-red-500/20">
+        <div class="text-xs text-gray-500 mb-1">💸 Fee pagate</div>
+        <div class="text-xl font-bold font-mono text-red-400">−{{ analytics.feesPaid.toFixed(4) }}$</div>
+        <div class="text-[10px] text-gray-600 mt-0.5">coppie attive</div>
+      </div>
+      <div class="stat-card border" :class="analytics.netPnl >= 0 ? 'border-emerald-500/30' : 'border-red-500/30'">
+        <div class="text-xs text-gray-500 mb-1">📊 Netto</div>
+        <div class="text-xl font-black font-mono" :class="analytics.netPnl >= 0 ? 'text-emerald-400' : 'text-red-400'">
+          {{ analytics.netPnl >= 0 ? '+' : '' }}{{ analytics.netPnl.toFixed(4) }}$
+        </div>
+        <div class="text-[10px] text-gray-600 mt-0.5">funding − fee</div>
       </div>
       <div class="stat-card border border-sky-500/20">
-        <div class="text-xs text-gray-500 mb-1">Unrealized PnL</div>
-        <div class="text-2xl font-bold font-mono" :class="positionsData.unrealizedPnl >= 0 ? 'text-sky-400' : 'text-red-400'">
-          {{ positionsData.unrealizedPnl >= 0 ? '+' : '' }}{{ positionsData.unrealizedPnl.toFixed(4) }}$
-        </div>
+        <div class="text-xs text-gray-500 mb-1">📈 Funding/giorno</div>
+        <div class="text-xl font-bold font-mono text-sky-400">+{{ analytics.dailyFundingEst.toFixed(4) }}$</div>
+        <div class="text-[10px] text-gray-600 mt-0.5">stima d'ora in poi</div>
       </div>
-      <div class="stat-card border border-white/20">
-        <div class="text-xs text-gray-500 mb-1">Posizioni</div>
-        <div class="text-2xl font-bold font-mono text-white">{{ positionsData.openPositions.length }} / {{ positionsData.totalPositions }}</div>
+      <div class="stat-card border" :class="absVal(analytics.gap) < 2 ? 'border-emerald-500/20' : 'border-yellow-500/30'">
+        <div class="text-xs text-gray-500 mb-1">⚖️ Gap delta</div>
+        <div class="text-xl font-bold font-mono" :class="absVal(analytics.gap) < 2 ? 'text-emerald-400' : 'text-yellow-400'">
+          {{ analytics.gap >= 0 ? '+' : '' }}{{ analytics.gap.toFixed(2) }}$
+        </div>
+        <div class="text-[10px] text-gray-600 mt-0.5">spot {{ analytics.spotValue.toFixed(0) }} vs fut {{ analytics.futNotional.toFixed(0) }} · {{ analytics.openCount }} pos</div>
       </div>
     </div>
 
@@ -326,6 +345,7 @@ const savingConfig     = ref(false)
 const autoTradeEnabled = ref<boolean | null>(null)
 const dashboard        = ref<any>(null)
 const positionsData    = ref<any>(null)
+const analytics        = ref<any>(null)
 const config           = ref<any>(null)
 const simSymbol        = ref('')
 const simCapital       = ref(100)
@@ -347,14 +367,16 @@ const avgApr           = computed(() => {
 async function load() {
   loading.value = true
   try {
-    const [dashRes, cfgRes, posRes] = await Promise.all([
+    const [dashRes, cfgRes, posRes, anRes] = await Promise.all([
       axios.get('/api/funding-arb/dashboard'),
       axios.get('/api/funding-arb/config'),
       axios.get('/api/funding-arb/positions'),
+      axios.get('/api/funding-arb/analytics').catch(() => ({ data: null })),
     ])
     dashboard.value = dashRes.data
     config.value = cfgRes.data
     positionsData.value = posRes.data
+    analytics.value = anRes.data
     autoTradeEnabled.value = cfgRes.data?.autoTradeEnabled ?? false
 
     if (!simSymbol.value && positiveWithSpot.value.length)
@@ -404,6 +426,18 @@ async function resetAll() {
   try {
     await axios.post('/api/funding-arb/reset-all')
     alert('✅ Reset completo eseguito')
+    await load()
+  } catch (e: any) {
+    alert(`❌ Errore: ${e?.response?.data?.message ?? e?.message}`)
+  } finally { loading.value = false }
+}
+
+async function cleanHistory() {
+  if (!confirm('Cancellare le posizioni chiuse di test dal DB? (non tocca le posizioni reali aperte)')) return
+  loading.value = true
+  try {
+    const { data } = await axios.post('/api/funding-arb/clean-history')
+    alert(`✅ ${data.removed} posizioni di test rimosse`)
     await load()
   } catch (e: any) {
     alert(`❌ Errore: ${e?.response?.data?.message ?? e?.message}`)
@@ -466,6 +500,8 @@ const nextFundingIn = (iso: string) => {
   const m = Math.floor((ms % 3600000) / 60000)
   return `${h}h ${m}m`
 }
+
+const absVal = (n: number) => Math.abs(n)
 
 const formatVol = (v: number) => {
   if (v >= 1e9) return (v / 1e9).toFixed(1) + 'B'
