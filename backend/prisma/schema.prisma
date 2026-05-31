@@ -1049,12 +1049,14 @@ model Inst1hSimConfig {
 }
 
 model FundingArbConfig {
-  id                    Int      @id @default(1)
-  autoTradeEnabled      Boolean  @default(true)
-  maxOpenPositions      Int      @default(5)
-  capitalPerPosition    Float    @default(1)
-  leveragePerPosition   Int      @default(1)
-  updatedAt             DateTime @updatedAt
+  id                    Int       @id @default(1)
+  autoTradeEnabled      Boolean   @default(true)
+  maxOpenPositions      Int       @default(5)
+  capitalPerPosition    Float     @default(1)
+  leveragePerPosition   Int       @default(1)
+  analyticsResetAt      DateTime?
+  baselineEquity        Float?
+  updatedAt             DateTime  @updatedAt
 }
 
 model FundingArbPosition {

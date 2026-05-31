@@ -428,16 +428,71 @@ export class FundingArbService implements OnModuleInit {
     };
   }
 
+  // ── Imposta il conto iniziale = equity ATTUALE (parti da ora, no chiusure) ─
+  async setBaseline() {
+    const current = await this.computeTotalEquity();
+    await this.prisma.fundingArbConfig.update({
+      where: { id: 1 },
+      data: { baselineEquity: current, analyticsResetAt: new Date() },
+    });
+    this.logger.log(`[FUNDING] baseline impostata a $${current.toFixed(2)} (parti da ora)`);
+    return { baselineEquity: +current.toFixed(2), analyticsResetAt: new Date() };
+  }
+
+  // ── Endpoint LEGGERO per refresh ogni secondo (solo equity, 2 chiamate) ──
+  async getEquity() {
+    const cfg = await this.prisma.fundingArbConfig.findUnique({ where: { id: 1 } });
+    const baseline = cfg?.baselineEquity ?? null;
+    const current = await this.computeTotalEquity();
+    return {
+      baselineEquity: baseline != null ? +baseline.toFixed(2) : null,
+      currentEquity: +current.toFixed(2),
+      equityPnl: baseline != null ? +(current - baseline).toFixed(4) : null,
+      ts: Date.now(),
+    };
+  }
+
+  // ── Equity totale del conto (spot USDT + asset spot + equity futures) ─────
+  async computeTotalEquity(): Promise<number> {
+    let total = 0;
+    try {
+      const sb = await this.spotExchange.fetchBalance();
+      total += Number((sb.total as any)?.USDT ?? 0);
+      // valuta gli asset spot con prezzo LIVE (fallback a rate.price del cache)
+      for (const [a, v] of Object.entries(sb.total || {})) {
+        if (['USDT', 'USDC', 'USD'].includes(a) || !Number(v)) continue;
+        let price = 0;
+        try { price = Number((await this.spotExchange.fetchTicker(`${a}/USDT`)).last) || 0; }
+        catch { price = this.rates.find(r => r.base === a)?.price ?? 0; }
+        total += Number(v) * price;
+      }
+    } catch (e: any) { this.logger.warn(`[EQUITY] spot: ${e?.message?.slice(0, 40)}`); }
+    try {
+      const fb = await this.swapExchange.fetchBalance();
+      const data = (fb.info as any)?.data;
+      if (Array.isArray(data)) {
+        const u = data.find((d: any) => d.currency === 'USDT');
+        if (u) total += Number(u.equity || 0);
+      } else {
+        total += Number((fb.total as any)?.USDT ?? 0);
+      }
+    } catch (e: any) { this.logger.warn(`[EQUITY] futures: ${e?.message?.slice(0, 40)}`); }
+    return total;
+  }
+
   // ── Analytics REALI letti direttamente da MEXC (non dal DB inaffidabile) ──
   async getAnalytics() {
+    const cfg = await this.prisma.fundingArbConfig.findUnique({ where: { id: 1 } });
+    const resetAt = cfg?.analyticsResetAt ? new Date(cfg.analyticsResetAt).getTime() : 0;  // punto zero
+    const baselineEquity = cfg?.baselineEquity ?? null;
     const openPos = await this.prisma.fundingArbPosition.findMany({ where: { status: 'open' } });
 
-    // 1. FUNDING realmente incassato (cumulativo, da MEXC funding records)
+    // 1. FUNDING realmente incassato DOPO il punto zero (da MEXC funding records)
     let fundingReceived = 0;
     let fundingCount = 0;
     try {
       const fr: any = await (this.swapExchange as any).contractPrivateGetPositionFundingRecords({ page_size: 100 });
-      const recs = fr?.data?.resultList || [];
+      const recs = (fr?.data?.resultList || []).filter((r: any) => Number(r.settleTime ?? 0) >= resetAt);
       fundingCount = recs.length;
       fundingReceived = recs.reduce((s: number, r: any) => s + Number(r.funding || 0), 0);
     } catch (e: any) {
@@ -480,15 +535,16 @@ export class FundingArbService implements OnModuleInit {
       this.logger.warn(`[ANALYTICS] positions/balance: ${e?.message?.slice(0, 40)}`);
     }
 
-    // 3. Fee pagate sulle coppie attualmente aperte (trade recenti)
+    // 3. Fee pagate DOPO il punto zero sulle coppie aperte (futures + spot)
     let feesPaid = 0;
     for (const pos of openPos) {
       try {
         const trades = await this.swapExchange.fetchMyTrades(pos.symbol, undefined, 100);
-        for (const t of trades) feesPaid += Number(t.fee?.cost ?? 0);
+        for (const t of trades) { if ((t.timestamp ?? 0) >= resetAt) feesPaid += Number(t.fee?.cost ?? 0); }
         const spotSym = pos.symbol.replace('/USDT:USDT', '/USDT');
         const st = await this.spotExchange.fetchMyTrades(spotSym, undefined, 100);
         for (const t of st) {
+          if ((t.timestamp ?? 0) < resetAt) continue;
           const fc = t.fee?.currency, fcost = Number(t.fee?.cost ?? 0);
           if (fc === 'USDT') feesPaid += fcost;
           else if (fc) { const rr = this.rates.find(r => r.base === fc); if (rr) feesPaid += fcost * rr.price; }
@@ -498,6 +554,10 @@ export class FundingArbService implements OnModuleInit {
 
     const gap = spotValue - futNotional;
     const netPnl = fundingReceived - feesPaid;
+
+    // Equity totale del conto: iniziale (baseline al reset) vs attuale → PnL reale
+    const currentEquity = await this.computeTotalEquity();
+    const equityPnl = baselineEquity != null ? currentEquity - baselineEquity : null;
 
     return {
       fundingReceived: +fundingReceived.toFixed(4),
@@ -510,6 +570,10 @@ export class FundingArbService implements OnModuleInit {
       gap: +gap.toFixed(3),
       openCount: openPos.length,
       legs,
+      baselineEquity: baselineEquity != null ? +baselineEquity.toFixed(2) : null,
+      currentEquity: +currentEquity.toFixed(2),
+      equityPnl: equityPnl != null ? +equityPnl.toFixed(4) : null,
+      resetAt: cfg?.analyticsResetAt ?? null,
     };
   }
 
@@ -594,19 +658,24 @@ export class FundingArbService implements OnModuleInit {
     return { closed, errors };
   }
 
-  // ── Reset completo: vendi spot + chiudi futures + pulisci DB ──────────────
+  // ── Reset completo: vendi spot + chiudi futures + pulisci DB + azzera analytics ─
   async resetAll() {
     const spotRes = await this.closeAllSpot().catch(e => ({ sold: 0, errors: [e.message] }));
     const futRes  = await this.closeAllFutures().catch(e => ({ closed: 0, errors: [e.message] }));
 
-    // Pulisci DB
-    await this.prisma.fundingArbPosition.updateMany({
-      where: { status: 'open' },
-      data: { status: 'closed', closeReason: 'reset_all' },
-    });
+    // Cancella le posizioni dal DB e imposta il PUNTO ZERO delle analytics
+    // (da adesso funding/fee/gap ripartono da zero — misura pulita del conto live)
+    await this.prisma.fundingArbPosition.deleteMany({});
 
-    this.logger.log(`[RESET] spot venduti=${spotRes.sold} · futures chiusi=${futRes.closed}`);
-    return { spotSold: spotRes.sold, futuresClosed: futRes.closed };
+    // Salva l'equity totale ATTUALE come baseline (conto a posizioni chiuse)
+    const baseline = await this.computeTotalEquity();
+    await this.prisma.fundingArbConfig.update({
+      where: { id: 1 },
+      data: { analyticsResetAt: new Date(), baselineEquity: baseline },
+    }).catch(() => {});
+
+    this.logger.log(`[RESET] spot venduti=${spotRes.sold} · futures chiusi=${futRes.closed} · baseline equity=$${baseline.toFixed(2)} · analytics azzerate`);
+    return { spotSold: spotRes.sold, futuresClosed: futRes.closed, baselineEquity: +baseline.toFixed(2), analyticsReset: true };
   }
 }
 

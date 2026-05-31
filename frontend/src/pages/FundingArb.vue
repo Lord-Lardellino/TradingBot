@@ -28,6 +28,10 @@
           class="px-3 py-1.5 rounded text-sm font-medium bg-purple-500/20 text-purple-400 hover:bg-purple-500/30 transition">
           💜 Chiudi Futures
         </button>
+        <button @click="setBaseline" :disabled="loading"
+          class="px-3 py-1.5 rounded text-sm font-medium bg-sky-500/20 text-sky-400 hover:bg-sky-500/30 transition">
+          📍 Azzera da ora
+        </button>
         <button @click="cleanHistory" :disabled="loading"
           class="px-3 py-1.5 rounded text-sm font-medium bg-surface-200 text-gray-400 hover:bg-surface-300 transition">
           🧹 Pulisci storico
@@ -76,6 +80,36 @@
       <div class="stat-card text-center">
         <div class="text-3xl font-bold font-mono text-sky-400">{{ avgApr.toFixed(1) }}%</div>
         <div class="text-sm text-gray-500 mt-1">APR medio positivi</div>
+      </div>
+    </div>
+
+    <!-- Conto totale: iniziale vs attuale (LIVE ogni secondo) -->
+    <div v-if="equity" class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+      <div class="stat-card border border-white/10">
+        <div class="text-xs text-gray-500 mb-1">🏦 Conto iniziale</div>
+        <div class="text-2xl font-bold font-mono text-gray-300">
+          {{ equity.baselineEquity != null ? '$' + equity.baselineEquity.toFixed(2) : '—' }}
+        </div>
+        <div class="text-[10px] text-gray-600 mt-0.5">al reset {{ analytics?.resetAt ? timeAgo(analytics.resetAt) : '' }}</div>
+      </div>
+      <div class="stat-card border border-sky-500/20">
+        <div class="text-xs text-gray-500 mb-1 flex items-center gap-1">
+          💼 Conto attuale
+          <span class="inline-block w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" title="live" />
+        </div>
+        <div class="text-2xl font-bold font-mono text-sky-300">${{ equity.currentEquity.toFixed(2) }}</div>
+        <div class="text-[10px] text-gray-600 mt-0.5">live · spot + asset + futures</div>
+      </div>
+      <div class="stat-card border-2" :class="(equity.equityPnl ?? 0) >= 0 ? 'border-emerald-500/40' : 'border-red-500/40'">
+        <div class="text-xs text-gray-500 mb-1">📊 Variazione reale (PnL)</div>
+        <div class="text-2xl font-black font-mono" :class="(equity.equityPnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'">
+          <template v-if="equity.equityPnl != null">
+            {{ equity.equityPnl >= 0 ? '+' : '' }}${{ equity.equityPnl.toFixed(4) }}
+            <span class="text-sm">({{ equity.baselineEquity ? ((equity.equityPnl / equity.baselineEquity) * 100).toFixed(2) : '0' }}%)</span>
+          </template>
+          <template v-else>—</template>
+        </div>
+        <div class="text-[10px] text-gray-600 mt-0.5">attuale − iniziale · include tutto</div>
       </div>
     </div>
 
@@ -328,7 +362,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import axios from 'axios'
 import Button from 'primevue/button'
 
@@ -346,7 +380,9 @@ const autoTradeEnabled = ref<boolean | null>(null)
 const dashboard        = ref<any>(null)
 const positionsData    = ref<any>(null)
 const analytics        = ref<any>(null)
+const equity           = ref<any>(null)
 const config           = ref<any>(null)
+let equityTimer: number | undefined
 const simSymbol        = ref('')
 const simCapital       = ref(100)
 const simLeverage      = ref(1)
@@ -377,6 +413,7 @@ async function load() {
     config.value = cfgRes.data
     positionsData.value = posRes.data
     analytics.value = anRes.data
+    if (anRes.data) equity.value = { baselineEquity: anRes.data.baselineEquity, currentEquity: anRes.data.currentEquity, equityPnl: anRes.data.equityPnl }
     autoTradeEnabled.value = cfgRes.data?.autoTradeEnabled ?? false
 
     if (!simSymbol.value && positiveWithSpot.value.length)
@@ -426,6 +463,19 @@ async function resetAll() {
   try {
     await axios.post('/api/funding-arb/reset-all')
     alert('✅ Reset completo eseguito')
+    await load()
+  } catch (e: any) {
+    alert(`❌ Errore: ${e?.response?.data?.message ?? e?.message}`)
+  } finally { loading.value = false }
+}
+
+async function setBaseline() {
+  if (!confirm('Impostare il conto iniziale = valore di ADESSO? La variazione ripartirà da 0 (le posizioni restano aperte).')) return
+  loading.value = true
+  try {
+    const { data } = await axios.post('/api/funding-arb/set-baseline')
+    alert(`✅ Conto iniziale impostato a $${data.baselineEquity}. Conteggio da ora.`)
+    await refreshEquity()
     await load()
   } catch (e: any) {
     alert(`❌ Errore: ${e?.response?.data?.message ?? e?.message}`)
@@ -509,5 +559,20 @@ const formatVol = (v: number) => {
   return (v / 1e3).toFixed(0) + 'K'
 }
 
-onMounted(load)
+async function refreshEquity() {
+  try {
+    const { data } = await axios.get('/api/funding-arb/equity')
+    equity.value = data
+  } catch { /* silenzioso */ }
+}
+
+onMounted(() => {
+  load()
+  refreshEquity()
+  equityTimer = window.setInterval(refreshEquity, 1000)  // conto live ogni secondo
+})
+
+onUnmounted(() => {
+  if (equityTimer) clearInterval(equityTimer)
+})
 </script>

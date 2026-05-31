@@ -13,6 +13,7 @@ export class FundingArbController {
   @Get('config')     getConfig()                                         { return this.svc.getConfig(); }
   @Get('positions')  getPositions()                                      { return this.svc.getPositions(); }
   @Get('analytics')  getAnalytics()                                      { return this.svc.getAnalytics(); }
+  @Get('equity')     getEquity()                                         { return this.svc.getEquity(); }
   @Get('projection') getProjection(@Query('symbol') sym: string, @Query('capital') cap: string, @Query('leverage') lev?: string) {
     return this.svc.calcProjection(sym, Number(cap || 100), Number(lev || 1));
   }
@@ -22,4 +23,5 @@ export class FundingArbController {
   @Post('close-all-futures') closeAllFutures() { return this.svc.closeAllFutures(); }
   @Post('reset-all')        resetAll() { return this.svc.resetAll(); }
   @Post('clean-history')    cleanHistory() { return this.svc.cleanHistory(); }
+  @Post('set-baseline')     setBaseline() { return this.svc.setBaseline(); }
 }
