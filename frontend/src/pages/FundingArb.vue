@@ -246,20 +246,18 @@
           <thead>
             <tr class="text-gray-600 border-b border-white/5">
               <th class="text-left pb-2">Asset</th>
-              <th class="text-right pb-2">Contratti</th>
               <th class="text-right pb-2">Margine</th>
-              <th class="text-right pb-2 text-amber-400">Funding</th>
-              <th class="text-right pb-2">Fee fut</th>
-              <th class="text-right pb-2">Realised</th>
+              <th class="text-right pb-2 text-amber-400">Fund.Fees</th>
+              <th class="text-right pb-2">Trad.Fee</th>
+              <th class="text-right pb-2 text-emerald-400">Funding</th>
               <th class="text-right pb-2">PNL%</th>
               <th class="text-right pb-2">Gap</th>
-              <th class="text-right pb-2">Net tot</th>
+              <th class="text-right pb-2">Net+spot</th>
             </tr>
           </thead>
           <tbody>
             <tr v-for="l in analytics.legs" :key="'f'+l.base" class="border-b border-white/3 hover:bg-surface-100 transition">
               <td class="py-2 text-white font-bold">{{ l.base }} <span class="text-gray-600">{{ l.aprPct.toFixed(0) }}%</span></td>
-              <td class="py-2 text-right">{{ l.futContracts }}</td>
               <td class="py-2 text-right text-gray-300">${{ l.futMargin.toFixed(2) }}</td>
               <td class="py-2 text-right text-amber-400">+{{ l.futFunding.toFixed(4) }}</td>
               <td class="py-2 text-right text-red-400">−{{ l.futFee.toFixed(4) }}</td>
@@ -270,7 +268,6 @@
             </tr>
             <tr class="border-t border-white/10 font-bold">
               <td class="py-2 text-gray-300">TOTALE</td>
-              <td></td>
               <td class="py-2 text-right text-gray-300">${{ analytics.legs.reduce((s,l)=>s+l.futMargin,0).toFixed(2) }}</td>
               <td class="py-2 text-right text-amber-400">+{{ analytics.fundingReceived.toFixed(4) }}</td>
               <td class="py-2 text-right text-red-400">−{{ analytics.futFeesPaid.toFixed(4) }}</td>
