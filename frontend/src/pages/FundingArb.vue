@@ -125,7 +125,7 @@
       <div class="stat-card border border-red-500/20">
         <div class="text-xs text-gray-500 mb-1">💸 Fee pagate</div>
         <div class="text-xl font-bold font-mono text-red-400">−{{ analytics.feesPaid.toFixed(4) }}$</div>
-        <div class="text-[10px] text-gray-600 mt-0.5">coppie attive</div>
+        <div class="text-[10px] text-gray-600 mt-0.5">costo apertura posizioni</div>
       </div>
       <div class="stat-card border" :class="analytics.netPnl >= 0 ? 'border-emerald-500/30' : 'border-red-500/30'">
         <div class="text-xs text-gray-500 mb-1">📊 Netto</div>
@@ -199,34 +199,91 @@
       </div>
     </div>
 
-    <!-- Open Positions -->
-    <div v-if="positionsData?.openPositions?.length" class="stat-card">
+    <!-- Sezione SPOT (long) -->
+    <div v-if="analytics?.legs?.length" class="stat-card">
       <div class="text-sm text-gray-400 font-medium mb-3 flex items-center gap-2">
-        <span class="w-2 h-2 rounded-full bg-blue-400 inline-block" />
-        Posizioni aperte ({{ positionsData.openPositions.length }})
+        <span class="w-2 h-2 rounded-full bg-emerald-400 inline-block" />
+        🟢 Posizioni SPOT (long)
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-xs font-mono">
           <thead>
             <tr class="text-gray-600 border-b border-white/5">
               <th class="text-left pb-2">Asset</th>
-              <th class="text-right pb-2">Entry</th>
-              <th class="text-right pb-2">Qty</th>
-              <th class="text-right pb-2">Rate</th>
-              <th class="text-right pb-2">Aperto</th>
+              <th class="text-right pb-2">Quantità</th>
+              <th class="text-right pb-2">Prezzo</th>
+              <th class="text-right pb-2">Valore</th>
+              <th class="text-right pb-2">Fee apertura</th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="pos in positionsData.openPositions" :key="pos.id"
-              class="border-b border-white/3 hover:bg-surface-100 transition">
-              <td class="py-2 text-white font-bold">{{ pos.symbol.replace('/USDT:USDT', '') }}</td>
-              <td class="py-2 text-right">{{ pos.entryPrice.toFixed(4) }}</td>
-              <td class="py-2 text-right">{{ pos.quantity.toFixed(6) }}</td>
-              <td class="py-2 text-right text-emerald-400">{{ (pos.fundingRate * 100).toFixed(4) }}%</td>
-              <td class="py-2 text-right text-gray-500">{{ timeAgo(pos.entryTime) }}</td>
+            <tr v-for="l in analytics.legs" :key="'s'+l.base" class="border-b border-white/3 hover:bg-surface-100 transition">
+              <td class="py-2 text-white font-bold">{{ l.base }}</td>
+              <td class="py-2 text-right">{{ l.spotQty }}</td>
+              <td class="py-2 text-right text-gray-400">{{ l.price }}</td>
+              <td class="py-2 text-right text-emerald-400">${{ l.spotValue.toFixed(2) }}</td>
+              <td class="py-2 text-right text-red-400">−${{ l.spotFee.toFixed(4) }}</td>
+            </tr>
+            <tr class="border-t border-white/10 font-bold">
+              <td class="py-2 text-gray-300">TOTALE</td>
+              <td></td><td></td>
+              <td class="py-2 text-right text-emerald-400">${{ analytics.spotValue.toFixed(2) }}</td>
+              <td class="py-2 text-right text-red-400">−${{ analytics.legs.reduce((s,l)=>s+l.spotFee,0).toFixed(4) }}</td>
             </tr>
           </tbody>
         </table>
+      </div>
+    </div>
+
+    <!-- Sezione FUTURES (short) -->
+    <div v-if="analytics?.legs?.length" class="stat-card">
+      <div class="text-sm text-gray-400 font-medium mb-3 flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full bg-purple-400 inline-block" />
+        🟣 Posizioni FUTURES (short, isolated)
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs font-mono">
+          <thead>
+            <tr class="text-gray-600 border-b border-white/5">
+              <th class="text-left pb-2">Asset</th>
+              <th class="text-right pb-2">Contratti</th>
+              <th class="text-right pb-2">Margine</th>
+              <th class="text-right pb-2 text-amber-400">Funding</th>
+              <th class="text-right pb-2">Fee fut</th>
+              <th class="text-right pb-2">Realised</th>
+              <th class="text-right pb-2">PNL%</th>
+              <th class="text-right pb-2">Gap</th>
+              <th class="text-right pb-2">Net tot</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="l in analytics.legs" :key="'f'+l.base" class="border-b border-white/3 hover:bg-surface-100 transition">
+              <td class="py-2 text-white font-bold">{{ l.base }} <span class="text-gray-600">{{ l.aprPct.toFixed(0) }}%</span></td>
+              <td class="py-2 text-right">{{ l.futContracts }}</td>
+              <td class="py-2 text-right text-gray-300">${{ l.futMargin.toFixed(2) }}</td>
+              <td class="py-2 text-right text-amber-400">+{{ l.futFunding.toFixed(4) }}</td>
+              <td class="py-2 text-right text-red-400">−{{ l.futFee.toFixed(4) }}</td>
+              <td class="py-2 text-right" :class="l.futRealised >= 0 ? 'text-emerald-400' : 'text-red-400'">{{ l.futRealised >= 0 ? '+' : '' }}{{ l.futRealised.toFixed(4) }}</td>
+              <td class="py-2 text-right" :class="l.profitRatio >= 0 ? 'text-emerald-400' : 'text-red-400'">{{ l.profitRatio.toFixed(2) }}%</td>
+              <td class="py-2 text-right" :class="absVal(l.gap) < 0.5 ? 'text-gray-500' : 'text-yellow-400 font-bold'">{{ l.gap >= 0 ? '+' : '' }}{{ l.gap.toFixed(2) }}</td>
+              <td class="py-2 text-right font-bold" :class="l.legNet >= 0 ? 'text-emerald-400' : 'text-red-400'">{{ l.legNet >= 0 ? '+' : '' }}${{ l.legNet.toFixed(4) }}</td>
+            </tr>
+            <tr class="border-t border-white/10 font-bold">
+              <td class="py-2 text-gray-300">TOTALE</td>
+              <td></td>
+              <td class="py-2 text-right text-gray-300">${{ analytics.legs.reduce((s,l)=>s+l.futMargin,0).toFixed(2) }}</td>
+              <td class="py-2 text-right text-amber-400">+{{ analytics.fundingReceived.toFixed(4) }}</td>
+              <td class="py-2 text-right text-red-400">−{{ analytics.futFeesPaid.toFixed(4) }}</td>
+              <td class="py-2 text-right text-emerald-400">+{{ analytics.legs.reduce((s,l)=>s+l.futRealised,0).toFixed(4) }}</td>
+              <td></td>
+              <td class="py-2 text-right" :class="absVal(analytics.gap) < 0.5 ? 'text-gray-500' : 'text-yellow-400'">{{ analytics.gap.toFixed(2) }}</td>
+              <td class="py-2 text-right font-bold" :class="analytics.legs.reduce((s,l)=>s+l.legNet,0) >= 0 ? 'text-emerald-400' : 'text-red-400'">{{ analytics.legs.reduce((s,l)=>s+l.legNet,0) >= 0 ? '+' : '' }}${{ analytics.legs.reduce((s,l)=>s+l.legNet,0).toFixed(4) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="mt-2 text-[10px] text-gray-600">
+        uPnL futures è compensato dal valore spot (delta-neutral). Il guadagno vero = <span class="text-amber-400">Funding</span> − <span class="text-red-400">Fee</span>.
       </div>
     </div>
 

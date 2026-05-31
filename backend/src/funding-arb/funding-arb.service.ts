@@ -277,13 +277,26 @@ export class FundingArbService implements OnModuleInit {
         throw new Error(`${base} minimo futures ${minFuturesNotional.toFixed(2)}$ > capitale ${capitalUsdt}$ (skip)`);
       }
 
-      // 1. Compra SPOT — quantità allineata ai contratti futures per restare delta-neutral
+      // 1. Compra SPOT con buffer (+0.5%) per coprire la fee detratta in coin,
+      //    così ricevo ALMENO targetCoin netti. Leggo la quantità EFFETTIVA dal balance.
       const targetCoin = contracts * contractSize;
-      const spotOrderRes = await this.spotExchange.createMarketBuyOrder(spotSymbol, targetCoin);
-      const spotQuantity = spotOrderRes.amount ?? targetCoin;
+      const balBefore = await this.spotExchange.fetchBalance();
+      const coinBefore = Number((balBefore.total as any)?.[base] ?? 0);
+      await this.spotExchange.createMarketBuyOrder(spotSymbol, targetCoin * 1.005);
+      const balAfter = await this.spotExchange.fetchBalance();
+      const received = Number((balAfter.total as any)?.[base] ?? 0) - coinBefore;
 
-      // 3. Imposta la leva su MEXC PRIMA di aprire (ISOLATED mode, posizione short)
-      // MEXC richiede openType (1=isolated, 2=cross) e positionType (1=long, 2=short)
+      // 2. Shorto SOLO i contratti che lo spot ricevuto copre (futures MAI > spot)
+      const contractsToShort = Math.floor(received / contractSize);
+      if (contractsToShort < minContracts) {
+        // spot insufficiente per 1 contratto → rollback completo dello spot comprato
+        this.logger.warn(`[FUNDING] ${base} spot ricevuto ${received} < 1 contratto → ROLLBACK`);
+        await this.spotExchange.createMarketSellOrder(spotSymbol, received).catch(() => {});
+        throw new Error(`Spot ricevuto insufficiente per delta-neutral (rollback)`);
+      }
+      const coveredCoin = contractsToShort * contractSize;
+
+      // 3. Imposta la leva su MEXC PRIMA di aprire (ISOLATED, posizione short)
       try {
         await this.swapExchange.setLeverage(leverage, symbol, { openType: 1, positionType: 2 });
         this.logger.log(`[FUNDING] setLeverage ${leverage}x ISOLATED OK su ${symbol}`);
@@ -291,20 +304,29 @@ export class FundingArbService implements OnModuleInit {
         this.logger.warn(`[FUNDING] setLeverage ${leverage}x ${symbol} FALLITO: ${e?.message?.slice(0, 60)}`);
       }
 
-      // 4. Apri SHORT FUTURES in ISOLATED — con ROLLBACK atomico: se fallisce, rivendo lo spot
+      // 4. Apri SHORT FUTURES = contractsToShort — ROLLBACK atomico se fallisce
       let futuresRes: any;
       try {
-        futuresRes = await this.swapExchange.createMarketSellOrder(symbol, contracts, { openType: 1, positionType: 2, leverage });
+        futuresRes = await this.swapExchange.createMarketSellOrder(symbol, contractsToShort, { openType: 1, positionType: 2, leverage });
       } catch (e: any) {
         this.logger.warn(`[FUNDING] ${base} futures fallito → ROLLBACK vendo spot. err: ${e?.message?.slice(0, 50)}`);
-        await this.spotExchange.createMarketSellOrder(spotSymbol, spotQuantity).catch((re: any) =>
+        await this.spotExchange.createMarketSellOrder(spotSymbol, received).catch((re: any) =>
           this.logger.error(`[FUNDING] ${base} ROLLBACK spot FALLITO: ${re?.message?.slice(0, 50)}`)
         );
         throw new Error(`Futures fallito (spot rollbackato): ${e?.message?.slice(0, 60)}`);
       }
-      // quantità reale in coin shortate = contratti eseguiti × contractSize
-      const futuresContracts = futuresRes.amount ?? contracts;
+      const futuresContracts = futuresRes.amount ?? contractsToShort;
       const futuresQuantity = futuresContracts * contractSize;
+
+      // 5. BILANCIAMENTO: vendo il residuo spot non coperto dai contratti (spot = futures)
+      const residuo = received - coveredCoin;
+      if (residuo > 0 && residuo * rate.price > 0.20) {
+        try {
+          await this.spotExchange.createMarketSellOrder(spotSymbol, residuo);
+          this.logger.log(`[FUNDING] ${base} venduto residuo spot ${residuo.toFixed(6)} → delta-neutral perfetto`);
+        } catch (e: any) { this.logger.warn(`[FUNDING] ${base} vendita residuo fallita: ${e?.message?.slice(0, 40)}`); }
+      }
+      const spotQuantity = coveredCoin;  // spot effettivo bilanciato = coin coperti
 
       const entryTs = Date.now();
       const notional       = futuresQuantity * rate.price;  // valore reale shortato
@@ -487,20 +509,10 @@ export class FundingArbService implements OnModuleInit {
     const baselineEquity = cfg?.baselineEquity ?? null;
     const openPos = await this.prisma.fundingArbPosition.findMany({ where: { status: 'open' } });
 
-    // 1. FUNDING realmente incassato DOPO il punto zero (da MEXC funding records)
-    let fundingReceived = 0;
-    let fundingCount = 0;
-    try {
-      const fr: any = await (this.swapExchange as any).contractPrivateGetPositionFundingRecords({ page_size: 100 });
-      const recs = (fr?.data?.resultList || []).filter((r: any) => Number(r.settleTime ?? 0) >= resetAt);
-      fundingCount = recs.length;
-      fundingReceived = recs.reduce((s: number, r: any) => s + Number(r.funding || 0), 0);
-    } catch (e: any) {
-      this.logger.warn(`[ANALYTICS] funding records: ${e?.message?.slice(0, 40)}`);
-    }
-
-    // 2. Posizioni futures REALI + spot balance → gap delta-neutral + funding/giorno
-    let spotValue = 0, futNotional = 0, dailyFundingEst = 0;
+    // Per ogni posizione: spot (qty/val/fee) + futures (campi REALI dal position info
+    // MEXC: holdFee=funding, totalFee=trading fee, realised=net, così coincide al millesimo)
+    const fundingCount = 0;
+    let spotValue = 0, futNotional = 0, dailyFundingEst = 0, feesPaid = 0, fundingReceived = 0, futUpnlTot = 0, futFeesTot = 0;
     const legs: any[] = [];
     try {
       const positions = (await this.swapExchange.fetchPositions()).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
@@ -511,9 +523,20 @@ export class FundingArbService implements OnModuleInit {
         const coin = Number(p.contracts) * cs;
         const price = Number(p.markPrice || p.entryPrice);
         const fNot = coin * price;
-        futNotional += fNot;
-
         const base = p.symbol.replace('/USDT:USDT', '');
+        const info: any = p.info || {};
+
+        // FUTURES: campi REALI dal position info MEXC (coincidono al millesimo con la UI)
+        const futMargin = Number(info.im ?? p.initialMargin ?? p.collateral ?? fNot);
+        const futFunding = Number(info.holdFee ?? 0);    // = "Funding Fees" su MEXC
+        const futFee = Number(info.totalFee ?? 0);        // = "Trading Fee" su MEXC
+        const futRealised = Number(info.realised ?? (futFunding - futFee));  // = "Funding" colonna
+        const profitRatio = Number(info.profitRatio ?? 0);
+        const entryPrice = Number(info.holdAvgPrice ?? p.entryPrice ?? price);
+        const futUpnl = (entryPrice - price) * coin;      // short: guadagna se prezzo scende
+        futNotional += fNot; futUpnlTot += futUpnl; fundingReceived += futFunding; futFeesTot += futFee;
+
+        // SPOT: quantità detenuta + valore live
         const spotQty = Number((balance.total as any)?.[base] ?? 0);
         const sVal = spotQty * price;
         spotValue += sVal;
@@ -522,34 +545,45 @@ export class FundingArbService implements OnModuleInit {
         const dEst = rate ? fNot * (rate.dailyPct / 100) : 0;
         dailyFundingEst += dEst;
 
+        // FEE SPOT apertura corrente (MEXC non la espone nel position info → dai trade)
+        const targetContracts = Number(p.contracts);
+        let spotFee = 0;
+        try {
+          const spotSym = `${base}/USDT`;
+          const st = (await this.spotExchange.fetchMyTrades(spotSym, undefined, 50)).sort((a: any, b: any) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+          let accS = 0;
+          for (const t of st) {
+            if (accS >= spotQty * 0.99) break;
+            const fc = t.fee?.currency, fcost = Number(t.fee?.cost ?? 0);
+            if (fc === 'USDT') spotFee += fcost;
+            else if (fc) { const rr = this.rates.find(r => r.base === fc); if (rr) spotFee += fcost * rr.price; }
+            accS += Number(t.amount ?? 0);
+          }
+        } catch {}
+        feesPaid += futFee + spotFee;  // futFee = totalFee reale MEXC
+
         legs.push({
-          base,
+          base, price,
+          spotQty: +spotQty.toFixed(6),
           spotValue: +sVal.toFixed(2),
+          spotFee: +spotFee.toFixed(4),
+          futContracts: targetContracts,
           futNotional: +fNot.toFixed(2),
+          futMargin: +futMargin.toFixed(2),
+          futUpnl: +futUpnl.toFixed(4),
+          futFee: +futFee.toFixed(4),            // = Trading Fee MEXC (al millesimo)
+          futFunding: +futFunding.toFixed(4),    // = Funding Fees MEXC (al millesimo)
+          futRealised: +futRealised.toFixed(4),  // = Funding (colonna) MEXC = holdFee - totalFee
+          profitRatio: +(profitRatio * 100).toFixed(2),
           gap: +(sVal - fNot).toFixed(3),
           aprPct: rate?.aprPct ?? 0,
           dailyFunding: +dEst.toFixed(4),
+          // net per coppia = realised futures (funding-feeFut, come MEXC) − fee spot
+          legNet: +(futRealised - spotFee).toFixed(4),
         });
       }
     } catch (e: any) {
       this.logger.warn(`[ANALYTICS] positions/balance: ${e?.message?.slice(0, 40)}`);
-    }
-
-    // 3. Fee pagate DOPO il punto zero sulle coppie aperte (futures + spot)
-    let feesPaid = 0;
-    for (const pos of openPos) {
-      try {
-        const trades = await this.swapExchange.fetchMyTrades(pos.symbol, undefined, 100);
-        for (const t of trades) { if ((t.timestamp ?? 0) >= resetAt) feesPaid += Number(t.fee?.cost ?? 0); }
-        const spotSym = pos.symbol.replace('/USDT:USDT', '/USDT');
-        const st = await this.spotExchange.fetchMyTrades(spotSym, undefined, 100);
-        for (const t of st) {
-          if ((t.timestamp ?? 0) < resetAt) continue;
-          const fc = t.fee?.currency, fcost = Number(t.fee?.cost ?? 0);
-          if (fc === 'USDT') feesPaid += fcost;
-          else if (fc) { const rr = this.rates.find(r => r.base === fc); if (rr) feesPaid += fcost * rr.price; }
-        }
-      } catch {}
     }
 
     const gap = spotValue - futNotional;
@@ -565,8 +599,11 @@ export class FundingArbService implements OnModuleInit {
       feesPaid: +feesPaid.toFixed(4),
       netPnl: +netPnl.toFixed(4),
       dailyFundingEst: +dailyFundingEst.toFixed(4),
+      futFeesPaid: +futFeesTot.toFixed(4),
+      spotFeesPaid: +(feesPaid - futFeesTot).toFixed(4),
       spotValue: +spotValue.toFixed(2),
       futNotional: +futNotional.toFixed(2),
+      futUpnl: +futUpnlTot.toFixed(4),
       gap: +gap.toFixed(3),
       openCount: openPos.length,
       legs,
