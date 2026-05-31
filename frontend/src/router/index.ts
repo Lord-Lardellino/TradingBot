@@ -18,6 +18,12 @@ const router = createRouter({
           meta: { title: 'Funding Rate Arbitrage' },
         },
         {
+          path: 'grid',
+          name: 'grid',
+          component: () => import('@/pages/GridScanner.vue'),
+          meta: { title: 'Grid Trading' },
+        },
+        {
           path: 'trades',
           name: 'trades',
           component: () => import('@/pages/Trades.vue'),

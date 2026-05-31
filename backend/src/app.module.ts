@@ -15,6 +15,7 @@ import { LiveModule } from './live/live.module';
 import { AiBrainModule } from './ai-brain/ai-brain.module';
 import { GemmaModule } from './gemma/gemma.module';
 import { FundingArbModule } from './funding-arb/funding-arb.module';
+import { GridScannerModule } from './grid-scanner/grid-scanner.module';
 
 @Module({
   imports: [
@@ -34,6 +35,7 @@ import { FundingArbModule } from './funding-arb/funding-arb.module';
     AiBrainModule,
     GemmaModule,
     FundingArbModule,
+    GridScannerModule,
   ],
 })
 export class AppModule {}

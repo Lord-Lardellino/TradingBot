@@ -98,6 +98,7 @@ const sidebarOpen = ref(false)
 
 const navItems: { to?: string; icon?: string; label?: string; section?: string }[] = [
   { to: '/funding-arb',  icon: 'pi-dollar',        label: '💰 Funding Arb' },
+  { to: '/grid',         icon: 'pi-th-large',      label: '🔲 Grid Trading' },
 
   { section: 'Altro' },
   { to: '/trades',      icon: 'pi-list',         label: 'Trade History' },

@@ -1072,3 +1072,54 @@ model FundingArbPosition {
   entryTime       DateTime  @default(now())
   closeTime       DateTime?
 }
+
+// ── Grid Trading Bot — griglie su coppie in range, 2 long + 2 short ──────────
+
+model GridConfig {
+  id                  Int       @id @default(1)
+  enabled             Boolean   @default(false)
+  autoTradeEnabled    Boolean   @default(false)
+  timeframe           String    @default("15m")   // 5m | 15m
+  maxLongGrids        Int       @default(2)
+  maxShortGrids       Int       @default(2)
+  capitalPerGrid      Float     @default(15)       // USDT margine per griglia
+  leverage            Int       @default(3)        // 2-5x moderata
+  gridLevels          Int       @default(20)       // numero livelli per griglia
+  // Filtri selezione coppie in range
+  maxAdx              Float     @default(20)       // ADX sotto = range
+  minRangePct         Float     @default(2.0)      // ampiezza range minima %
+  maxRangePct         Float     @default(8.0)      // ampiezza range massima %
+  minVolume24h        Float     @default(5000000)  // liquidità minima
+  // Uscita su break
+  exitAdx             Float     @default(28)       // ADX sopra = trend = esci
+  // Reset analytics
+  analyticsResetAt    DateTime?
+  baselineEquity      Float?
+  updatedAt           DateTime  @updatedAt
+}
+
+model GridBot {
+  id              String    @id @default(cuid())
+  symbol          String
+  side            String                            // long | short
+  mode            String    @default("sim")         // sim | live
+  timeframe       String
+  leverage        Int
+  rangeLow        Float
+  rangeHigh       Float
+  gridLevels      Int
+  spacingPct      Float                             // distanza % tra livelli
+  capitalUsdt     Float                             // margine impegnato
+  entryPrice      Float                             // prezzo all'apertura
+  status          String    @default("open")        // open | closed
+  realizedPnl     Float     @default(0)             // profitto dai cicli completati
+  filledCycles    Int       @default(0)             // numero di cicli buy+sell completati
+  contractSize    Float     @default(1)             // coin per contratto MEXC
+  contractsPerLevel Float   @default(0)             // contratti per ogni ordine
+  liveOrders      String?                           // JSON: [{id, price, side, level}]
+  closePrice      Float?
+  closePnl        Float?
+  closeReason     String?                           // break_up | break_down | manual | rate
+  openedAt        DateTime  @default(now())
+  closedAt        DateTime?
+}
