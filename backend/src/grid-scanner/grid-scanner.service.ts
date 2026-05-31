@@ -281,6 +281,22 @@ export class GridScannerService implements OnModuleInit {
       for (const bot of bots) {
         try { await this.checkLiveGrid(bot); } catch (e: any) { this.logger.warn(`[GRID LIVE] ${bot.symbol}: ${e?.message?.slice(0, 50)}`); }
       }
+
+      // Mantieni sempre 1 griglia LIVE attiva (se auto-trade ON e margine disponibile)
+      const cfg = await this.getConfig();
+      if (cfg.autoTradeEnabled && bots.length < 1) {
+        const sugg = this.getSuggestions(1, 1);
+        const openSym = new Set(bots.map(b => b.symbol));
+        const longC = sugg.long.find(c => !openSym.has(c.symbol));
+        const shortC = sugg.short.find(c => !openSym.has(c.symbol));
+        const pick = longC ? { c: longC, side: 'long' as const } : shortC ? { c: shortC, side: 'short' as const } : null;
+        if (pick) {
+          try {
+            await this.openLiveGrid(pick.c.symbol, pick.side, cfg.capitalPerGrid, 10);
+            this.logger.log(`[GRID LIVE] auto-mantenimento: aperta ${pick.side} ${pick.c.base}`);
+          } catch (e: any) { this.logger.warn(`[GRID LIVE] auto-apertura saltata: ${e?.message?.slice(0, 50)}`); }
+        }
+      }
     } catch (e: any) { this.logger.warn(`[GRID LIVE] monitor: ${e?.message}`); }
   }
 
@@ -353,7 +369,6 @@ export class GridScannerService implements OnModuleInit {
     const cand = this.candidates.find(c => c.symbol === symbol);
     if (!cand) throw new Error(`${symbol} non è in range`);
     const cfg = await this.getConfig();
-    const leverage = cfg.leverage;
     const market = this.swapExchange.market(symbol);
     const cs = Number((market as any)?.contractSize ?? 1) || 1;
     const minContracts = Number((market as any)?.limits?.amount?.min ?? 1) || 1;
@@ -362,23 +377,31 @@ export class GridScannerService implements OnModuleInit {
     const low = cand.rangeLow, high = cand.rangeHigh;
     const spacing = (high - low) / liveLevels;
     const pricePos = (price - low) / ((high - low) || 1);
+    const rangePct = ((high - low) / price) * 100;
 
     // 1. CENTRO RANGE: il prezzo deve stare al 25-75% così la griglia è bilanciata
     if (pricePos < 0.25 || pricePos > 0.75)
       throw new Error(`${cand.base} prezzo al ${(pricePos * 100).toFixed(0)}% del range (serve 25-75% per griglia bilanciata)`);
 
-    // 2. Livelli EQUIDISTANTI centrati sul prezzo: il primo a ±0.5 spacing dal
-    //    prezzo (così nessuno si riempie all'apertura), poi ogni spacing costante.
-    //    Nessun buco al centro → griglia perfettamente uniforme sopra e sotto.
-    const half = spacing * 0.5;
-    const maxPerSide = Math.ceil(liveLevels / 2);
+    // LEVA AUTOMATICA: la liquidazione deve cadere OLTRE il range (×2 di margine).
+    // Range stretto → leva più alta (più contratti = più profitto/ciclo) senza
+    // rischiare la liquidazione prima del break. Cappata a [2, 20].
+    const safeLeverage = Math.floor(100 / (rangePct * 2));
+    const leverage = Math.max(2, Math.min(20, safeLeverage || 2));
+    const liquidationPct = +(100 / leverage).toFixed(1);
+
+    // 2. Griglia FISSA ancorata al range: livelli sempre agli stessi prezzi
+    //    (low + k×spacing), equidistanti. BUY ai livelli sotto il prezzo, SELL
+    //    sopra. Gli ordini limite NON si riempiono all'apertura (buy sotto si
+    //    attiva solo se scende, sell sopra solo se sale). I buy chiudono sempre
+    //    sotto l'entrata della base = in profitto. Media ordini = centro griglia.
     const above: number[] = [];   // SELL (sopra il prezzo)
     const below: number[] = [];   // BUY (sotto il prezzo)
-    for (let k = 0; k < maxPerSide; k++) {
-      const sp = price + half + spacing * k;
-      if (sp < high) above.push(Number(this.swapExchange.priceToPrecision(symbol, sp)));
-      const bp = price - half - spacing * k;
-      if (bp > low) below.push(Number(this.swapExchange.priceToPrecision(symbol, bp)));
+    for (let i = 1; i < liveLevels; i++) {
+      const lp = Number(this.swapExchange.priceToPrecision(symbol, low + spacing * i));
+      if (Math.abs(lp - price) < spacing * 0.05) continue;  // skip solo quello esatto sul prezzo
+      if (lp > price) above.push(lp);
+      else if (lp < price) below.push(lp);
     }
     const levels = [...new Set([...above, ...below])];     // dedup
     const totalOrders = above.length + below.length;
@@ -432,8 +455,16 @@ export class GridScannerService implements OnModuleInit {
         contractSize: cs, contractsPerLevel, liveOrders: JSON.stringify(liveOrders),
       },
     });
-    this.logger.log(`[GRID LIVE OPEN] ${side.toUpperCase()} ${cand.base} · ${liveOrders.length} ordini (${above.length} sell + ${below.length} buy) · margine tot ~$${realMarginTotal.toFixed(2)} · ${contractsPerLevel}c/lvl`);
-    return { bot, ordersPlaced: liveOrders.length, sellOrders: above.length, buyOrders: below.length, contractsPerLevel, notionalPerLevel: +realNotionalPerLevel.toFixed(2), marginTotal: +realMarginTotal.toFixed(2) };
+    // Calcolo profitto: ogni ciclo = spacing × contratti × contractSize (netto fee)
+    const profitPerCycle = spacing * contractsPerLevel * cs - (contractsPerLevel * cs * price) * 0.0004;
+    const dailyProfitEst = +(profitPerCycle * (cand.cyclesPerDay ?? 0)).toFixed(4);
+
+    this.logger.log(`[GRID LIVE OPEN] ${side.toUpperCase()} ${cand.base} · ${liveOrders.length} ordini · leva AUTO ${leverage}x (liq ±${liquidationPct}%, range ${rangePct.toFixed(1)}%) · profit/ciclo $${profitPerCycle.toFixed(4)} · margine ~$${realMarginTotal.toFixed(2)}`);
+    return {
+      bot, ordersPlaced: liveOrders.length, sellOrders: above.length, buyOrders: below.length,
+      contractsPerLevel, notionalPerLevel: +realNotionalPerLevel.toFixed(2), marginTotal: +realMarginTotal.toFixed(2),
+      leverage, liquidationPct, profitPerCycle: +profitPerCycle.toFixed(4), dailyProfitEst,
+    };
   }
 
   // ── Chiudi griglia LIVE: cancella ordini + chiudi posizione residua ───────
