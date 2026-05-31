@@ -59,8 +59,8 @@
         <div class="text-sm text-gray-500 mt-1">Miglior score</div>
       </div>
       <div class="stat-card text-center">
-        <div class="text-3xl font-bold font-mono text-emerald-400">{{ activeBots.length }}</div>
-        <div class="text-sm text-gray-500 mt-1">Griglie attive</div>
+        <div class="text-3xl font-bold font-mono text-emerald-400">{{ liveBots.length }}<span class="text-gray-600 text-lg"> + {{ simBots.length }}</span></div>
+        <div class="text-sm text-gray-500 mt-1">Griglie live + sim</div>
       </div>
       <div class="stat-card text-center">
         <div class="text-3xl font-bold font-mono text-yellow-400">{{ bestApr }}%</div>
@@ -68,30 +68,26 @@
       </div>
     </div>
 
-    <!-- PnL Simulazione (paper trading con prezzi reali) -->
-    <div v-if="sim" class="grid grid-cols-2 sm:grid-cols-5 gap-3">
-      <div class="stat-card border-2" :class="sim.totalPnl >= 0 ? 'border-emerald-500/40' : 'border-red-500/40'">
-        <div class="text-xs text-gray-500 mb-1">📊 PnL Simulato Totale</div>
-        <div class="text-2xl font-black font-mono" :class="sim.totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'">
-          {{ sim.totalPnl >= 0 ? '+' : '' }}${{ sim.totalPnl.toFixed(4) }}
-        </div>
-        <div class="text-[10px] text-gray-600 mt-0.5">paper trading · prezzi reali</div>
+    <!-- PnL LIVE vs SIM -->
+    <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+      <div v-if="live" class="stat-card border-2" :class="live.pnl >= 0 ? 'border-red-500/40' : 'border-red-500/40'">
+        <div class="text-xs text-gray-500 mb-1">🔴 PnL LIVE (reale)</div>
+        <div class="text-2xl font-black font-mono" :class="live.pnl >= 0 ? 'text-emerald-400' : 'text-red-400'">{{ live.pnl >= 0 ? '+' : '' }}${{ live.pnl.toFixed(4) }}</div>
+        <div class="text-[10px] text-gray-600 mt-0.5">{{ live.count }} griglie · {{ live.cycles }} cicli · soldi veri</div>
       </div>
-      <div class="stat-card border border-emerald-500/20">
-        <div class="text-xs text-gray-500 mb-1">Aperte (non realizz.)</div>
-        <div class="text-xl font-bold font-mono" :class="sim.openPnl >= 0 ? 'text-emerald-400' : 'text-red-400'">{{ sim.openPnl >= 0 ? '+' : '' }}${{ sim.openPnl.toFixed(4) }}</div>
+      <div v-if="sim" class="stat-card border-2" :class="sim.pnl >= 0 ? 'border-sky-500/40' : 'border-red-500/40'">
+        <div class="text-xs text-gray-500 mb-1">🔵 PnL SIM (paper)</div>
+        <div class="text-2xl font-black font-mono" :class="sim.pnl >= 0 ? 'text-sky-400' : 'text-red-400'">{{ sim.pnl >= 0 ? '+' : '' }}${{ sim.pnl.toFixed(4) }}</div>
+        <div class="text-[10px] text-gray-600 mt-0.5">{{ sim.count }} griglie · {{ sim.cycles }} cicli · simulato</div>
       </div>
-      <div class="stat-card border border-sky-500/20">
+      <div v-if="sim" class="stat-card border border-white/10">
         <div class="text-xs text-gray-500 mb-1">Chiuse (realizz.)</div>
-        <div class="text-xl font-bold font-mono" :class="sim.closedPnl >= 0 ? 'text-sky-400' : 'text-red-400'">{{ sim.closedPnl >= 0 ? '+' : '' }}${{ sim.closedPnl.toFixed(4) }}</div>
+        <div class="text-xl font-bold font-mono" :class="(sim.closedPnl ?? 0) >= 0 ? 'text-gray-300' : 'text-red-400'">{{ (sim.closedPnl ?? 0) >= 0 ? '+' : '' }}${{ (sim.closedPnl ?? 0).toFixed(4) }}</div>
+        <div class="text-[10px] text-gray-600 mt-0.5">{{ sim.closedCount }} griglie chiuse</div>
       </div>
-      <div class="stat-card border border-white/10">
-        <div class="text-xs text-gray-500 mb-1">Cicli totali</div>
-        <div class="text-xl font-bold font-mono text-white">{{ sim.totalCycles }}</div>
-      </div>
-      <div class="stat-card border border-white/10">
-        <div class="text-xs text-gray-500 mb-1">Griglie</div>
-        <div class="text-xl font-bold font-mono text-white">{{ sim.openCount }} <span class="text-gray-600 text-sm">/ {{ sim.closedCount }} chiuse</span></div>
+      <div class="stat-card text-center">
+        <div class="text-3xl font-bold font-mono text-yellow-400">{{ bestApr }}%</div>
+        <div class="text-sm text-gray-500 mt-1">Miglior APR stimato</div>
       </div>
     </div>
 
@@ -184,46 +180,70 @@
       </div>
     </div>
 
-    <!-- Griglie attive -->
-    <div v-if="activeBots.length" class="stat-card">
-      <div class="text-sm text-gray-400 font-medium mb-3 flex items-center gap-2">
-        <span class="w-2 h-2 rounded-full bg-emerald-400 inline-block" />
-        Griglie attive ({{ activeBots.length }}) — simulazione live
+    <!-- Griglie LIVE (ordini reali su MEXC) -->
+    <div v-if="liveBots.length" class="stat-card border border-red-500/20">
+      <div class="text-sm text-red-400 font-medium mb-3 flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full bg-red-400 inline-block animate-pulse" />
+        🔴 Griglie LIVE ({{ liveBots.length }}) — ordini reali su MEXC, soldi veri
       </div>
       <div class="overflow-x-auto">
         <table class="w-full text-xs font-mono">
           <thead>
             <tr class="text-gray-600 border-b border-white/5">
-              <th class="text-left pb-2">Asset</th>
-              <th class="text-center pb-2">Lato</th>
-              <th class="text-right pb-2">Leva</th>
-              <th class="text-right pb-2">Capitale</th>
-              <th class="text-right pb-2">Range</th>
-              <th class="text-right pb-2">Prezzo</th>
-              <th class="text-right pb-2">Pos</th>
-              <th class="text-right pb-2">→Break</th>
-              <th class="text-right pb-2">ADX</th>
-              <th class="text-right pb-2">Cicli</th>
-              <th class="text-right pb-2">PnL</th>
-              <th class="text-right pb-2">Aperto</th>
-              <th class="text-right pb-2"></th>
+              <th class="text-left pb-2">Asset</th><th class="text-center pb-2">Lato</th><th class="text-right pb-2">Leva</th>
+              <th class="text-right pb-2">Margine</th><th class="text-right pb-2">Range</th><th class="text-right pb-2">Prezzo</th>
+              <th class="text-right pb-2">→Break</th><th class="text-right pb-2">ADX</th><th class="text-right pb-2">Cicli</th>
+              <th class="text-right pb-2">PnL</th><th class="text-right pb-2">Aperto</th><th class="text-right pb-2"></th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="b in activeBots" :key="b.id" class="border-b border-white/3 hover:bg-surface-100 transition">
+            <tr v-for="b in liveBots" :key="b.id" class="border-b border-white/3 hover:bg-surface-100 transition">
               <td class="py-2 text-white font-bold">{{ b.symbol.replace('/USDT:USDT','') }}</td>
               <td class="py-2 text-center"><span :class="b.side === 'long' ? 'text-emerald-400' : 'text-red-400'">{{ b.side.toUpperCase() }}</span></td>
               <td class="py-2 text-right text-gray-400">{{ b.leverage }}x</td>
               <td class="py-2 text-right text-gray-400">${{ b.capitalUsdt }}</td>
               <td class="py-2 text-right text-gray-500">{{ b.rangeLow }}–{{ b.rangeHigh }}</td>
               <td class="py-2 text-right text-white">{{ b.currentPrice }}</td>
-              <td class="py-2 text-right">
-                <span :class="b.pricePos > 0.85 || b.pricePos < 0.15 ? 'text-yellow-400' : 'text-gray-500'">{{ (b.pricePos * 100).toFixed(0) }}%</span>
-              </td>
               <td class="py-2 text-right" :class="b.distToBreakPct < 1 ? 'text-red-400' : 'text-gray-500'">{{ b.distToBreakPct }}%</td>
               <td class="py-2 text-right" :class="b.adx && b.adx > 25 ? 'text-red-400' : 'text-gray-500'">{{ b.adx ?? '—' }}</td>
               <td class="py-2 text-right">{{ b.filledCycles }}</td>
               <td class="py-2 text-right font-bold" :class="b.realizedPnl >= 0 ? 'text-emerald-400' : 'text-red-400'">{{ b.realizedPnl >= 0 ? '+' : '' }}${{ b.realizedPnl.toFixed(4) }}</td>
+              <td class="py-2 text-right text-gray-500">{{ timeAgo(b.openedAt) }}</td>
+              <td class="py-2 text-right"><button @click="closeLiveGrid(b.id)" class="text-red-400/70 hover:text-red-400 text-[10px]">✕</button></td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Griglie SIM (paper trading) -->
+    <div v-if="simBots.length" class="stat-card border border-sky-500/20">
+      <div class="text-sm text-sky-400 font-medium mb-3 flex items-center gap-2">
+        <span class="w-2 h-2 rounded-full bg-sky-400 inline-block" />
+        🔵 Griglie SIM ({{ simBots.length }}) — paper trading, prezzi reali, nessun ordine
+      </div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-xs font-mono">
+          <thead>
+            <tr class="text-gray-600 border-b border-white/5">
+              <th class="text-left pb-2">Asset</th><th class="text-center pb-2">Lato</th><th class="text-right pb-2">Leva</th>
+              <th class="text-right pb-2">Capitale</th><th class="text-right pb-2">Range</th><th class="text-right pb-2">Prezzo</th>
+              <th class="text-right pb-2">→Break</th><th class="text-right pb-2">ADX</th><th class="text-right pb-2">Cicli</th>
+              <th class="text-right pb-2">PnL</th><th class="text-right pb-2">Aperto</th><th class="text-right pb-2"></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="b in simBots" :key="b.id" class="border-b border-white/3 hover:bg-surface-100 transition">
+              <td class="py-2 text-white font-bold">{{ b.symbol.replace('/USDT:USDT','') }}</td>
+              <td class="py-2 text-center"><span :class="b.side === 'long' ? 'text-emerald-400' : 'text-red-400'">{{ b.side.toUpperCase() }}</span></td>
+              <td class="py-2 text-right text-gray-400">{{ b.leverage }}x</td>
+              <td class="py-2 text-right text-gray-400">${{ b.capitalUsdt }}</td>
+              <td class="py-2 text-right text-gray-500">{{ b.rangeLow }}–{{ b.rangeHigh }}</td>
+              <td class="py-2 text-right text-white">{{ b.currentPrice }}</td>
+              <td class="py-2 text-right" :class="b.distToBreakPct < 1 ? 'text-red-400' : 'text-gray-500'">{{ b.distToBreakPct }}%</td>
+              <td class="py-2 text-right" :class="b.adx && b.adx > 25 ? 'text-red-400' : 'text-gray-500'">{{ b.adx ?? '—' }}</td>
+              <td class="py-2 text-right">{{ b.filledCycles }}</td>
+              <td class="py-2 text-right font-bold" :class="b.realizedPnl >= 0 ? 'text-sky-400' : 'text-red-400'">{{ b.realizedPnl >= 0 ? '+' : '' }}${{ b.realizedPnl.toFixed(4) }}</td>
               <td class="py-2 text-right text-gray-500">{{ timeAgo(b.openedAt) }}</td>
               <td class="py-2 text-right"><button @click="closeGrid(b.id)" class="text-red-400/70 hover:text-red-400 text-[10px]">✕</button></td>
             </tr>
@@ -322,8 +342,10 @@ const config       = ref<any>(null)
 const status      = computed(() => dashboard.value?.status)
 const candidates  = computed<any[]>(() => dashboard.value?.candidates ?? [])
 const suggestions = computed(() => dashboard.value?.suggestions ?? { long: [], short: [] })
-const activeBots  = computed<any[]>(() => dashboard.value?.activeBots ?? [])
+const liveBots    = computed<any[]>(() => dashboard.value?.liveBots ?? [])
+const simBots     = computed<any[]>(() => dashboard.value?.simBots ?? [])
 const closedBots  = computed<any[]>(() => dashboard.value?.closedBots ?? [])
+const live        = computed(() => dashboard.value?.live)
 const sim         = computed(() => dashboard.value?.sim)
 const bestApr     = computed(() => candidates.value[0]?.aprEst ?? 0)
 
@@ -347,6 +369,12 @@ async function forceScan() {
 async function closeGrid(id: string) {
   if (!confirm('Chiudere questa griglia simulata?')) return
   try { await axios.post('/api/grid-scanner/close', { id }); await load() }
+  catch (e: any) { alert(`❌ ${e?.response?.data?.message ?? e?.message}`) }
+}
+
+async function closeLiveGrid(id: string) {
+  if (!confirm('Chiudere questa griglia LIVE? (cancella ordini + chiude posizione reale su MEXC)')) return
+  try { await axios.post('/api/grid-scanner/close-live', { id }); await load() }
   catch (e: any) { alert(`❌ ${e?.response?.data?.message ?? e?.message}`) }
 }
 

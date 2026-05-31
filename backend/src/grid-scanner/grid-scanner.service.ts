@@ -172,9 +172,10 @@ export class GridScannerService implements OnModuleInit {
   async simLoop() {
     try {
       const cfg = await this.getConfig();
-      const bots = await this.prisma.gridBot.findMany({ where: { status: 'open' } });
+      // SOLO griglie SIM (le live sono gestite dal monitor live, non da qui)
+      const bots = await this.prisma.gridBot.findMany({ where: { status: 'open', mode: 'sim' } });
 
-      // 1. Aggiorna ogni griglia aperta: cicli completati + check break
+      // 1. Aggiorna ogni griglia sim: cicli completati + check break
       for (const bot of bots) {
         const cand = this.candidates.find(c => c.symbol === bot.symbol);
         let price = cand?.price;
@@ -217,12 +218,14 @@ export class GridScannerService implements OnModuleInit {
         }
       }
 
-      // 2. Auto-apertura: mantieni maxLong long + maxShort short
+      // 2. Auto-apertura SIM: mantieni maxLong long + maxShort short (conta solo le SIM).
+      //    Esclude le coppie già aperte in QUALSIASI modo (sim o live) per non duplicarle.
       if (cfg.autoTradeEnabled) {
-        const open = await this.prisma.gridBot.findMany({ where: { status: 'open' } });
-        const openLong = open.filter(b => b.side === 'long');
-        const openShort = open.filter(b => b.side === 'short');
-        const openSymbols = new Set(open.map(b => b.symbol));
+        const allOpen = await this.prisma.gridBot.findMany({ where: { status: 'open' } });
+        const simOpen = allOpen.filter(b => b.mode === 'sim');
+        const openLong = simOpen.filter(b => b.side === 'long');
+        const openShort = simOpen.filter(b => b.side === 'short');
+        const openSymbols = new Set(allOpen.map(b => b.symbol));  // include anche le live
 
         const sugg = this.getSuggestions(cfg.maxLongGrids, cfg.maxShortGrids);
         for (const c of sugg.long) {
@@ -585,21 +588,27 @@ export class GridScannerService implements OnModuleInit {
       };
     });
 
-    const openPnl = openBots.reduce((s, b) => s + b.realizedPnl, 0);
-    const closedPnl = closedBots.reduce((s, b) => s + (b.closePnl ?? 0), 0);
-    const totalCycles = allBots.reduce((s, b) => s + b.filledCycles, 0);
+    // Separa LIVE da SIM
+    const liveBots = activeBots.filter(b => b.mode === 'live');
+    const simBots  = activeBots.filter(b => b.mode === 'sim');
+    const sumPnl = (arr: any[]) => +arr.reduce((s, b) => s + (b.realizedPnl ?? b.closePnl ?? 0), 0).toFixed(4);
 
     return {
       candidates: this.candidates.slice(0, 40),
       suggestions: getSuggestionsSafe(this, cfg),
-      activeBots,
+      liveBots,
+      simBots,
       closedBots: closedBots.slice(0, 20),
+      live: {
+        pnl: sumPnl(liveBots),
+        cycles: liveBots.reduce((s, b) => s + b.filledCycles, 0),
+        count: liveBots.length,
+      },
       sim: {
-        openPnl: +openPnl.toFixed(4),
-        closedPnl: +closedPnl.toFixed(4),
-        totalPnl: +(openPnl + closedPnl).toFixed(4),
-        totalCycles,
-        openCount: openBots.length,
+        pnl: sumPnl(simBots),
+        cycles: simBots.reduce((s, b) => s + b.filledCycles, 0),
+        count: simBots.length,
+        closedPnl: sumPnl(closedBots),
         closedCount: closedBots.length,
       },
       status: this.getStatus(),
