@@ -285,7 +285,7 @@ export class GridScannerService implements OnModuleInit {
       },
     });
     this.simPos.set(bot.id, { openLevels: [], lastPrice: price });
-    this.logger.log(`[GRID SIM] aperta ${side.toUpperCase()} ${cand.base} · leva AUTO ${leverage}x · 10 livelli · range ${low}-${high}`);
+    this.logger.log(`[GRID SIM] aperta ${side.toUpperCase()} ${cand.base} · leva AUTO ${leverage}x · ${liveLevels} livelli · range ${low}-${high}`);
     return bot;
   }
 
@@ -318,19 +318,21 @@ export class GridScannerService implements OnModuleInit {
         try { await this.checkLiveGrid(bot); } catch (e: any) { this.logger.warn(`[GRID LIVE] ${bot.symbol}: ${e?.message?.slice(0, 50)}`); }
       }
 
-      // Mantieni sempre 1 griglia LIVE attiva (se auto-trade ON e margine disponibile)
+      // Mantieni sempre 1 griglia LIVE LONG + 1 SHORT (se auto-trade ON e margine ok)
       const cfg = await this.getConfig();
-      if (cfg.autoTradeEnabled && bots.length < 1) {
-        const sugg = this.getSuggestions(3, 3);
+      if (cfg.autoTradeEnabled) {
+        const sugg = this.getSuggestions(5, 5);
         const openSym = new Set(bots.map(b => b.symbol));
-        const longC = sugg.long.find(c => !openSym.has(c.symbol) && !this.inCooldown(c.symbol));
-        const shortC = sugg.short.find(c => !openSym.has(c.symbol) && !this.inCooldown(c.symbol));
-        const pick = longC ? { c: longC, side: 'long' as const } : shortC ? { c: shortC, side: 'short' as const } : null;
-        if (pick) {
+        const haveLong  = bots.some(b => b.side === 'long');
+        const haveShort = bots.some(b => b.side === 'short');
+        const toOpen: { c: any; side: 'long' | 'short' }[] = [];
+        if (!haveLong)  { const c = sugg.long.find(x => !openSym.has(x.symbol) && !this.inCooldown(x.symbol));  if (c) toOpen.push({ c, side: 'long' }); }
+        if (!haveShort) { const c = sugg.short.find(x => !openSym.has(x.symbol) && !this.inCooldown(x.symbol)); if (c) toOpen.push({ c, side: 'short' }); }
+        for (const { c, side } of toOpen) {
           try {
-            await this.openLiveGrid(pick.c.symbol, pick.side, cfg.capitalPerGrid, 10);
-            this.logger.log(`[GRID LIVE] auto-mantenimento: aperta ${pick.side} ${pick.c.base}`);
-          } catch (e: any) { this.logger.warn(`[GRID LIVE] auto-apertura saltata: ${e?.message?.slice(0, 50)}`); }
+            await this.openLiveGrid(c.symbol, side, cfg.capitalPerGrid, 10);
+            this.logger.log(`[GRID LIVE] auto-mantenimento: aperta ${side} ${c.base}`);
+          } catch (e: any) { this.logger.warn(`[GRID LIVE] auto-apertura ${side} saltata: ${e?.message?.slice(0, 50)}`); }
         }
       }
     } catch (e: any) { this.logger.warn(`[GRID LIVE] monitor: ${e?.message}`); }
@@ -381,66 +383,73 @@ export class GridScannerService implements OnModuleInit {
       return;
     }
 
-    // Match per PREZZO (l'id da create è rotto su MEXC): un ordine salvato che non
-    // ha più un ordine aperto al suo prezzo (entro mezzo spacing) = è stato riempito.
+    // ── Match per PREZZO (l'id da create è rotto su MEXC): un ordine salvato senza
+    //    ordine aperto al suo prezzo (entro mezzo spacing) = è stato RIEMPITO. ──────
     const openOrders = await this.swapExchange.fetchOpenOrders(bot.symbol);
     const tol = spacing * 0.4;
-    const isStillOpen = (p: number) => openOrders.some((o: any) => Math.abs(Number(o.price) - p) < tol);
+    const isOpenAt = (p: number) => openOrders.some((o: any) => Math.abs(Number(o.price) - p) < tol);
+    const cpl = bot.contractsPerLevel;
 
-    let pnlAdd = 0, cyclesAdd = 0, changed = false;
-    const newOrders: any[] = [];
-
+    // 1) Conta i cicli di PROFITTO chiusi nel frattempo: long → un SELL reduceOnly
+    //    riempito = venduto in alto; short → un BUY reduceOnly riempito = ricomprato.
+    let pnlAdd = 0, cyclesAdd = 0;
     for (const ord of orders) {
-      if (isStillOpen(ord.price)) { newOrders.push(ord); continue; }
-      // riempito → ripiazza l'ordine OPPOSTO un gradino dall'altra parte
-      changed = true;
-      // In LONG grid: SELL riempito = profitto (venduto in alto), ripiazza BUY sotto.
-      //               BUY riempito = ricomprato, ripiazza SELL sopra (reduceOnly).
-      // In SHORT grid: BUY riempito = profitto (ricomprato in basso), ripiazza SELL sopra.
-      //                SELL riempito = rishortato, ripiazza BUY sotto (reduceOnly).
+      if (isOpenAt(ord.price)) continue;
       const isProfitFill = (bot.side === 'long' && ord.side === 'sell') || (bot.side === 'short' && ord.side === 'buy');
-      if (isProfitFill) { pnlAdd += spacing * bot.contractsPerLevel * cs; cyclesAdd += 1; }
-
-      try {
-        if (bot.side === 'long') {
-          if (ord.side === 'sell') {
-            const np = Number(this.swapExchange.priceToPrecision(bot.symbol, ord.price - spacing));
-            if (np > bot.rangeLow && !isStillOpen(np)) { await this.swapExchange.createLimitBuyOrder(bot.symbol, bot.contractsPerLevel, np, { openType: 1, positionType: 1, leverage: bot.leverage }); newOrders.push({ price: np, side: 'buy' }); }
-          } else {
-            const np = Number(this.swapExchange.priceToPrecision(bot.symbol, ord.price + spacing));
-            if (np < bot.rangeHigh && !isStillOpen(np)) { await this.swapExchange.createLimitSellOrder(bot.symbol, bot.contractsPerLevel, np, { openType: 1, positionType: 1, leverage: bot.leverage, reduceOnly: true }); newOrders.push({ price: np, side: 'sell' }); }
-          }
-        } else {
-          if (ord.side === 'buy') {
-            const np = Number(this.swapExchange.priceToPrecision(bot.symbol, ord.price + spacing));
-            if (np < bot.rangeHigh && !isStillOpen(np)) { await this.swapExchange.createLimitSellOrder(bot.symbol, bot.contractsPerLevel, np, { openType: 1, positionType: 2, leverage: bot.leverage }); newOrders.push({ price: np, side: 'sell' }); }
-          } else {
-            const np = Number(this.swapExchange.priceToPrecision(bot.symbol, ord.price - spacing));
-            if (np > bot.rangeLow && !isStillOpen(np)) { await this.swapExchange.createLimitBuyOrder(bot.symbol, bot.contractsPerLevel, np, { openType: 1, positionType: 2, leverage: bot.leverage, reduceOnly: true }); newOrders.push({ price: np, side: 'buy' }); }
-          }
-        }
-      } catch (e: any) { this.logger.warn(`[GRID LIVE] ripiazzo: ${e?.message?.slice(0, 40)}`); }
+      if (isProfitFill) { pnlAdd += spacing * cpl * cs; cyclesAdd += 1; }
     }
 
-    // ── RIPARAZIONE BUCHI: ripristina gli ordini di APERTURA mancanti ─────────
-    // (long → buy sotto il prezzo · short → sell sopra). I livelli di chiusura
-    // reduceOnly li gestisce il fill quando la posizione si carica.
+    // 2) RECONCILE GRIGLIA COMPLETA — ad ogni tick OGNI livello sopra il prezzo ha un
+    //    SELL e ogni livello sotto un BUY: la griglia resta sempre EQUIDISTANTE e
+    //    PIENA (mai buchi). long: buy sotto apre · sell sopra reduceOnly chiude.
+    //    short: speculare. I reduceOnly sono limitati ai contratti che la posizione
+    //    copre davvero, dal livello più vicino al prezzo (niente ordini fantasma).
+    let posContracts = 0;
+    try {
+      const ps = (await this.swapExchange.fetchPositions([bot.symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
+      if (ps.length) posContracts = Math.abs(Number(ps[0].contracts));
+    } catch {}
+
+    const sellLevels: number[] = [], buyLevels: number[] = [];
     for (let i = 1; i < bot.gridLevels; i++) {
       const L = Number(this.swapExchange.priceToPrecision(bot.symbol, bot.rangeLow + spacing * i));
-      if (Math.abs(L - price) < spacing * 0.5) continue;                                   // troppo vicino al prezzo
-      if (isStillOpen(L) || newOrders.some(o => Math.abs(o.price - L) < tol)) continue;     // già presente
-      try {
-        if (bot.side === 'long' && L < price) {
-          await this.swapExchange.createLimitBuyOrder(bot.symbol, bot.contractsPerLevel, L, { openType: 1, positionType: 1, leverage: bot.leverage });
-          newOrders.push({ price: L, side: 'buy' }); changed = true;
-        } else if (bot.side === 'short' && L > price) {
-          await this.swapExchange.createLimitSellOrder(bot.symbol, bot.contractsPerLevel, L, { openType: 1, positionType: 2, leverage: bot.leverage });
-          newOrders.push({ price: L, side: 'sell' }); changed = true;
-        }
-      } catch { /* margine/minimo → salta, riproverà */ }
+      if (Math.abs(L - price) < spacing * 0.05) continue;     // salta solo il livello esatto sul prezzo
+      if (L > price) sellLevels.push(L); else buyLevels.push(L);
+    }
+    sellLevels.sort((a, b) => a - b);   // dal più vicino al prezzo verso l'alto
+    buyLevels.sort((a, b) => b - a);    // dal più vicino al prezzo verso il basso
+
+    const newOrders: any[] = [];
+    let reduceBudget = posContracts;    // contratti coperti dalla posizione per i reduceOnly
+
+    // assicura un ordine al livello L: lo (ri)crea solo se manca davvero sull'exchange
+    const ensure = async (L: number, sideOrd: 'buy' | 'sell', create: () => Promise<any>) => {
+      if (isOpenAt(L)) { newOrders.push({ price: L, side: sideOrd }); return; }
+      try { await create(); newOrders.push({ price: L, side: sideOrd }); }
+      catch (e: any) { this.logger.warn(`[GRID LIVE] ${sideOrd}@${L}: ${e?.message?.slice(0, 40)}`); }
+    };
+
+    if (bot.side === 'long') {
+      for (const L of sellLevels) {                 // SELL sopra = reduceOnly (chiude long)
+        if (reduceBudget < cpl) break;
+        await ensure(L, 'sell', () => this.swapExchange.createLimitSellOrder(bot.symbol, cpl, L, { openType: 1, positionType: 1, leverage: bot.leverage, reduceOnly: true }));
+        reduceBudget -= cpl;
+      }
+      for (const L of buyLevels)                     // BUY sotto = apre long
+        await ensure(L, 'buy', () => this.swapExchange.createLimitBuyOrder(bot.symbol, cpl, L, { openType: 1, positionType: 1, leverage: bot.leverage }));
+    } else {
+      for (const L of buyLevels) {                  // BUY sotto = reduceOnly (chiude short)
+        if (reduceBudget < cpl) break;
+        await ensure(L, 'buy', () => this.swapExchange.createLimitBuyOrder(bot.symbol, cpl, L, { openType: 1, positionType: 2, leverage: bot.leverage, reduceOnly: true }));
+        reduceBudget -= cpl;
+      }
+      for (const L of sellLevels)                    // SELL sopra = apre short
+        await ensure(L, 'sell', () => this.swapExchange.createLimitSellOrder(bot.symbol, cpl, L, { openType: 1, positionType: 2, leverage: bot.leverage }));
     }
 
-    if (changed) {
+    // stato reale della griglia, ordinato per prezzo decrescente (come sul grafico)
+    newOrders.sort((a, b) => b.price - a.price);
+    if (cyclesAdd > 0 || JSON.stringify(newOrders) !== JSON.stringify(orders)) {
       if (pnlAdd > 0) this.logger.log(`[GRID LIVE] ${bot.symbol.replace('/USDT:USDT','')} +${cyclesAdd} cicli · +$${pnlAdd.toFixed(4)}`);
       await this.prisma.gridBot.update({
         where: { id: bot.id },
