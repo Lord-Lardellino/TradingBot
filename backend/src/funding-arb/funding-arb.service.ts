@@ -515,7 +515,11 @@ export class FundingArbService implements OnModuleInit {
     let spotValue = 0, futNotional = 0, dailyFundingEst = 0, feesPaid = 0, fundingReceived = 0, futUpnlTot = 0, futFeesTot = 0;
     const legs: any[] = [];
     try {
-      const positions = (await this.swapExchange.fetchPositions()).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
+      // SOLO le posizioni del funding arb (tracciate nel suo DB), non quelle del grid
+      // o altre strategie che condividono lo stesso wallet futures MEXC.
+      const arbSymbols = new Set(openPos.map(p => p.symbol));
+      const positions = (await this.swapExchange.fetchPositions()).filter((p: any) =>
+        Math.abs(Number(p.contracts || 0)) > 0 && arbSymbols.has(p.symbol));
       const balance = await this.spotExchange.fetchBalance();
       for (const p of positions) {
         const m = this.swapExchange.market(p.symbol);
