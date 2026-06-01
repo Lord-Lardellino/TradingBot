@@ -269,7 +269,7 @@ export class GridScannerService implements OnModuleInit {
     // STESSI parametri del live: livelli DINAMICI, leva AUTO, contractsPerLevel.
     const price = cand.price, low = cand.rangeLow, high = cand.rangeHigh;
     const rangePct = ((high - low) / price) * 100;
-    const liveLevels = Math.max(6, Math.min(24, Math.round(rangePct / cfg.gridSpacingPct)));
+    const liveLevels = Math.max(10, Math.min(30, Math.round(rangePct / cfg.gridSpacingPct)));
     const leverage = Math.max(2, Math.min(5, Math.floor(100 / (rangePct * 2)) || 2));
     let cs = 1, minContracts = 1;
     try { const m = this.swapExchange.market(symbol); cs = Number((m as any)?.contractSize ?? 1) || 1; minContracts = Number((m as any)?.limits?.amount?.min ?? 1) || 1; } catch {}
@@ -461,9 +461,9 @@ export class GridScannerService implements OnModuleInit {
     const price = cand.price;
     const low = cand.rangeLow, high = cand.rangeHigh;
     const rangePct = ((high - low) / price) * 100;
-    // NUMERO LIVELLI DINAMICO: si adatta al range mantenendo lo spacing target
-    // (~gridSpacingPct % del prezzo). Range largo → più livelli, stretto → meno.
-    liveLevels = Math.max(6, Math.min(24, Math.round(rangePct / cfg.gridSpacingPct)));
+    // NUMERO LIVELLI DINAMICO: si adatta al range ma sempre DENSO (min 10 livelli,
+    // come prima). Spacing target ~gridSpacingPct % → range largo = più livelli.
+    liveLevels = Math.max(10, Math.min(30, Math.round(rangePct / cfg.gridSpacingPct)));
     const spacing = (high - low) / liveLevels;
     const pricePos = (price - low) / ((high - low) || 1);
 
