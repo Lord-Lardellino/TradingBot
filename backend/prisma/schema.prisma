@@ -1094,6 +1094,7 @@ model GridConfig {
   exitAdx             Float     @default(28)       // ADX sopra = trend = esci
   takeProfitPct       Float     @default(4.0)      // chiudi al +X% del margine (netto) + posizione neutra
   stopThreshold       Float     @default(0.88)     // stop anticipato al X% del range verso il lato sfavorevole
+  gridSpacingPct      Float     @default(0.7)      // spacing target % → numero livelli dinamico (range/spacing)
   // Reset analytics
   analyticsResetAt    DateTime?
   baselineEquity      Float?

@@ -22,6 +22,9 @@ export class GridScannerService implements OnModuleInit {
   // SIM fedele al live: traccia la posizione reale livello per livello.
   // openLevels = prezzi dei livelli con posizione aperta (come gli ordini eseguiti).
   private simPos = new Map<string, { openLevels: number[]; lastPrice: number }>();
+  // Cooldown: coppie chiuse di recente → non riaprirle subito (rotazione)
+  private recentlyClosed = new Map<string, number>();
+  private readonly COOLDOWN_MS = 30 * 60 * 1000;  // 30 minuti
 
   constructor(
     private config: ConfigService,
@@ -243,14 +246,14 @@ export class GridScannerService implements OnModuleInit {
         const openShort = simOpen.filter(b => b.side === 'short');
         const openSymbols = new Set(allOpen.map(b => b.symbol));  // include anche le live
 
-        const sugg = this.getSuggestions(cfg.maxLongGrids, cfg.maxShortGrids);
+        const sugg = this.getSuggestions(cfg.maxLongGrids + 3, cfg.maxShortGrids + 3);
         for (const c of sugg.long) {
           if (openLong.length >= cfg.maxLongGrids) break;
-          if (!openSymbols.has(c.symbol)) { await this.openSimGrid(c.symbol, 'long'); openSymbols.add(c.symbol); openLong.push({} as any); }
+          if (!openSymbols.has(c.symbol) && !this.inCooldown(c.symbol)) { await this.openSimGrid(c.symbol, 'long'); openSymbols.add(c.symbol); openLong.push({} as any); }
         }
         for (const c of sugg.short) {
           if (openShort.length >= cfg.maxShortGrids) break;
-          if (!openSymbols.has(c.symbol)) { await this.openSimGrid(c.symbol, 'short'); openSymbols.add(c.symbol); openShort.push({} as any); }
+          if (!openSymbols.has(c.symbol) && !this.inCooldown(c.symbol)) { await this.openSimGrid(c.symbol, 'short'); openSymbols.add(c.symbol); openShort.push({} as any); }
         }
       }
     } catch (e: any) {
@@ -263,11 +266,11 @@ export class GridScannerService implements OnModuleInit {
     const cand = this.candidates.find(c => c.symbol === symbol);
     if (!cand) throw new Error(`${symbol} non è in range (nessun candidato)`);
     const cfg = await this.getConfig();
-    // STESSI parametri del live: 10 livelli, leva AUTO, contractsPerLevel calcolato.
-    const liveLevels = 10;
+    // STESSI parametri del live: livelli DINAMICI, leva AUTO, contractsPerLevel.
     const price = cand.price, low = cand.rangeLow, high = cand.rangeHigh;
     const rangePct = ((high - low) / price) * 100;
-    const leverage = Math.max(2, Math.min(20, Math.floor(100 / (rangePct * 2)) || 2));
+    const liveLevels = Math.max(6, Math.min(24, Math.round(rangePct / cfg.gridSpacingPct)));
+    const leverage = Math.max(2, Math.min(5, Math.floor(100 / (rangePct * 2)) || 2));
     let cs = 1, minContracts = 1;
     try { const m = this.swapExchange.market(symbol); cs = Number((m as any)?.contractSize ?? 1) || 1; minContracts = Number((m as any)?.limits?.amount?.min ?? 1) || 1; } catch {}
     const totalOrders = Math.max(1, liveLevels - 1);
@@ -295,8 +298,15 @@ export class GridScannerService implements OnModuleInit {
       data: { status: 'closed', closeReason: reason, closePrice: price ?? bot.entryPrice, closePnl: bot.realizedPnl, closedAt: new Date() },
     });
     this.lastPrices.delete(botId);
+    this.simPos.delete(botId);
+    this.recentlyClosed.set(bot.symbol, Date.now());  // cooldown
     this.logger.log(`[GRID SIM] chiusa ${bot.side.toUpperCase()} ${bot.symbol.replace('/USDT:USDT','')} · ${reason} · cicli ${bot.filledCycles} · PnL $${bot.realizedPnl.toFixed(4)}`);
     return { closed: true, reason, pnl: bot.realizedPnl };
+  }
+
+  private inCooldown(symbol: string): boolean {
+    const t = this.recentlyClosed.get(symbol);
+    return t != null && (Date.now() - t) < this.COOLDOWN_MS;
   }
 
   // ── Monitor griglie LIVE — ogni 15 secondi: rileva fill e ripiazza ────────
@@ -311,10 +321,10 @@ export class GridScannerService implements OnModuleInit {
       // Mantieni sempre 1 griglia LIVE attiva (se auto-trade ON e margine disponibile)
       const cfg = await this.getConfig();
       if (cfg.autoTradeEnabled && bots.length < 1) {
-        const sugg = this.getSuggestions(1, 1);
+        const sugg = this.getSuggestions(3, 3);
         const openSym = new Set(bots.map(b => b.symbol));
-        const longC = sugg.long.find(c => !openSym.has(c.symbol));
-        const shortC = sugg.short.find(c => !openSym.has(c.symbol));
+        const longC = sugg.long.find(c => !openSym.has(c.symbol) && !this.inCooldown(c.symbol));
+        const shortC = sugg.short.find(c => !openSym.has(c.symbol) && !this.inCooldown(c.symbol));
         const pick = longC ? { c: longC, side: 'long' as const } : shortC ? { c: shortC, side: 'short' as const } : null;
         if (pick) {
           try {
@@ -412,6 +422,24 @@ export class GridScannerService implements OnModuleInit {
       } catch (e: any) { this.logger.warn(`[GRID LIVE] ripiazzo: ${e?.message?.slice(0, 40)}`); }
     }
 
+    // ── RIPARAZIONE BUCHI: ripristina gli ordini di APERTURA mancanti ─────────
+    // (long → buy sotto il prezzo · short → sell sopra). I livelli di chiusura
+    // reduceOnly li gestisce il fill quando la posizione si carica.
+    for (let i = 1; i < bot.gridLevels; i++) {
+      const L = Number(this.swapExchange.priceToPrecision(bot.symbol, bot.rangeLow + spacing * i));
+      if (Math.abs(L - price) < spacing * 0.5) continue;                                   // troppo vicino al prezzo
+      if (isStillOpen(L) || newOrders.some(o => Math.abs(o.price - L) < tol)) continue;     // già presente
+      try {
+        if (bot.side === 'long' && L < price) {
+          await this.swapExchange.createLimitBuyOrder(bot.symbol, bot.contractsPerLevel, L, { openType: 1, positionType: 1, leverage: bot.leverage });
+          newOrders.push({ price: L, side: 'buy' }); changed = true;
+        } else if (bot.side === 'short' && L > price) {
+          await this.swapExchange.createLimitSellOrder(bot.symbol, bot.contractsPerLevel, L, { openType: 1, positionType: 2, leverage: bot.leverage });
+          newOrders.push({ price: L, side: 'sell' }); changed = true;
+        }
+      } catch { /* margine/minimo → salta, riproverà */ }
+    }
+
     if (changed) {
       if (pnlAdd > 0) this.logger.log(`[GRID LIVE] ${bot.symbol.replace('/USDT:USDT','')} +${cyclesAdd} cicli · +$${pnlAdd.toFixed(4)}`);
       await this.prisma.gridBot.update({
@@ -432,19 +460,22 @@ export class GridScannerService implements OnModuleInit {
 
     const price = cand.price;
     const low = cand.rangeLow, high = cand.rangeHigh;
+    const rangePct = ((high - low) / price) * 100;
+    // NUMERO LIVELLI DINAMICO: si adatta al range mantenendo lo spacing target
+    // (~gridSpacingPct % del prezzo). Range largo → più livelli, stretto → meno.
+    liveLevels = Math.max(6, Math.min(24, Math.round(rangePct / cfg.gridSpacingPct)));
     const spacing = (high - low) / liveLevels;
     const pricePos = (price - low) / ((high - low) || 1);
-    const rangePct = ((high - low) / price) * 100;
 
     // 1. CENTRO RANGE: il prezzo deve stare al 25-75% così la griglia è bilanciata
     if (pricePos < 0.25 || pricePos > 0.75)
       throw new Error(`${cand.base} prezzo al ${(pricePos * 100).toFixed(0)}% del range (serve 25-75% per griglia bilanciata)`);
 
-    // LEVA AUTOMATICA: la liquidazione deve cadere OLTRE il range (×2 di margine).
-    // Range stretto → leva più alta (più contratti = più profitto/ciclo) senza
-    // rischiare la liquidazione prima del break. Cappata a [2, 20].
+    // LEVA AUTOMATICA: liquidazione oltre il range MA cappata a 5x per limitare la
+    // PERDITA al break (la leva amplifica la perdita: posizione × movimento × leva).
+    // 5x è il compromesso: profitto/ciclo decente, perdita break gestibile.
     const safeLeverage = Math.floor(100 / (rangePct * 2));
-    const leverage = Math.max(2, Math.min(20, safeLeverage || 2));
+    const leverage = Math.max(2, Math.min(5, safeLeverage || 2));
     const liquidationPct = +(100 / leverage).toFixed(1);
 
     // 2. Griglia FISSA ancorata al range: livelli sempre agli stessi prezzi
@@ -546,6 +577,7 @@ export class GridScannerService implements OnModuleInit {
       where: { id: botId },
       data: { status: 'closed', closeReason: reason, closePnl: bot.realizedPnl, closedAt: new Date() },
     });
+    this.recentlyClosed.set(bot.symbol, Date.now());  // cooldown 30 min
     this.logger.log(`[GRID LIVE CLOSE] ${bot.symbol} · ${reason} · cicli ${bot.filledCycles} · PnL $${bot.realizedPnl.toFixed(4)}`);
     return { closed: true, reason, pnl: bot.realizedPnl };
   }
