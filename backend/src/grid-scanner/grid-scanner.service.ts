@@ -25,6 +25,8 @@ export class GridScannerService implements OnModuleInit {
   // Cooldown: coppie chiuse di recente → non riaprirle subito (rotazione)
   private recentlyClosed = new Map<string, number>();
   private readonly COOLDOWN_MS = 30 * 60 * 1000;  // 30 minuti
+  // Debounce anti-wick: il take deve restare sopra target per 2 tick di fila
+  private takeHits = new Map<string, number>();
 
   constructor(
     private config: ConfigService,
@@ -349,26 +351,32 @@ export class GridScannerService implements OnModuleInit {
     if (price == null) { try { price = Number((await this.swapExchange.fetchTicker(bot.symbol)).last); } catch { return; } }
     const pricePos = (price - bot.rangeLow) / ((bot.rangeHigh - bot.rangeLow) || 1);
 
-    // ── USCITE (in ordine di priorità) ──────────────────────────────────────
-    // 1. TAKE PROFIT sul PnL TOTALE = cicli realizzati + unrealized della posizione.
-    //    Così incassa anche il profitto della posizione aperta (es. long in forte
-    //    guadagno), non solo i cicli. Esci appena il totale raggiunge il target.
-    const target = bot.capitalUsdt * (cfg.takeProfitPct / 100);
-    let uPnl = 0;
+    // ── POSIZIONE REALE (un solo fetch): entry, contratti, unrealized e REALIZZATO
+    //    VERO da MEXC (info.realised = P&L trading realizzato, NON il funding). ──────
+    let uPnl = 0, posContracts = 0, realised = 0, entry = price;
     try {
       const ps = (await this.swapExchange.fetchPositions([bot.symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
       if (ps.length) {
         const p = ps[0];
-        const entry = Number((p.info as any)?.holdAvgPrice ?? p.entryPrice ?? price);
-        const coin = Math.abs(Number(p.contracts)) * cs;
+        entry = Number((p.info as any)?.holdAvgPrice ?? p.entryPrice ?? price);
+        posContracts = Math.abs(Number(p.contracts));
+        const coin = posContracts * cs;
         uPnl = bot.side === 'long' ? (price - entry) * coin : (entry - price) * coin;
+        realised = Number((p.info as any)?.realised ?? 0);
       }
     } catch {}
-    const totalPnl = bot.realizedPnl + uPnl;
-    if (totalPnl >= target) {
-      await this.closeLiveGrid(bot.id, 'take_profit');
-      return;
-    }
+    const realTotal = realised + uPnl;   // P&L REALE che incasseremmo chiudendo ORA
+
+    // ── USCITE (in ordine di priorità) ──────────────────────────────────────
+    // 1. TAKE PROFIT sul P&L REALE (realizzato MEXC + unrealized vero), con DEBOUNCE
+    //    anti-wick: deve restare >= target per 2 tick di fila → niente chiusure su un
+    //    picco momentaneo che poi rientra (era il bug: take su wick, incasso in perdita).
+    const target = bot.capitalUsdt * (cfg.takeProfitPct / 100);
+    if (realTotal >= target) {
+      const hits = (this.takeHits.get(bot.id) ?? 0) + 1;
+      this.takeHits.set(bot.id, hits);
+      if (hits >= 2) { this.takeHits.delete(bot.id); await this.closeLiveGrid(bot.id, 'take_profit'); return; }
+    } else { this.takeHits.delete(bot.id); }
     // 2. STOP ANTICIPATO sul lato SFAVOREVOLE (prima del bordo, perdita piccola):
     //    short → temi l'alto; long → temi il basso. Esci alla soglia interna.
     const stopUp   = bot.side === 'short' && pricePos > cfg.stopThreshold;
@@ -391,24 +399,17 @@ export class GridScannerService implements OnModuleInit {
     const cpl = bot.contractsPerLevel;
     const px = (v: number) => Number(this.swapExchange.priceToPrecision(bot.symbol, v));
 
-    // posizione reale: quanti CHUNK abbiamo in mano (servono per gli ordini di chiusura)
-    let posContracts = 0;
-    try {
-      const ps = (await this.swapExchange.fetchPositions([bot.symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
-      if (ps.length) posContracts = Math.abs(Number(ps[0].contracts));
-    } catch {}
-
     const newOrders: any[] = [];
     const has  = (p: number, side?: 'buy' | 'sell') => newOrders.some(o => Math.abs(o.price - p) < tol && (!side || o.side === side));
     const keep = (p: number, side: 'buy' | 'sell') => { if (!has(p, side)) newOrders.push({ price: p, side }); };
 
-    // 1) Riporta gli ordini ancora aperti; conta i cicli di PROFITTO chiusi.
-    //    long → un SELL riempito = chunk venduto in alto (+spacing). short = speculare.
-    let pnlAdd = 0, cyclesAdd = 0;
+    // 1) Riporta gli ordini ancora aperti; conta SOLO i fill di chiusura come ATTIVITÀ
+    //    (non come profitto: il profitto vero è realised di MEXC, sopra).
+    let cyclesAdd = 0;
     for (const ord of orders) {
       if (isOpenAt(ord.price)) { keep(ord.price, ord.side); continue; }
-      const isProfit = (bot.side === 'long' && ord.side === 'sell') || (bot.side === 'short' && ord.side === 'buy');
-      if (isProfit) { pnlAdd += spacing * cpl * cs; cyclesAdd += 1; }
+      const isClose = (bot.side === 'long' && ord.side === 'sell') || (bot.side === 'short' && ord.side === 'buy');
+      if (isClose) cyclesAdd += 1;
     }
 
     // 2) Livelli equidistanti divisi sopra/sotto il prezzo, con DEAD-ZONE di mezzo
@@ -455,13 +456,14 @@ export class GridScannerService implements OnModuleInit {
       } catch (e: any) { this.logger.warn(`[GRID LIVE] ${openSide}@${L}: ${e?.message?.slice(0, 40)}`); }
     }
 
-    // stato reale della griglia, ordinato per prezzo decrescente (come sul grafico)
+    // stato reale della griglia + P&L REALIZZATO VERO (realised di MEXC), ordinato per
+    // prezzo decrescente. realizedPnl viene SETTATO (non incrementato) al valore vero.
     newOrders.sort((a, b) => b.price - a.price);
-    if (cyclesAdd > 0 || JSON.stringify(newOrders) !== JSON.stringify(orders)) {
-      if (pnlAdd > 0) this.logger.log(`[GRID LIVE] ${bot.symbol.replace('/USDT:USDT','')} +${cyclesAdd} cicli · +$${pnlAdd.toFixed(4)}`);
+    if (cyclesAdd > 0 || Math.abs(realised - bot.realizedPnl) > 1e-6 || JSON.stringify(newOrders) !== JSON.stringify(orders)) {
+      if (cyclesAdd > 0) this.logger.log(`[GRID LIVE] ${bot.symbol.replace('/USDT:USDT','')} ${cyclesAdd} chiusure · realizzato $${realised.toFixed(4)} · unrealized $${uPnl.toFixed(4)}`);
       await this.prisma.gridBot.update({
         where: { id: bot.id },
-        data: { liveOrders: JSON.stringify(newOrders), realizedPnl: { increment: pnlAdd }, filledCycles: { increment: cyclesAdd } },
+        data: { liveOrders: JSON.stringify(newOrders), realizedPnl: realised, filledCycles: { increment: cyclesAdd } },
       });
     }
   }
@@ -576,27 +578,36 @@ export class GridScannerService implements OnModuleInit {
   async closeLiveGrid(botId: string, reason: string) {
     const bot = await this.prisma.gridBot.findUnique({ where: { id: botId } });
     if (!bot || bot.status !== 'open') return;
+    let realClosePnl = bot.realizedPnl;   // fallback
     try {
       // cancella tutti gli ordini aperti della coppia
       const openOrders = await this.swapExchange.fetchOpenOrders(bot.symbol);
       for (const o of openOrders) { try { await this.swapExchange.cancelOrder(o.id, bot.symbol); } catch {} }
-      // chiudi posizione residua
+      // chiudi posizione residua — P&L REALE = realizzato MEXC + unrealized che incassiamo
+      const cs = bot.contractSize || 1;
+      let price = this.candidates.find(c => c.symbol === bot.symbol)?.price;
+      if (price == null) { try { price = Number((await this.swapExchange.fetchTicker(bot.symbol)).last); } catch {} }
       const positions = (await this.swapExchange.fetchPositions([bot.symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
       for (const p of positions) {
         const c = Math.abs(Number(p.contracts));
+        const entry = Number((p.info as any)?.holdAvgPrice ?? p.entryPrice ?? price ?? 0);
+        const realised = Number((p.info as any)?.realised ?? 0);
+        const uPnl = price ? (bot.side === 'long' ? (price - entry) : (entry - price)) * c * cs : 0;
+        realClosePnl = realised + uPnl;
         try {
           if (p.side === 'long') await this.swapExchange.createMarketSellOrder(bot.symbol, c, { reduceOnly: true });
           else await this.swapExchange.createMarketBuyOrder(bot.symbol, c, { reduceOnly: true });
         } catch (e: any) { this.logger.warn(`[GRID LIVE CLOSE] pos: ${e?.message?.slice(0, 40)}`); }
       }
     } catch (e: any) { this.logger.warn(`[GRID LIVE CLOSE] ${e?.message?.slice(0, 50)}`); }
+    this.takeHits.delete(botId);
     await this.prisma.gridBot.update({
       where: { id: botId },
-      data: { status: 'closed', closeReason: reason, closePnl: bot.realizedPnl, closedAt: new Date() },
+      data: { status: 'closed', closeReason: reason, closePnl: realClosePnl, realizedPnl: realClosePnl, closedAt: new Date() },
     });
     this.recentlyClosed.set(bot.symbol, Date.now());  // cooldown 30 min
-    this.logger.log(`[GRID LIVE CLOSE] ${bot.symbol} · ${reason} · cicli ${bot.filledCycles} · PnL $${bot.realizedPnl.toFixed(4)}`);
-    return { closed: true, reason, pnl: bot.realizedPnl };
+    this.logger.log(`[GRID LIVE CLOSE] ${bot.symbol} · ${reason} · P&L REALE $${realClosePnl.toFixed(4)}`);
+    return { closed: true, reason, pnl: realClosePnl };
   }
 
   // ── RESET totale: chiudi griglie live reali + cancella tutto il DB grid ───
