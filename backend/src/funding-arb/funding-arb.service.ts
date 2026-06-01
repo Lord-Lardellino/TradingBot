@@ -625,11 +625,15 @@ export class FundingArbService implements OnModuleInit {
     return { removed: res.count };
   }
 
-  // ── Vendi TUTTO lo spot reale sul wallet MEXC (esclude USDT/stablecoin) ───
+  // ── Vendi lo spot delle SOLE coppie del funding arb (non quelle del grid) ──
   async closeAllSpot() {
     const STABLES = new Set(['USDT', 'USDC', 'USD', 'BUSD', 'DAI', 'TUSD']);
     let sold = 0;
     const errors: string[] = [];
+
+    // Solo gli asset tracciati dal funding arb (esclude grid/altre strategie)
+    const arbPos = await this.prisma.fundingArbPosition.findMany({ where: { status: 'open' } });
+    const arbBases = new Set(arbPos.map(p => p.symbol.replace('/USDT:USDT', '')));
 
     try {
       const balance = await this.spotExchange.fetchBalance();
@@ -637,7 +641,7 @@ export class FundingArbService implements OnModuleInit {
 
       for (const [asset, amount] of Object.entries(free)) {
         const qty = Number(amount);
-        if (!qty || qty <= 0 || STABLES.has(asset)) continue;
+        if (!qty || qty <= 0 || STABLES.has(asset) || !arbBases.has(asset)) continue;
 
         const spotSymbol = `${asset}/USDT`;
         if (!this.spotExchange.markets?.[spotSymbol]) continue;
@@ -664,14 +668,18 @@ export class FundingArbService implements OnModuleInit {
     return { sold, errors };
   }
 
-  // ── Chiudi TUTTE le posizioni futures reali su MEXC ──────────────────────
+  // ── Chiudi le posizioni futures delle SOLE coppie arb (non quelle del grid) ─
   async closeAllFutures() {
     let closed = 0;
     const errors: string[] = [];
 
+    // Solo i symbol tracciati dal funding arb (esclude grid/altre strategie)
+    const arbPos = await this.prisma.fundingArbPosition.findMany({ where: { status: 'open' } });
+    const arbSymbols = new Set(arbPos.map(p => p.symbol));
+
     try {
       const positions = await this.swapExchange.fetchPositions();
-      const openPositions = positions.filter((p: any) => Math.abs(Number(p.contracts ?? 0)) > 0);
+      const openPositions = positions.filter((p: any) => Math.abs(Number(p.contracts ?? 0)) > 0 && arbSymbols.has(p.symbol));
 
       for (const pos of openPositions) {
         const symbol = pos.symbol;
