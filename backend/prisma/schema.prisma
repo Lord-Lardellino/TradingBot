@@ -1085,13 +1085,15 @@ model GridConfig {
   capitalPerGrid      Float     @default(15)       // USDT margine per griglia
   leverage            Int       @default(3)        // 2-5x moderata
   gridLevels          Int       @default(20)       // numero livelli per griglia
-  // Filtri selezione coppie in range
-  maxAdx              Float     @default(20)       // ADX sotto = range
+  // Filtri selezione coppie in range (privilegia STALLO: ADX bassissimo, range stabile)
+  maxAdx              Float     @default(18)       // ADX sotto = range (15-18 = stallo)
   minRangePct         Float     @default(2.0)      // ampiezza range minima %
   maxRangePct         Float     @default(8.0)      // ampiezza range massima %
   minVolume24h        Float     @default(5000000)  // liquidità minima
-  // Uscita su break
+  // Uscita
   exitAdx             Float     @default(28)       // ADX sopra = trend = esci
+  takeProfitPct       Float     @default(4.0)      // chiudi al +X% del margine (netto) + posizione neutra
+  stopThreshold       Float     @default(0.88)     // stop anticipato al X% del range verso il lato sfavorevole
   // Reset analytics
   analyticsResetAt    DateTime?
   baselineEquity      Float?

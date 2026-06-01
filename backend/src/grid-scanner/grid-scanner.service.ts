@@ -19,7 +19,9 @@ export class GridScannerService implements OnModuleInit {
   private lastScanAt: string | null = null;
   private isScanning = false;
   private lastPrices = new Map<string, number>();  // per live monitor
-  private simExtreme = new Map<string, { price: number; dir: number }>();  // sim: punto di svolta
+  // SIM fedele al live: traccia la posizione reale livello per livello.
+  // openLevels = prezzi dei livelli con posizione aperta (come gli ordini eseguiti).
+  private simPos = new Map<string, { openLevels: number[]; lastPrice: number }>();
 
   constructor(
     private config: ConfigService,
@@ -184,38 +186,52 @@ export class GridScannerService implements OnModuleInit {
         }
         if (!price) continue;
 
-        // BREAK: prezzo fuori range oppure ADX salito sopra soglia → chiudi
-        const adxNow = cand?.adx ?? 0;
-        if (price > bot.rangeHigh) { await this.closeSimGrid(bot.id, 'break_up', price); continue; }
-        if (price < bot.rangeLow)  { await this.closeSimGrid(bot.id, 'break_down', price); continue; }
-        if (cand && adxNow > cfg.exitAdx) { await this.closeSimGrid(bot.id, 'trend_adx', price); continue; }
-
-        // CICLI (modello fedele al grid reale): un ciclo profittevole = il prezzo
-        // OSCILLA (va e torna di 1 spacing). In trend non conta nulla (il grid reale
-        // lì accumula, non profitta). Traccio il punto di svolta (estremo) e conto
-        // i cicli solo all'INVERSIONE.
+        const cs = bot.contractSize || 1;
         const spacingPrice = (bot.rangeHigh - bot.rangeLow) / bot.gridLevels;
-        let ext = this.simExtreme.get(bot.id) ?? { price: bot.entryPrice, dir: 0 };
-        let cycles = 0;
-        if (ext.dir >= 0 && price >= ext.price) {
-          ext = { price, dir: 1 };                    // continua a salire → estendo estremo
-        } else if (ext.dir <= 0 && price <= ext.price) {
-          ext = { price, dir: -1 };                   // continua a scendere → estendo estremo
-        } else {
-          // INVERSIONE: il prezzo è tornato indietro → conto i livelli richiusi = cicli
-          const reversal = Math.abs(price - ext.price);
-          cycles = spacingPrice > 0 ? Math.floor(reversal / spacingPrice) : 0;
-          if (cycles > 0) ext = { price, dir: price > ext.price ? 1 : -1 };
+        const adxNow = cand?.adx ?? 0;
+        const pricePos = (price - bot.rangeLow) / ((bot.rangeHigh - bot.rangeLow) || 1);
+
+        // ── SIMULATORE FEDELE AL LIVE: traccia la posizione livello per livello ──
+        // Ogni attraversamento di un livello = un ordine eseguito (come nel live).
+        // Short: sale→apre short al livello; scende→chiude (profitto = spacing). Long: speculare.
+        const st = this.simPos.get(bot.id) ?? { openLevels: [], lastPrice: bot.entryPrice };
+        const fee = bot.contractsPerLevel * cs * price * 0.0004;
+        let cyclesAdd = 0, realizedAdd = 0;
+        for (let i = 1; i < bot.gridLevels; i++) {
+          const L = bot.rangeLow + spacingPrice * i;
+          const up = st.lastPrice < L && price >= L;
+          const down = st.lastPrice > L && price <= L;
+          if (bot.side === 'short') {
+            if (up) st.openLevels.push(L);  // sale → apre short a L
+            if (down) { const idx = st.openLevels.findIndex(o => Math.abs(o - (L + spacingPrice)) < spacingPrice * 0.1); if (idx >= 0) { st.openLevels.splice(idx, 1); realizedAdd += spacingPrice * bot.contractsPerLevel * cs - fee; cyclesAdd++; } }
+          } else {
+            if (down) st.openLevels.push(L);  // scende → apre long a L
+            if (up) { const idx = st.openLevels.findIndex(o => Math.abs(o - (L - spacingPrice)) < spacingPrice * 0.1); if (idx >= 0) { st.openLevels.splice(idx, 1); realizedAdd += spacingPrice * bot.contractsPerLevel * cs - fee; cyclesAdd++; } }
+          }
         }
-        this.simExtreme.set(bot.id, ext);
-        if (cycles > 0) {
-          const notionalPerLevel = (bot.capitalUsdt * bot.leverage) / bot.gridLevels;
-          const profitPerCycle = notionalPerLevel * (bot.spacingPct / 100) - notionalPerLevel * 0.0004;
-          await this.prisma.gridBot.update({
-            where: { id: bot.id },
-            data: { realizedPnl: { increment: cycles * profitPerCycle }, filledCycles: { increment: cycles } },
-          });
+        st.lastPrice = price;
+        this.simPos.set(bot.id, st);
+        if (cyclesAdd > 0) {
+          await this.prisma.gridBot.update({ where: { id: bot.id }, data: { realizedPnl: { increment: realizedAdd }, filledCycles: { increment: cyclesAdd } } });
+          bot.realizedPnl += realizedAdd;
         }
+
+        // Unrealized della posizione simulata (avg entry dei livelli aperti), come il live
+        const posCount = st.openLevels.length;
+        const avgEntry = posCount ? st.openLevels.reduce((a, b) => a + b, 0) / posCount : price;
+        const posCoin = posCount * bot.contractsPerLevel * cs;
+        const uPnl = bot.side === 'short' ? (avgEntry - price) * posCoin : (price - avgEntry) * posCoin;
+        const totalPnl = bot.realizedPnl + uPnl;
+
+        // ── USCITE identiche al live: take su PnL TOTALE · stop anticipato · break · trend ──
+        const target = bot.capitalUsdt * (cfg.takeProfitPct / 100);
+        if (totalPnl >= target) { await this.closeSimGrid(bot.id, 'take_profit', price); this.simPos.delete(bot.id); continue; }
+        const stopUp   = bot.side === 'short' && pricePos > cfg.stopThreshold;
+        const stopDown = bot.side === 'long'  && pricePos < (1 - cfg.stopThreshold);
+        if (stopUp || stopDown) { await this.closeSimGrid(bot.id, stopUp ? 'stop_early_up' : 'stop_early_down', price); this.simPos.delete(bot.id); continue; }
+        if (price > bot.rangeHigh) { await this.closeSimGrid(bot.id, 'break_up', price); this.simPos.delete(bot.id); continue; }
+        if (price < bot.rangeLow)  { await this.closeSimGrid(bot.id, 'break_down', price); this.simPos.delete(bot.id); continue; }
+        if (cand && adxNow > cfg.exitAdx) { await this.closeSimGrid(bot.id, 'trend_adx', price); this.simPos.delete(bot.id); continue; }
       }
 
       // 2. Auto-apertura SIM: mantieni maxLong long + maxShort short (conta solo le SIM).
@@ -247,16 +263,26 @@ export class GridScannerService implements OnModuleInit {
     const cand = this.candidates.find(c => c.symbol === symbol);
     if (!cand) throw new Error(`${symbol} non è in range (nessun candidato)`);
     const cfg = await this.getConfig();
+    // STESSI parametri del live: 10 livelli, leva AUTO, contractsPerLevel calcolato.
+    const liveLevels = 10;
+    const price = cand.price, low = cand.rangeLow, high = cand.rangeHigh;
+    const rangePct = ((high - low) / price) * 100;
+    const leverage = Math.max(2, Math.min(20, Math.floor(100 / (rangePct * 2)) || 2));
+    let cs = 1, minContracts = 1;
+    try { const m = this.swapExchange.market(symbol); cs = Number((m as any)?.contractSize ?? 1) || 1; minContracts = Number((m as any)?.limits?.amount?.min ?? 1) || 1; } catch {}
+    const totalOrders = Math.max(1, liveLevels - 1);
+    const contractsPerLevel = Math.max(minContracts, Math.round((cfg.capitalPerGrid * leverage / totalOrders / price) / cs));
+
     const bot = await this.prisma.gridBot.create({
       data: {
-        symbol, side, timeframe: cfg.timeframe, leverage: cfg.leverage,
-        rangeLow: cand.rangeLow, rangeHigh: cand.rangeHigh, gridLevels: cand.gridLevels,
-        spacingPct: cand.spacingPct, capitalUsdt: cfg.capitalPerGrid, entryPrice: cand.price,
-        status: 'open',
+        symbol, side, mode: 'sim', timeframe: cfg.timeframe, leverage,
+        rangeLow: low, rangeHigh: high, gridLevels: liveLevels,
+        spacingPct: cand.spacingPct, capitalUsdt: cfg.capitalPerGrid, entryPrice: price,
+        status: 'open', contractSize: cs, contractsPerLevel,
       },
     });
-    this.lastPrices.set(bot.id, cand.price);
-    this.logger.log(`[GRID SIM] aperta ${side.toUpperCase()} ${cand.base} · range ${cand.rangeLow}-${cand.rangeHigh} · ~${cand.aprEst}% APR`);
+    this.simPos.set(bot.id, { openLevels: [], lastPrice: price });
+    this.logger.log(`[GRID SIM] aperta ${side.toUpperCase()} ${cand.base} · leva AUTO ${leverage}x · 10 livelli · range ${low}-${high}`);
     return bot;
   }
 
@@ -305,11 +331,42 @@ export class GridScannerService implements OnModuleInit {
     if (!orders.length) return;
     const cs = bot.contractSize || 1;
     const spacing = (bot.rangeHigh - bot.rangeLow) / bot.gridLevels;
+    const cfg = await this.getConfig();
 
-    // BREAK: prezzo fuori range → chiudi tutto
     let price = this.candidates.find(c => c.symbol === bot.symbol)?.price;
     if (price == null) { try { price = Number((await this.swapExchange.fetchTicker(bot.symbol)).last); } catch { return; } }
-    if (price && (price > bot.rangeHigh || price < bot.rangeLow)) {
+    const pricePos = (price - bot.rangeLow) / ((bot.rangeHigh - bot.rangeLow) || 1);
+
+    // ── USCITE (in ordine di priorità) ──────────────────────────────────────
+    // 1. TAKE PROFIT sul PnL TOTALE = cicli realizzati + unrealized della posizione.
+    //    Così incassa anche il profitto della posizione aperta (es. long in forte
+    //    guadagno), non solo i cicli. Esci appena il totale raggiunge il target.
+    const target = bot.capitalUsdt * (cfg.takeProfitPct / 100);
+    let uPnl = 0;
+    try {
+      const ps = (await this.swapExchange.fetchPositions([bot.symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
+      if (ps.length) {
+        const p = ps[0];
+        const entry = Number((p.info as any)?.holdAvgPrice ?? p.entryPrice ?? price);
+        const coin = Math.abs(Number(p.contracts)) * cs;
+        uPnl = bot.side === 'long' ? (price - entry) * coin : (entry - price) * coin;
+      }
+    } catch {}
+    const totalPnl = bot.realizedPnl + uPnl;
+    if (totalPnl >= target) {
+      await this.closeLiveGrid(bot.id, 'take_profit');
+      return;
+    }
+    // 2. STOP ANTICIPATO sul lato SFAVOREVOLE (prima del bordo, perdita piccola):
+    //    short → temi l'alto; long → temi il basso. Esci alla soglia interna.
+    const stopUp   = bot.side === 'short' && pricePos > cfg.stopThreshold;
+    const stopDown = bot.side === 'long'  && pricePos < (1 - cfg.stopThreshold);
+    if (stopUp || stopDown) {
+      await this.closeLiveGrid(bot.id, stopUp ? 'stop_early_up' : 'stop_early_down');
+      return;
+    }
+    // 3. BREAK pieno fuori range (fallback)
+    if (price > bot.rangeHigh || price < bot.rangeLow) {
       await this.closeLiveGrid(bot.id, price > bot.rangeHigh ? 'break_up' : 'break_down');
       return;
     }
