@@ -73,10 +73,12 @@ export class EmaScalperService implements OnModuleInit {
       const upSlope   = emaF[i] > emaF[i - sl] && emaS[i] >= emaS[i - sl];
       const downSlope = emaF[i] < emaF[i - sl] && emaS[i] <= emaS[i - sl];
       const spreadPct = Math.abs(emaF[i] - emaS[i]) / price * 100;
+      const fastMidPct = Math.abs(emaF[i] - emaM[i]) / price * 100;       // separazione EMA50-EMA100
       const choppy = spreadPct < cfg.minEmaSpreadPct;
+      const separated = fastMidPct >= (cfg.minFastMidPct ?? 0.10);        // EMA50/100 non ancora incrociate
       let trend: 'up' | 'down' | 'flat' = 'flat';
-      if (!choppy && upAligned && upSlope) trend = 'up';
-      else if (!choppy && downAligned && downSlope) trend = 'down';
+      if (!choppy && separated && upAligned && upSlope) trend = 'up';
+      else if (!choppy && separated && downAligned && downSlope) trend = 'down';
 
       // ── PULLBACK + INGRESSO (candela chiusa i) ─────────────────────────────
       // Pullback = il prezzo TORNA A TESTARE la EMA veloce (anche solo di stoppino/wick)
@@ -108,7 +110,7 @@ export class EmaScalperService implements OnModuleInit {
 
       this.snapshot = {
         ready: true, ts: Date.now(), symbol: cfg.symbol, price,
-        ema: { fast: +emaF[i].toFixed(2), mid: +emaM[i].toFixed(2), slow: +emaS[i].toFixed(2), spreadPct: +spreadPct.toFixed(3) },
+        ema: { fast: +emaF[i].toFixed(2), mid: +emaM[i].toFixed(2), slow: +emaS[i].toFixed(2), spreadPct: +spreadPct.toFixed(3), fastMidPct: +fastMidPct.toFixed(3) },
         trend, choppy, session,
         setup: setupLong ? 'long' : setupShort ? 'short' : null,
         signals: { touchedFastLong, heldSlowLong, triggerLong, touchedFastShort, heldSlowShort, triggerShort },
@@ -217,7 +219,7 @@ export class EmaScalperService implements OnModuleInit {
   }
 
   async updateConfig(patch: any) {
-    const allowed = ['enabled', 'liveEnabled', 'symbol', 'timeframe', 'emaFast', 'emaMid', 'emaSlow', 'riskReward', 'capitalUsdt', 'leverage', 'swingLookback', 'pullbackLookback', 'slopeLookback', 'minEmaSpreadPct', 'sessionFilter'];
+    const allowed = ['enabled', 'liveEnabled', 'symbol', 'timeframe', 'emaFast', 'emaMid', 'emaSlow', 'riskReward', 'capitalUsdt', 'leverage', 'swingLookback', 'pullbackLookback', 'slopeLookback', 'minEmaSpreadPct', 'minFastMidPct', 'sessionFilter'];
     const data: any = {};
     for (const k of allowed) if (patch[k] !== undefined) data[k] = patch[k];
     await this.getConfig();

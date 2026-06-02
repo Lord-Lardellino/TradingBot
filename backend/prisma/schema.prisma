@@ -1143,7 +1143,8 @@ model EmaScalperConfig {
   swingLookback    Int       @default(10)       // candele per swing low/high (SL)
   pullbackLookback Int       @default(5)        // candele per rilevare il pullback
   slopeLookback    Int       @default(3)        // candele per la pendenza EMA
-  minEmaSpreadPct  Float     @default(0.03)     // filtro anti-laterale: spread EMA min %
+  minEmaSpreadPct  Float     @default(0.03)     // filtro anti-laterale: spread EMA50-200 min %
+  minFastMidPct    Float     @default(0.10)     // separazione minima EMA50-EMA100 (no crossing fresco)
   sessionFilter    Boolean   @default(false)    // solo London/NY
   analyticsResetAt DateTime?
   updatedAt        DateTime  @updatedAt
