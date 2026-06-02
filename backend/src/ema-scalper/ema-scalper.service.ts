@@ -181,20 +181,26 @@ export class EmaScalperService implements OnModuleInit {
 
     if (mode === 'live') {
       const pt = side === 'long' ? 1 : 2;
+      const tpPx = Number(this.exchange.priceToPrecision(cfg.symbol, tp));
+      const slPx = Number(this.exchange.priceToPrecision(cfg.symbol, sl));
       try {
         await this.exchange.setLeverage(cfg.leverage, cfg.symbol, { openType: 1, positionType: pt }).catch(() => {});
         if (side === 'long') await this.exchange.createMarketBuyOrder(cfg.symbol, qty, { openType: 1, positionType: 1, leverage: cfg.leverage });
         else await this.exchange.createMarketSellOrder(cfg.symbol, qty, { openType: 1, positionType: 2, leverage: cfg.leverage });
       } catch (e: any) { this.logger.warn(`[EMA LIVE] apertura saltata: ${e?.message?.slice(0, 60)}`); return; }
-      // ORDINI TP/SL sull'exchange: TP = limit reduceOnly · SL = trigger market reduceOnly.
-      // Eseguono nativamente quando toccati (no attesa del tick), visibili sul grafico.
-      const closeSide: 'buy' | 'sell' = side === 'long' ? 'sell' : 'buy';
-      const tpPx = Number(this.exchange.priceToPrecision(cfg.symbol, tp));
-      const slPx = Number(this.exchange.priceToPrecision(cfg.symbol, sl));
-      try { await this.exchange.createOrder(cfg.symbol, 'limit', closeSide, qty, tpPx, { reduceOnly: true, openType: 1, positionType: pt }); }
-      catch (e: any) { this.logger.warn(`[EMA LIVE] ordine TP: ${e?.message?.slice(0, 50)}`); }
-      try { await this.exchange.createOrder(cfg.symbol, 'market', closeSide, qty, undefined, { triggerPrice: slPx, reduceOnly: true, openType: 1, positionType: pt }); }
-      catch (e: any) { this.logger.warn(`[EMA LIVE] ordine SL: ${e?.message?.slice(0, 50)}`); }
+      // TP/SL ATTACCATI ALLA POSIZIONE (come live-trading): prendi il positionId, poi
+      // stoporder/place con vol + stopLossPrice + takeProfitPrice → colonna TP/SL su MEXC.
+      try {
+        await new Promise((r) => setTimeout(r, 800));
+        const pos = (await this.exchange.fetchPositions([cfg.symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0)[0];
+        const positionId = pos?.info?.positionId;
+        const posVol = Math.abs(Number(pos?.contracts ?? qty));
+        const mexcSymbol = (this.exchange.market(cfg.symbol) as any).id;
+        if (positionId) {
+          await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol: posVol, stopLossPrice: slPx, takeProfitPrice: tpPx });
+          this.logger.log(`[EMA LIVE] TP/SL attaccati alla posizione · posId ${positionId} · SL ${slPx} · TP ${tpPx}`);
+        } else { this.logger.warn('[EMA LIVE] positionId non trovato — SL/TP non attaccati'); }
+      } catch (e: any) { this.logger.warn(`[EMA LIVE] SL/TP posizione: ${e?.message?.slice(0, 70)}`); }
     }
 
     await this.prisma.emaScalperTrade.create({
