@@ -609,17 +609,19 @@ export class GridScannerService implements OnModuleInit {
       let price = this.candidates.find(c => c.symbol === bot.symbol)?.price;
       if (price == null) { try { price = Number((await this.swapExchange.fetchTicker(bot.symbol)).last); } catch {} }
       const positions = (await this.swapExchange.fetchPositions([bot.symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
+      let sumRealised = 0, sumUpnl = 0;
       for (const p of positions) {
         const c = Math.abs(Number(p.contracts));
-        const entry = Number((p.info as any)?.holdAvgPrice ?? p.entryPrice ?? price ?? 0);
-        const realised = Number((p.info as any)?.realised ?? 0);
-        const uPnl = price ? (bot.side === 'long' ? (price - entry) : (entry - price)) * c * cs : 0;
-        realClosePnl = realised + uPnl;
+        const e = Number((p.info as any)?.holdAvgPrice ?? p.entryPrice ?? price ?? 0);
+        const sgn = p.side === 'short' ? -1 : 1;          // direzione REALE della posizione
+        if (price) sumUpnl += (price - e) * sgn * c * cs;
+        sumRealised += Number((p.info as any)?.realised ?? 0);
         try {
           if (p.side === 'long') await this.swapExchange.createMarketSellOrder(bot.symbol, c, { reduceOnly: true });
           else await this.swapExchange.createMarketBuyOrder(bot.symbol, c, { reduceOnly: true });
         } catch (e: any) { this.logger.warn(`[GRID LIVE CLOSE] pos: ${e?.message?.slice(0, 40)}`); }
       }
+      if (positions.length) realClosePnl = sumRealised + sumUpnl;
     } catch (e: any) { this.logger.warn(`[GRID LIVE CLOSE] ${e?.message?.slice(0, 50)}`); }
     this.takeHits.delete(botId);
     await this.prisma.gridBot.update({
