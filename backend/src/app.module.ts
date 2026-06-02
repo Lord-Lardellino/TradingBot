@@ -16,6 +16,7 @@ import { AiBrainModule } from './ai-brain/ai-brain.module';
 import { GemmaModule } from './gemma/gemma.module';
 import { FundingArbModule } from './funding-arb/funding-arb.module';
 import { GridScannerModule } from './grid-scanner/grid-scanner.module';
+import { EmaScalperModule } from './ema-scalper/ema-scalper.module';
 
 @Module({
   imports: [
@@ -36,6 +37,7 @@ import { GridScannerModule } from './grid-scanner/grid-scanner.module';
     GemmaModule,
     FundingArbModule,
     GridScannerModule,
+    EmaScalperModule,
   ],
 })
 export class AppModule {}

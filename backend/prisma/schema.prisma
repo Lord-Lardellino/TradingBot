@@ -1126,3 +1126,45 @@ model GridBot {
   openedAt        DateTime  @default(now())
   closedAt        DateTime?
 }
+
+// ── 3 EMA Scalper (BTCUSDT 1m) ──────────────────────────────────────────────
+model EmaScalperConfig {
+  id               Int       @id @default(1)
+  enabled          Boolean   @default(true)
+  liveEnabled      Boolean   @default(false)   // toggle ordini reali su MEXC
+  symbol           String    @default("BTC/USDT:USDT")
+  timeframe        String    @default("1m")
+  emaFast          Int       @default(50)
+  emaMid           Int       @default(100)
+  emaSlow          Int       @default(200)
+  riskReward       Float     @default(2.0)      // TP = entry +/- R:R * rischio
+  capitalUsdt      Float     @default(20)       // margine per trade
+  leverage         Int       @default(5)
+  swingLookback    Int       @default(10)       // candele per swing low/high (SL)
+  pullbackLookback Int       @default(5)        // candele per rilevare il pullback
+  slopeLookback    Int       @default(3)        // candele per la pendenza EMA
+  minEmaSpreadPct  Float     @default(0.03)     // filtro anti-laterale: spread EMA min %
+  sessionFilter    Boolean   @default(false)    // solo London/NY
+  analyticsResetAt DateTime?
+  updatedAt        DateTime  @updatedAt
+}
+
+model EmaScalperTrade {
+  id          String    @id @default(cuid())
+  symbol      String
+  side        String    // long | short
+  mode        String    @default("sim")  // sim | live
+  entry       Float
+  stopLoss    Float
+  takeProfit  Float
+  qty         Float     // contratti
+  leverage    Int
+  riskUsd     Float     @default(0)       // rischio in USD (entry-SL)*qty*cs
+  status      String    @default("open")  // open | win | loss | manual
+  exitPrice   Float?
+  pnl         Float?
+  rMultiple   Float?    // multiplo di R realizzato
+  reason      String?   // tp | sl | manual | reset
+  openedAt    DateTime  @default(now())
+  closedAt    DateTime?
+}

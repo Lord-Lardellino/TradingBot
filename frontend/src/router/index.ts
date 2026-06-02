@@ -24,6 +24,12 @@ const router = createRouter({
           meta: { title: 'Grid Trading' },
         },
         {
+          path: 'ema-scalper',
+          name: 'ema-scalper',
+          component: () => import('@/pages/EmaScalper.vue'),
+          meta: { title: '3 EMA Scalper' },
+        },
+        {
           path: 'trades',
           name: 'trades',
           component: () => import('@/pages/Trades.vue'),

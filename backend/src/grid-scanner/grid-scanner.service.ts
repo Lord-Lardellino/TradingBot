@@ -19,9 +19,9 @@ export class GridScannerService implements OnModuleInit {
   private lastScanAt: string | null = null;
   private isScanning = false;
   private lastPrices = new Map<string, number>();  // per live monitor
-  // SIM fedele al live: traccia la posizione reale livello per livello.
-  // openLevels = prezzi dei livelli con posizione aperta (come gli ordini eseguiti).
-  private simPos = new Map<string, { openLevels: number[]; lastPrice: number }>();
+  // SIM fedele al live: posizione NETTA firmata (neutral grid) con costo medio.
+  // lots = contratti netti (>0 long, <0 short) · avgEntry = prezzo medio di carico.
+  private simPos = new Map<string, { lots: number; avgEntry: number; lastPrice: number }>();
   // Cooldown: coppie chiuse di recente → non riaprirle subito (rotazione)
   private recentlyClosed = new Map<string, number>();
   private readonly COOLDOWN_MS = 30 * 60 * 1000;  // 30 minuti
@@ -193,69 +193,65 @@ export class GridScannerService implements OnModuleInit {
 
         const cs = bot.contractSize || 1;
         const spacingPrice = (bot.rangeHigh - bot.rangeLow) / bot.gridLevels;
-        const adxNow = cand?.adx ?? 0;
         const pricePos = (price - bot.rangeLow) / ((bot.rangeHigh - bot.rangeLow) || 1);
+        const cpl = bot.contractsPerLevel;
 
-        // ── SIMULATORE FEDELE AL LIVE: traccia la posizione livello per livello ──
-        // Ogni attraversamento di un livello = un ordine eseguito (come nel live).
-        // Short: sale→apre short al livello; scende→chiude (profitto = spacing). Long: speculare.
-        const st = this.simPos.get(bot.id) ?? { openLevels: [], lastPrice: bot.entryPrice };
-        const fee = bot.contractsPerLevel * cs * price * 0.0004;
+        // ── NEUTRAL GRID (come MEXC): scendendo COMPRA (long), salendo VENDE (short).
+        //    Posizione NETTA firmata, P&L a COSTO MEDIO esatto. Profitto = ogni chiusura
+        //    completata (spacing − fee). Identico al live. ──────────────────────────
+        const st = this.simPos.get(bot.id) ?? { lots: 0, avgEntry: price, lastPrice: bot.entryPrice };
+        const feeRate = 0.0002;  // maker (ordini limite della griglia)
         let cyclesAdd = 0, realizedAdd = 0;
-        for (let i = 1; i < bot.gridLevels; i++) {
-          const L = bot.rangeLow + spacingPrice * i;
-          const up = st.lastPrice < L && price >= L;
-          const down = st.lastPrice > L && price <= L;
-          if (bot.side === 'short') {
-            if (up) st.openLevels.push(L);  // sale → apre short a L
-            if (down) { const idx = st.openLevels.findIndex(o => Math.abs(o - (L + spacingPrice)) < spacingPrice * 0.1); if (idx >= 0) { st.openLevels.splice(idx, 1); realizedAdd += spacingPrice * bot.contractsPerLevel * cs - fee; cyclesAdd++; } }
-          } else {
-            if (down) st.openLevels.push(L);  // scende → apre long a L
-            if (up) { const idx = st.openLevels.findIndex(o => Math.abs(o - (L - spacingPrice)) < spacingPrice * 0.1); if (idx >= 0) { st.openLevels.splice(idx, 1); realizedAdd += spacingPrice * bot.contractsPerLevel * cs - fee; cyclesAdd++; } }
+        const lo = Math.min(st.lastPrice, price), hi = Math.max(st.lastPrice, price);
+        const crossed: number[] = [];
+        for (let i = 1; i < bot.gridLevels; i++) { const L = bot.rangeLow + spacingPrice * i; if (L > lo && L <= hi) crossed.push(L); }
+        const goingUp = price >= st.lastPrice;
+        crossed.sort((a, b) => goingUp ? a - b : b - a);
+        for (const L of crossed) {
+          const fee = cpl * cs * L * feeRate;
+          if (goingUp) {                                   // VENDI cpl @ L
+            if (st.lots > 0) { const q = Math.min(cpl, st.lots); realizedAdd += (L - st.avgEntry) * q * cs - fee; st.lots -= q; if (cpl - q > 0) { st.avgEntry = L; st.lots -= (cpl - q); } cyclesAdd++; }
+            else { st.avgEntry = ((-st.lots) * st.avgEntry + cpl * L) / ((-st.lots) + cpl); st.lots -= cpl; realizedAdd -= fee; }
+          } else {                                         // COMPRA cpl @ L
+            if (st.lots < 0) { const q = Math.min(cpl, -st.lots); realizedAdd += (st.avgEntry - L) * q * cs - fee; st.lots += q; if (cpl - q > 0) { st.avgEntry = L; st.lots += (cpl - q); } cyclesAdd++; }
+            else { st.avgEntry = (st.lots * st.avgEntry + cpl * L) / (st.lots + cpl); st.lots += cpl; realizedAdd -= fee; }
           }
         }
         st.lastPrice = price;
         this.simPos.set(bot.id, st);
-        if (cyclesAdd > 0) {
+        const uPnl = (price - st.avgEntry) * st.lots * cs;
+        if (realizedAdd !== 0 || cyclesAdd > 0) {
           await this.prisma.gridBot.update({ where: { id: bot.id }, data: { realizedPnl: { increment: realizedAdd }, filledCycles: { increment: cyclesAdd } } });
           bot.realizedPnl += realizedAdd;
         }
 
-        // Unrealized della posizione simulata (avg entry dei livelli aperti), come il live
-        const posCount = st.openLevels.length;
-        const avgEntry = posCount ? st.openLevels.reduce((a, b) => a + b, 0) / posCount : price;
-        const posCoin = posCount * bot.contractsPerLevel * cs;
-        const uPnl = bot.side === 'short' ? (avgEntry - price) * posCoin : (price - avgEntry) * posCoin;
-        const totalPnl = bot.realizedPnl + uPnl;
-
-        // ── USCITE identiche al live: take su PnL TOTALE · stop anticipato · break · trend ──
-        const target = bot.capitalUsdt * (cfg.takeProfitPct / 100);
-        if (totalPnl >= target) { await this.closeSimGrid(bot.id, 'take_profit', price); this.simPos.delete(bot.id); continue; }
-        const stopUp   = bot.side === 'short' && pricePos > cfg.stopThreshold;
-        const stopDown = bot.side === 'long'  && pricePos < (1 - cfg.stopThreshold);
-        if (stopUp || stopDown) { await this.closeSimGrid(bot.id, stopUp ? 'stop_early_up' : 'stop_early_down', price); this.simPos.delete(bot.id); continue; }
-        if (price > bot.rangeHigh) { await this.closeSimGrid(bot.id, 'break_up', price); this.simPos.delete(bot.id); continue; }
-        if (price < bot.rangeLow)  { await this.closeSimGrid(bot.id, 'break_down', price); this.simPos.delete(bot.id); continue; }
-        if (cand && adxNow > cfg.exitAdx) { await this.closeSimGrid(bot.id, 'trend_adx', price); this.simPos.delete(bot.id); continue; }
+        // ── USCITE (come MEXC + safety stop): range break + stop sui bordi. NIENTE take
+        //    sull'unrealized. Alla chiusura realizziamo anche l'unrealized residuo.
+        const finalize = async (reason: string) => {
+          await this.prisma.gridBot.update({ where: { id: bot.id }, data: { realizedPnl: { increment: uPnl } } });
+          await this.closeSimGrid(bot.id, reason, price); this.simPos.delete(bot.id);
+        };
+        if (price > bot.rangeHigh) { await finalize('break_up'); continue; }
+        if (price < bot.rangeLow)  { await finalize('break_down'); continue; }
+        if (pricePos > cfg.stopThreshold)       { await finalize('stop_early_up'); continue; }
+        if (pricePos < (1 - cfg.stopThreshold)) { await finalize('stop_early_down'); continue; }
       }
 
-      // 2. Auto-apertura SIM: mantieni maxLong long + maxShort short (conta solo le SIM).
-      //    Esclude le coppie già aperte in QUALSIASI modo (sim o live) per non duplicarle.
+      // 2. Auto-apertura SIM: griglie NEUTRAL sui migliori candidati in range (conta
+      //    solo le SIM). Esclude coppie già aperte in QUALSIASI modo (sim o live).
       if (cfg.autoTradeEnabled) {
         const allOpen = await this.prisma.gridBot.findMany({ where: { status: 'open' } });
         const simOpen = allOpen.filter(b => b.mode === 'sim');
-        const openLong = simOpen.filter(b => b.side === 'long');
-        const openShort = simOpen.filter(b => b.side === 'short');
         const openSymbols = new Set(allOpen.map(b => b.symbol));  // include anche le live
+        const maxNeutral = cfg.maxLongGrids + cfg.maxShortGrids;
 
-        const sugg = this.getSuggestions(cfg.maxLongGrids + 3, cfg.maxShortGrids + 3);
-        for (const c of sugg.long) {
-          if (openLong.length >= cfg.maxLongGrids) break;
-          if (!openSymbols.has(c.symbol) && !this.inCooldown(c.symbol)) { await this.openSimGrid(c.symbol, 'long'); openSymbols.add(c.symbol); openLong.push({} as any); }
-        }
-        for (const c of sugg.short) {
-          if (openShort.length >= cfg.maxShortGrids) break;
-          if (!openSymbols.has(c.symbol) && !this.inCooldown(c.symbol)) { await this.openSimGrid(c.symbol, 'short'); openSymbols.add(c.symbol); openShort.push({} as any); }
+        const sugg = this.getSuggestions(maxNeutral + 3, maxNeutral + 3);
+        const cands = [...sugg.long, ...sugg.short]
+          .filter((c, i, arr) => arr.findIndex(x => x.symbol === c.symbol) === i)
+          .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        for (const c of cands) {
+          if (simOpen.length >= maxNeutral) break;
+          if (!openSymbols.has(c.symbol) && !this.inCooldown(c.symbol)) { await this.openSimGrid(c.symbol, 'neutral'); openSymbols.add(c.symbol); simOpen.push({} as any); }
         }
       }
     } catch (e: any) {
@@ -264,7 +260,7 @@ export class GridScannerService implements OnModuleInit {
   }
 
   // ── Apri una griglia simulata dal candidato in range ──────────────────────
-  async openSimGrid(symbol: string, side: 'long' | 'short') {
+  async openSimGrid(symbol: string, side: 'long' | 'short' | 'neutral') {
     const cand = this.candidates.find(c => c.symbol === symbol);
     if (!cand) throw new Error(`${symbol} non è in range (nessun candidato)`);
     const cfg = await this.getConfig();
@@ -286,7 +282,7 @@ export class GridScannerService implements OnModuleInit {
         status: 'open', contractSize: cs, contractsPerLevel,
       },
     });
-    this.simPos.set(bot.id, { openLevels: [], lastPrice: price });
+    this.simPos.set(bot.id, { lots: 0, avgEntry: price, lastPrice: price });
     this.logger.log(`[GRID SIM] aperta ${side.toUpperCase()} ${cand.base} · leva AUTO ${leverage}x · ${liveLevels} livelli · range ${low}-${high}`);
     return bot;
   }
@@ -320,21 +316,20 @@ export class GridScannerService implements OnModuleInit {
         try { await this.checkLiveGrid(bot); } catch (e: any) { this.logger.warn(`[GRID LIVE] ${bot.symbol}: ${e?.message?.slice(0, 50)}`); }
       }
 
-      // Mantieni sempre 1 griglia LIVE LONG + 1 SHORT (se auto-trade ON e margine ok)
+      // Mantieni 1 griglia LIVE NEUTRAL (per validarla dal vivo con margine piccolo).
       const cfg = await this.getConfig();
-      if (cfg.autoTradeEnabled) {
-        const sugg = this.getSuggestions(5, 5);
+      if (cfg.autoTradeEnabled && bots.length < 1) {
+        const sugg = this.getSuggestions(6, 6);
         const openSym = new Set(bots.map(b => b.symbol));
-        const haveLong  = bots.some(b => b.side === 'long');
-        const haveShort = bots.some(b => b.side === 'short');
-        const toOpen: { c: any; side: 'long' | 'short' }[] = [];
-        if (!haveLong)  { const c = sugg.long.find(x => !openSym.has(x.symbol) && !this.inCooldown(x.symbol));  if (c) toOpen.push({ c, side: 'long' }); }
-        if (!haveShort) { const c = sugg.short.find(x => !openSym.has(x.symbol) && !this.inCooldown(x.symbol)); if (c) toOpen.push({ c, side: 'short' }); }
-        for (const { c, side } of toOpen) {
+        const cands = [...sugg.long, ...sugg.short]
+          .filter((c, i, arr) => arr.findIndex(x => x.symbol === c.symbol) === i)
+          .sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+        const c = cands.find(x => !openSym.has(x.symbol) && !this.inCooldown(x.symbol));
+        if (c) {
           try {
-            await this.openLiveGrid(c.symbol, side, cfg.capitalPerGrid, 10);
-            this.logger.log(`[GRID LIVE] auto-mantenimento: aperta ${side} ${c.base}`);
-          } catch (e: any) { this.logger.warn(`[GRID LIVE] auto-apertura ${side} saltata: ${e?.message?.slice(0, 50)}`); }
+            await this.openLiveGrid(c.symbol, 'neutral', cfg.capitalPerGrid, 10);
+            this.logger.log(`[GRID LIVE] auto-mantenimento: aperta NEUTRAL ${c.base}`);
+          } catch (e: any) { this.logger.warn(`[GRID LIVE] auto-apertura neutral saltata: ${e?.message?.slice(0, 50)}`); }
         }
       }
     } catch (e: any) { this.logger.warn(`[GRID LIVE] monitor: ${e?.message}`); }
@@ -342,54 +337,56 @@ export class GridScannerService implements OnModuleInit {
 
   private async checkLiveGrid(bot: any) {
     const orders: any[] = bot.liveOrders ? JSON.parse(bot.liveOrders) : [];
-    if (!orders.length) return;
     const cs = bot.contractSize || 1;
     const spacing = (bot.rangeHigh - bot.rangeLow) / bot.gridLevels;
+    const center = (bot.rangeLow + bot.rangeHigh) / 2;
+    const neutral = bot.side === 'neutral';
     const cfg = await this.getConfig();
 
     let price = this.candidates.find(c => c.symbol === bot.symbol)?.price;
     if (price == null) { try { price = Number((await this.swapExchange.fetchTicker(bot.symbol)).last); } catch { return; } }
     const pricePos = (price - bot.rangeLow) / ((bot.rangeHigh - bot.rangeLow) || 1);
 
-    // ── POSIZIONE REALE (un solo fetch): entry, contratti, unrealized e REALIZZATO
-    //    VERO da MEXC (info.realised = P&L trading realizzato, NON il funding). ──────
-    let uPnl = 0, posContracts = 0, realised = 0, entry = price;
+    // ── POSIZIONE REALE (un solo fetch): netta FIRMATA (+long/-short), entry, e
+    //    REALIZZATO VERO da MEXC (info.realised = P&L trading, NON il funding). ──────
+    let posContracts = 0, netSigned = 0, realised = 0, uPnl = 0;
     try {
       const ps = (await this.swapExchange.fetchPositions([bot.symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
-      if (ps.length) {
-        const p = ps[0];
-        entry = Number((p.info as any)?.holdAvgPrice ?? p.entryPrice ?? price);
-        posContracts = Math.abs(Number(p.contracts));
-        const coin = posContracts * cs;
-        uPnl = bot.side === 'long' ? (price - entry) * coin : (entry - price) * coin;
-        realised = Number((p.info as any)?.realised ?? 0);
+      for (const p of ps) {  // somma firmata su tutte le posizioni (gestisce anche hedge)
+        const e = Number((p.info as any)?.holdAvgPrice ?? p.entryPrice ?? price);
+        const c = Math.abs(Number(p.contracts));
+        const sgn = p.side === 'short' ? -1 : 1;
+        netSigned += c * sgn;
+        uPnl += (price - e) * c * sgn * cs;
+        realised += Number((p.info as any)?.realised ?? 0);
       }
+      posContracts = Math.abs(netSigned);
     } catch {}
-    const realTotal = realised + uPnl;   // P&L REALE che incasseremmo chiudendo ORA
+    const realTotal = realised + uPnl;
 
-    // ── USCITE (in ordine di priorità) ──────────────────────────────────────
-    // 1. TAKE PROFIT sul P&L REALE (realizzato MEXC + unrealized vero), con DEBOUNCE
-    //    anti-wick: deve restare >= target per 2 tick di fila → niente chiusure su un
-    //    picco momentaneo che poi rientra (era il bug: take su wick, incasso in perdita).
+    // DIREZIONE EFFETTIVA: neutral = long sotto il centro / short sopra (segue la
+    // posizione netta; se flat decide dal centro). Le direzionali usano il loro side.
+    const eff: 'long' | 'short' = neutral
+      ? (netSigned > 0 ? 'long' : netSigned < 0 ? 'short' : (price < center ? 'long' : 'short'))
+      : (bot.side as 'long' | 'short');
+
+    // ── USCITE ──────────────────────────────────────────────────────────────
+    // TAKE PROFIT su PnL reale (SOLO direzionali; il neutral NON chiude sull'unrealized,
+    // come MEXC) con debounce anti-wick.
     const target = bot.capitalUsdt * (cfg.takeProfitPct / 100);
-    if (realTotal >= target) {
+    if (!neutral && realTotal >= target) {
       const hits = (this.takeHits.get(bot.id) ?? 0) + 1;
       this.takeHits.set(bot.id, hits);
       if (hits >= 2) { this.takeHits.delete(bot.id); await this.closeLiveGrid(bot.id, 'take_profit'); return; }
     } else { this.takeHits.delete(bot.id); }
-    // 2. STOP ANTICIPATO sul lato SFAVOREVOLE (prima del bordo, perdita piccola):
-    //    short → temi l'alto; long → temi il basso. Esci alla soglia interna.
-    const stopUp   = bot.side === 'short' && pricePos > cfg.stopThreshold;
-    const stopDown = bot.side === 'long'  && pricePos < (1 - cfg.stopThreshold);
-    if (stopUp || stopDown) {
-      await this.closeLiveGrid(bot.id, stopUp ? 'stop_early_up' : 'stop_early_down');
-      return;
-    }
-    // 3. BREAK pieno fuori range (fallback)
-    if (price > bot.rangeHigh || price < bot.rangeLow) {
-      await this.closeLiveGrid(bot.id, price > bot.rangeHigh ? 'break_up' : 'break_down');
-      return;
-    }
+    // STOP di sicurezza sui bordi: neutral teme ENTRAMBI i lati (carico long in basso,
+    // short in alto); direzionale solo il lato sfavorevole.
+    const stopUp   = (neutral || bot.side === 'short') && pricePos > cfg.stopThreshold;
+    const stopDown = (neutral || bot.side === 'long')  && pricePos < (1 - cfg.stopThreshold);
+    if (stopUp || stopDown) { await this.closeLiveGrid(bot.id, stopUp ? 'stop_early_up' : 'stop_early_down'); return; }
+    // BREAK fuori range
+    if (price > bot.rangeHigh || price < bot.rangeLow) { await this.closeLiveGrid(bot.id, price > bot.rangeHigh ? 'break_up' : 'break_down'); return; }
+    if (!orders.length && !neutral) return;
 
     // ── Match per PREZZO (l'id da create è rotto su MEXC): un ordine salvato senza
     //    ordine aperto al suo prezzo (entro mezzo spacing) = è stato RIEMPITO. ──────
@@ -403,64 +400,63 @@ export class GridScannerService implements OnModuleInit {
     const has  = (p: number, side?: 'buy' | 'sell') => newOrders.some(o => Math.abs(o.price - p) < tol && (!side || o.side === side));
     const keep = (p: number, side: 'buy' | 'sell') => { if (!has(p, side)) newOrders.push({ price: p, side }); };
 
-    // 1) Riporta gli ordini ancora aperti; conta SOLO i fill di chiusura come ATTIVITÀ
-    //    (non come profitto: il profitto vero è realised di MEXC, sopra).
+    // 1) Riporta gli ordini ancora aperti; conta i fill di chiusura come ATTIVITÀ.
     let cyclesAdd = 0;
     for (const ord of orders) {
       if (isOpenAt(ord.price)) { keep(ord.price, ord.side); continue; }
-      const isClose = (bot.side === 'long' && ord.side === 'sell') || (bot.side === 'short' && ord.side === 'buy');
+      const isClose = (eff === 'long' && ord.side === 'sell') || (eff === 'short' && ord.side === 'buy');
       if (isClose) cyclesAdd += 1;
     }
 
-    // 2) Livelli equidistanti divisi sopra/sotto il prezzo, con DEAD-ZONE di mezzo
-    //    spacing attorno al prezzo: MAI un ordine sul livello appena preso (il centro).
+    // 2) Livelli equidistanti sopra/sotto il prezzo, con DEAD-ZONE di mezzo spacing:
+    //    MAI un ordine sul livello appena preso (il centro).
     const above: number[] = [], below: number[] = [];
     for (let i = 1; i < bot.gridLevels; i++) {
       const L = px(bot.rangeLow + spacing * i);
       if (Math.abs(L - price) < spacing * 0.5) continue;
       if (L > price) above.push(L); else below.push(L);
     }
-    above.sort((a, b) => a - b);   // più vicino al prezzo prima
+    above.sort((a, b) => a - b);
     below.sort((a, b) => b - a);
 
-    // 3) CHUNK IN MANO → un solo ordine di CHIUSURA per ciascuno, a 1 tacca dal prezzo.
-    //    long: SELL reduceOnly sopra · short: BUY reduceOnly sotto. Mai più dei chunk
-    //    realmente in posizione (niente ordini fantasma).
-    const chunks      = Math.round(posContracts / cpl);
-    const closeSide   = bot.side === 'long' ? 'sell' : 'buy';
-    const closeLevels = bot.side === 'long' ? above : below;
+    // 3) CHIUSURE dei chunk in mano (reduceOnly), 1 per chunk, gated dalla posizione
+    //    reale. eff long → SELL sopra (pt1) · eff short → BUY sotto (pt2).
+    const chunks       = Math.round(posContracts / cpl);
+    const closeSide: 'buy' | 'sell' = eff === 'long' ? 'sell' : 'buy';
+    const closeLevels  = eff === 'long' ? above : below;
+    const closePt      = eff === 'long' ? 1 : 2;
     let placed = newOrders.filter(o => o.side === closeSide).length;
     for (const L of closeLevels) {
       if (placed >= chunks) break;
       if (has(L)) continue;
       try {
-        if (bot.side === 'long') await this.swapExchange.createLimitSellOrder(bot.symbol, cpl, L, { openType: 1, positionType: 1, leverage: bot.leverage, reduceOnly: true });
-        else                     await this.swapExchange.createLimitBuyOrder(bot.symbol, cpl, L, { openType: 1, positionType: 2, leverage: bot.leverage, reduceOnly: true });
-        keep(L, closeSide as any); placed++;
+        if (closeSide === 'sell') await this.swapExchange.createLimitSellOrder(bot.symbol, cpl, L, { openType: 1, positionType: closePt, leverage: bot.leverage, reduceOnly: true });
+        else                      await this.swapExchange.createLimitBuyOrder(bot.symbol, cpl, L, { openType: 1, positionType: closePt, leverage: bot.leverage, reduceOnly: true });
+        keep(L, closeSide); placed++;
       } catch (e: any) { this.logger.warn(`[GRID LIVE] ${closeSide}@${L}: ${e?.message?.slice(0, 40)}`); }
     }
 
-    // 4) ENTRATE dense SENZA ricomprare al centro: long → BUY sotto · short → SELL sopra,
-    //    MA salto un livello L se ne sto già tenendo il chunk (c'è già la sua CHIUSURA
-    //    a L±1 tacca) → non ripiazzo mai un'entrata sul livello appena preso.
-    const openSide   = bot.side === 'long' ? 'buy' : 'sell';
-    const openLevels = bot.side === 'long' ? below : above;
+    // 4) ENTRATE dense SENZA riaprire al centro: eff long → BUY sotto (pt1 apre long) ·
+    //    eff short → SELL sopra (pt2 apre short). Salto un livello se ne tengo già il
+    //    chunk (chiusura presente a ±1 tacca) → mai una nuova entrata sul livello preso.
+    const openSide: 'buy' | 'sell' = eff === 'long' ? 'buy' : 'sell';
+    const openLevels = eff === 'long' ? below : above;
+    const openPt     = eff === 'long' ? 1 : 2;
     for (const L of openLevels) {
       if (has(L)) continue;
-      const closeOfThis = bot.side === 'long' ? px(L + spacing) : px(L - spacing);
-      if (has(closeOfThis, closeSide as any)) continue;   // chunk già in mano qui → non ricomprare
+      const closeOfThis = eff === 'long' ? px(L + spacing) : px(L - spacing);
+      if (has(closeOfThis, closeSide)) continue;
       try {
-        if (bot.side === 'long') await this.swapExchange.createLimitBuyOrder(bot.symbol, cpl, L, { openType: 1, positionType: 1, leverage: bot.leverage });
-        else                     await this.swapExchange.createLimitSellOrder(bot.symbol, cpl, L, { openType: 1, positionType: 2, leverage: bot.leverage });
-        keep(L, openSide as any);
+        if (openSide === 'buy') await this.swapExchange.createLimitBuyOrder(bot.symbol, cpl, L, { openType: 1, positionType: openPt, leverage: bot.leverage });
+        else                    await this.swapExchange.createLimitSellOrder(bot.symbol, cpl, L, { openType: 1, positionType: openPt, leverage: bot.leverage });
+        keep(L, openSide);
       } catch (e: any) { this.logger.warn(`[GRID LIVE] ${openSide}@${L}: ${e?.message?.slice(0, 40)}`); }
     }
 
-    // stato reale della griglia + P&L REALIZZATO VERO (realised di MEXC), ordinato per
-    // prezzo decrescente. realizedPnl viene SETTATO (non incrementato) al valore vero.
+    // stato reale + P&L REALIZZATO VERO (realised di MEXC), ordinato per prezzo decr.
     newOrders.sort((a, b) => b.price - a.price);
     if (cyclesAdd > 0 || Math.abs(realised - bot.realizedPnl) > 1e-6 || JSON.stringify(newOrders) !== JSON.stringify(orders)) {
-      if (cyclesAdd > 0) this.logger.log(`[GRID LIVE] ${bot.symbol.replace('/USDT:USDT','')} ${cyclesAdd} chiusure · realizzato $${realised.toFixed(4)} · unrealized $${uPnl.toFixed(4)}`);
+      if (cyclesAdd > 0) this.logger.log(`[GRID LIVE] ${bot.symbol.replace('/USDT:USDT','')} ${eff} ${cyclesAdd} chiusure · realizzato $${realised.toFixed(4)} · uPnl $${uPnl.toFixed(4)}`);
       await this.prisma.gridBot.update({
         where: { id: bot.id },
         data: { liveOrders: JSON.stringify(newOrders), realizedPnl: realised, filledCycles: { increment: cyclesAdd } },
@@ -469,7 +465,7 @@ export class GridScannerService implements OnModuleInit {
   }
 
   // ── Apri griglia LIVE BIDIREZIONALE: posizione base + buy sotto + sell sopra ─
-  async openLiveGrid(symbol: string, side: 'long' | 'short', marginUsdt: number, liveLevels = 6) {
+  async openLiveGrid(symbol: string, side: 'long' | 'short' | 'neutral', marginUsdt: number, liveLevels = 6) {
     const cand = this.candidates.find(c => c.symbol === symbol);
     if (!cand) throw new Error(`${symbol} non è in range`);
     const cfg = await this.getConfig();
@@ -520,13 +516,26 @@ export class GridScannerService implements OnModuleInit {
     const realMarginTotal = (realNotionalPerLevel * totalOrders) / leverage;
     if (realNotionalPerLevel < 1) throw new Error(`notional/livello ${realNotionalPerLevel.toFixed(2)}$ < minimo 1$ — aumenta margine`);
 
-    try { await this.swapExchange.setLeverage(leverage, symbol, { openType: 1, positionType: side === 'long' ? 1 : 2 }); } catch {}
+    const neutralEff: 'long' | 'short' = price < (low + high) / 2 ? 'long' : 'short';
+    const levPt = side === 'neutral' ? (neutralEff === 'long' ? 1 : 2) : (side === 'long' ? 1 : 2);
+    try { await this.swapExchange.setLeverage(leverage, symbol, { openType: 1, positionType: levPt }); } catch {}
 
     const liveOrders: any[] = [];
 
     // NB: l'id da createLimitOrder è rotto su MEXC → salvo solo {price, side} e il
     // monitor confronta per PREZZO (affidabile) con fetchOpenOrders.
-    if (side === 'long') {
+    if (side === 'neutral') {
+      // NEUTRAL: parte FLAT (nessuna base). Mette l'intera scala: BUY sotto il prezzo
+      // (apre long, pt1) + SELL sopra (apre short, pt2). In one-way mode MEXC netta i
+      // fill → posizione long sotto il centro, short sopra. Il monitor gestisce le
+      // chiusure accoppiate. Se l'account è one-way puro e rifiuta un lato, si vede dai log.
+      for (const l of below) {
+        try { await this.swapExchange.createLimitBuyOrder(symbol, contractsPerLevel, l, { openType: 1, positionType: 1, leverage }); liveOrders.push({ price: l, side: 'buy' }); } catch (e: any) { this.logger.warn(`[GRID OPEN] buy@${l}: ${e?.message?.slice(0,40)}`); }
+      }
+      for (const l of above) {
+        try { await this.swapExchange.createLimitSellOrder(symbol, contractsPerLevel, l, { openType: 1, positionType: 2, leverage }); liveOrders.push({ price: l, side: 'sell' }); } catch (e: any) { this.logger.warn(`[GRID OPEN] sell@${l}: ${e?.message?.slice(0,40)}`); }
+      }
+    } else if (side === 'long') {
       const baseContracts = contractsPerLevel * above.length;  // base = poter vendere ai SELL sopra
       if (baseContracts > 0) {
         try { await this.swapExchange.createMarketBuyOrder(symbol, baseContracts, { openType: 1, positionType: 1, leverage }); }
