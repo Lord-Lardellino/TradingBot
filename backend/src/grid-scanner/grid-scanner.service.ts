@@ -231,6 +231,7 @@ export class GridScannerService implements OnModuleInit {
           await this.prisma.gridBot.update({ where: { id: bot.id }, data: { realizedPnl: { increment: uPnl } } });
           await this.closeSimGrid(bot.id, reason, price); this.simPos.delete(bot.id);
         };
+        if (cand && (cand.adx ?? 0) > cfg.exitAdx) { await finalize('trend_adx'); continue; }
         if (price > bot.rangeHigh) { await finalize('break_up'); continue; }
         if (price < bot.rangeLow)  { await finalize('break_down'); continue; }
         if (pricePos > cfg.stopThreshold)       { await finalize('stop_early_up'); continue; }
@@ -267,8 +268,8 @@ export class GridScannerService implements OnModuleInit {
     // STESSI parametri del live: livelli DINAMICI, leva AUTO, contractsPerLevel.
     const price = cand.price, low = cand.rangeLow, high = cand.rangeHigh;
     const rangePct = ((high - low) / price) * 100;
-    const liveLevels = Math.max(10, Math.min(30, Math.round(rangePct / cfg.gridSpacingPct)));
-    const leverage = Math.max(2, Math.min(5, Math.floor(100 / (rangePct * 2)) || 2));
+    const liveLevels = Math.max(6, Math.min(20, Math.round(rangePct / cfg.gridSpacingPct)));  // spacing più largo = ciclo più grosso
+    const leverage = Math.max(2, Math.min(3, Math.floor(100 / (rangePct * 2)) || 2));  // cap 3x
     let cs = 1, minContracts = 1;
     try { const m = this.swapExchange.market(symbol); cs = Number((m as any)?.contractSize ?? 1) || 1; minContracts = Number((m as any)?.limits?.amount?.min ?? 1) || 1; } catch {}
     const totalOrders = Math.max(1, liveLevels - 1);
@@ -379,6 +380,17 @@ export class GridScannerService implements OnModuleInit {
       this.takeHits.set(bot.id, hits);
       if (hits >= 2) { this.takeHits.delete(bot.id); await this.closeLiveGrid(bot.id, 'take_profit'); return; }
     } else { this.takeHits.delete(bot.id); }
+    // USCITA TREND (chiave per la profittabilità): appena il mercato inizia a trendare
+    // (ADX alto) chiudo la griglia PRIMA di accumulare la grossa perdita direzionale.
+    // Se la coppia è uscita dai candidati (ha trendato fuori range) calcolo l'ADX al volo.
+    let candAdx = this.candidates.find(c => c.symbol === bot.symbol)?.adx;
+    if (candAdx == null) {
+      try {
+        const oh = await this.swapExchange.fetchOHLCV(bot.symbol, cfg.timeframe || '15m', undefined, 60);
+        candAdx = this.calcADX(oh.map((c: any) => +c[2]), oh.map((c: any) => +c[3]), oh.map((c: any) => +c[4]));
+      } catch { candAdx = 0; }
+    }
+    if ((candAdx ?? 0) > cfg.exitAdx) { await this.closeLiveGrid(bot.id, 'trend_adx'); return; }
     // STOP di sicurezza sui bordi: neutral teme ENTRAMBI i lati (carico long in basso,
     // short in alto); direzionale solo il lato sfavorevole.
     const stopUp   = (neutral || bot.side === 'short') && pricePos > cfg.stopThreshold;
@@ -478,7 +490,7 @@ export class GridScannerService implements OnModuleInit {
     const rangePct = ((high - low) / price) * 100;
     // NUMERO LIVELLI DINAMICO: si adatta al range ma sempre DENSO (min 10 livelli,
     // come prima). Spacing target ~gridSpacingPct % → range largo = più livelli.
-    liveLevels = Math.max(10, Math.min(30, Math.round(rangePct / cfg.gridSpacingPct)));
+    liveLevels = Math.max(6, Math.min(20, Math.round(rangePct / cfg.gridSpacingPct)));  // spacing più largo = ciclo più grosso
     const spacing = (high - low) / liveLevels;
     const pricePos = (price - low) / ((high - low) || 1);
 
@@ -490,7 +502,7 @@ export class GridScannerService implements OnModuleInit {
     // PERDITA al break (la leva amplifica la perdita: posizione × movimento × leva).
     // 5x è il compromesso: profitto/ciclo decente, perdita break gestibile.
     const safeLeverage = Math.floor(100 / (rangePct * 2));
-    const leverage = Math.max(2, Math.min(5, safeLeverage || 2));
+    const leverage = Math.max(2, Math.min(3, safeLeverage || 2));  // cap 3x: perdita break più piccola
     const liquidationPct = +(100 / leverage).toFixed(1);
 
     // 2. Griglia FISSA ancorata al range: livelli sempre agli stessi prezzi
