@@ -83,13 +83,14 @@ export class EmaScalperService implements OnModuleInit {
       // nelle ultime 2 candele, SENZA rompere la EMA lenta. Ingresso = candela di RIGETTO
       // nella direzione del trend (verde sopra la EMA per long, rossa sotto per short).
       const pb = cfg.pullbackLookback;
+      const tol = 0.0015;  // tolleranza tocco EMA50: il massimo/minimo entro 0,15% conta come test
       const heldSlowLong  = lows.slice(i - pb + 1, i + 1).every((lw, k) => lw > emaS[i - pb + 1 + k]);
-      const touchedFastLong = lows[i] <= emaF[i] || lows[i - 1] <= emaF[i - 1];
+      const touchedFastLong = lows[i] <= emaF[i] * (1 + tol) || lows[i - 1] <= emaF[i - 1] * (1 + tol);
       const triggerLong = touchedFastLong && closes[i] > emaF[i] && closes[i] > opens[i];
       const setupLong = trend === 'up' && heldSlowLong && triggerLong;
 
       const heldSlowShort = highs.slice(i - pb + 1, i + 1).every((hg, k) => hg < emaS[i - pb + 1 + k]);
-      const touchedFastShort = highs[i] >= emaF[i] || highs[i - 1] >= emaF[i - 1];
+      const touchedFastShort = highs[i] >= emaF[i] * (1 - tol) || highs[i - 1] >= emaF[i - 1] * (1 - tol);
       const triggerShort = touchedFastShort && closes[i] < emaF[i] && closes[i] < opens[i];
       const setupShort = trend === 'down' && heldSlowShort && triggerShort;
 
