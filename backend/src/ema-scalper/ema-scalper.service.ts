@@ -78,18 +78,20 @@ export class EmaScalperService implements OnModuleInit {
       if (!choppy && upAligned && upSlope) trend = 'up';
       else if (!choppy && downAligned && downSlope) trend = 'down';
 
-      // ── PULLBACK + INGRESSO sulla candela chiusa i ─────────────────────────
+      // ── PULLBACK + INGRESSO (candela chiusa i) ─────────────────────────────
+      // Pullback = il prezzo TORNA A TESTARE la EMA veloce (anche solo di stoppino/wick)
+      // nelle ultime 2 candele, SENZA rompere la EMA lenta. Ingresso = candela di RIGETTO
+      // nella direzione del trend (verde sopra la EMA per long, rossa sotto per short).
       const pb = cfg.pullbackLookback;
-      // long: in pb candele il prezzo ha toccato/sceso la EMA veloce SENZA rompere la lenta
-      const touchedFastLong = lows.slice(i - pb + 1, i + 1).some((lw, k) => lw <= emaF[i - pb + 1 + k]);
-      const heldSlowLong    = lows.slice(i - pb + 1, i + 1).every((lw, k) => lw > emaS[i - pb + 1 + k]);
-      const triggerLong = closes[i] > emaF[i] && closes[i] > opens[i] && closes[i - 1] <= emaF[i - 1];
-      const setupLong = trend === 'up' && touchedFastLong && heldSlowLong && triggerLong;
+      const heldSlowLong  = lows.slice(i - pb + 1, i + 1).every((lw, k) => lw > emaS[i - pb + 1 + k]);
+      const touchedFastLong = lows[i] <= emaF[i] || lows[i - 1] <= emaF[i - 1];
+      const triggerLong = touchedFastLong && closes[i] > emaF[i] && closes[i] > opens[i];
+      const setupLong = trend === 'up' && heldSlowLong && triggerLong;
 
-      const touchedFastShort = highs.slice(i - pb + 1, i + 1).some((hg, k) => hg >= emaF[i - pb + 1 + k]);
-      const heldSlowShort    = highs.slice(i - pb + 1, i + 1).every((hg, k) => hg < emaS[i - pb + 1 + k]);
-      const triggerShort = closes[i] < emaF[i] && closes[i] < opens[i] && closes[i - 1] >= emaF[i - 1];
-      const setupShort = trend === 'down' && touchedFastShort && heldSlowShort && triggerShort;
+      const heldSlowShort = highs.slice(i - pb + 1, i + 1).every((hg, k) => hg < emaS[i - pb + 1 + k]);
+      const touchedFastShort = highs[i] >= emaF[i] || highs[i - 1] >= emaF[i - 1];
+      const triggerShort = touchedFastShort && closes[i] < emaF[i] && closes[i] < opens[i];
+      const setupShort = trend === 'down' && heldSlowShort && triggerShort;
 
       const session = this.inSession();
       const sessionOk = !cfg.sessionFilter || session.active;
@@ -157,7 +159,7 @@ export class EmaScalperService implements OnModuleInit {
       : Math.max(...highs.slice(i - look + 1, i + 1));
     const swingDist = side === 'long' ? entry - swing : swing - entry;
     if (swingDist <= 0) return;                       // swing dalla parte sbagliata
-    const risk = Math.max(swingDist, entry * 0.0005); // distanza minima 0.05% (anti micro-stop)
+    const risk = Math.max(swingDist, entry * 0.0012); // distanza minima 0.12% → TP a 2R copre le fee (~0.12% a/r)
     const sl = side === 'long' ? entry - risk : entry + risk;
     const tp = side === 'long' ? entry + cfg.riskReward * risk : entry - cfg.riskReward * risk;
     const qty = Math.max(minContracts, Math.round((cfg.capitalUsdt * cfg.leverage / entry) / cs));
