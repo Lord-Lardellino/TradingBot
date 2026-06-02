@@ -486,12 +486,23 @@ export class GridScannerService implements OnModuleInit {
     const minContracts = Number((market as any)?.limits?.amount?.min ?? 1) || 1;
 
     const price = cand.price;
-    const low = cand.rangeLow, high = cand.rangeHigh;
-    const rangePct = ((high - low) / price) * 100;
-    // NUMERO LIVELLI DINAMICO: si adatta al range ma sempre DENSO (min 10 livelli,
-    // come prima). Spacing target ~gridSpacingPct % → range largo = più livelli.
-    liveLevels = Math.max(6, Math.min(20, Math.round(rangePct / cfg.gridSpacingPct)));  // spacing più largo = ciclo più grosso
-    const spacing = (high - low) / liveLevels;
+    let low = cand.rangeLow, high = cand.rangeHigh;
+    let rangePct = ((high - low) / price) * 100;
+    liveLevels = Math.max(6, Math.min(20, Math.round(rangePct / cfg.gridSpacingPct)));
+    let spacing = (high - low) / liveLevels;
+
+    // NEUTRAL: griglia SIMMETRICA e BILANCIATA centrata sul prezzo di entrata →
+    // stesso numero di livelli sopra e sotto, spacing = gridSpacingPct%. Il range
+    // viene ridefinito attorno al prezzo (N livelli per lato), niente sbilanciamenti.
+    if (side === 'neutral') {
+      const sp = price * cfg.gridSpacingPct / 100;                              // spacing in prezzo
+      const N = Math.max(3, Math.min(6, Math.round((rangePct / 2) / cfg.gridSpacingPct)));  // livelli per lato
+      low = Number(this.swapExchange.priceToPrecision(symbol, price - (N + 1) * sp));
+      high = Number(this.swapExchange.priceToPrecision(symbol, price + (N + 1) * sp));
+      liveLevels = 2 * N + 2;
+      spacing = (high - low) / liveLevels;
+      rangePct = ((high - low) / price) * 100;
+    }
     const pricePos = (price - low) / ((high - low) || 1);
 
     // 1. CENTRO RANGE: il prezzo deve stare al 25-75% così la griglia è bilanciata
