@@ -124,30 +124,42 @@ export class EmaScalperService implements OnModuleInit {
   }
 
   private async manageOpen(t: any, high: number, low: number, price: number, cs: number) {
-    let hit: 'tp' | 'sl' | null = null, exit = price;
-    if (t.side === 'long') {
-      if (high >= t.takeProfit) { hit = 'tp'; exit = t.takeProfit; }
-      else if (low <= t.stopLoss) { hit = 'sl'; exit = t.stopLoss; }
-    } else {
-      if (low <= t.takeProfit) { hit = 'tp'; exit = t.takeProfit; }
-      else if (high >= t.stopLoss) { hit = 'sl'; exit = t.stopLoss; }
-    }
-    if (!hit) return;
     const dir = t.side === 'long' ? 1 : -1;
-    const pnl = (exit - t.entry) * dir * t.qty * cs;
-    const rMultiple = t.riskUsd > 0 ? pnl / t.riskUsd : 0;
+    const hitTp = t.side === 'long' ? high >= t.takeProfit : low <= t.takeProfit;
+    const hitSl = t.side === 'long' ? low <= t.stopLoss : high >= t.stopLoss;
+
     if (t.mode === 'live') {
-      try {
-        if (t.side === 'long') await this.exchange.createMarketSellOrder(t.symbol, t.qty, { reduceOnly: true });
-        else await this.exchange.createMarketBuyOrder(t.symbol, t.qty, { reduceOnly: true });
-      } catch (e: any) { this.logger.warn(`[EMA LIVE] chiusura: ${e?.message?.slice(0, 50)}`); }
+      // La posizione è gestita dagli ordini TP/SL NATIVI sull'exchange. Qui rilevo
+      // solo la chiusura e registro; se per qualche motivo gli ordini non hanno
+      // chiuso ma il prezzo ha toccato, chiudo a mercato (backup di sicurezza).
+      let stillOpen = true;
+      try { stillOpen = (await this.exchange.fetchPositions([t.symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0).length > 0; } catch { return; }
+      if (stillOpen && !hitTp && !hitSl) return;                 // ancora aperta, niente toccato → lascia lavorare gli ordini
+      if (stillOpen) {                                            // toccato ma ancora aperta → backup a mercato
+        try {
+          if (t.side === 'long') await this.exchange.createMarketSellOrder(t.symbol, t.qty, { reduceOnly: true });
+          else await this.exchange.createMarketBuyOrder(t.symbol, t.qty, { reduceOnly: true });
+        } catch (e: any) { this.logger.warn(`[EMA LIVE] backup close: ${e?.message?.slice(0, 40)}`); }
+      }
+      // cancella l'ordine TP/SL rimasto (non eseguito), anche i trigger
+      try { for (const o of await this.exchange.fetchOpenOrders(t.symbol)) { try { await this.exchange.cancelOrder(o.id, t.symbol); } catch {} } } catch {}
+      try { await this.exchange.cancelAllOrders(t.symbol, { trigger: true }); } catch {}
+      const win = hitTp || (!hitSl && (t.side === 'long' ? price >= t.entry : price <= t.entry));
+      const exit = win ? t.takeProfit : t.stopLoss;
+      const pnl = (exit - t.entry) * dir * t.qty * cs;
+      await this.prisma.emaScalperTrade.update({ where: { id: t.id }, data: { status: win ? 'win' : 'loss', exitPrice: exit, pnl, rMultiple: t.riskUsd > 0 ? pnl / t.riskUsd : 0, reason: win ? 'tp' : 'sl', closedAt: new Date() } });
+      this.lastClosedAt = Date.now();
+      this.logger.log(`[EMA LIVE] ${t.side} CHIUSO ${win ? 'TP' : 'SL'} · ${t.entry} → ${exit} · $${pnl.toFixed(4)} (${(t.riskUsd > 0 ? pnl / t.riskUsd : 0).toFixed(2)}R)`);
+      return;
     }
-    await this.prisma.emaScalperTrade.update({
-      where: { id: t.id },
-      data: { status: hit === 'tp' ? 'win' : 'loss', exitPrice: exit, pnl, rMultiple, reason: hit, closedAt: new Date() },
-    });
+
+    // SIM: simula l'esecuzione di TP/SL su high/low della candela
+    if (!hitTp && !hitSl) return;
+    const exit = hitTp ? t.takeProfit : t.stopLoss;
+    const pnl = (exit - t.entry) * dir * t.qty * cs;
+    await this.prisma.emaScalperTrade.update({ where: { id: t.id }, data: { status: hitTp ? 'win' : 'loss', exitPrice: exit, pnl, rMultiple: t.riskUsd > 0 ? pnl / t.riskUsd : 0, reason: hitTp ? 'tp' : 'sl', closedAt: new Date() } });
     this.lastClosedAt = Date.now();
-    this.logger.log(`[EMA ${t.mode.toUpperCase()}] ${t.side} CHIUSO ${hit.toUpperCase()} · entry ${t.entry} → ${exit} · PnL $${pnl.toFixed(4)} (${rMultiple.toFixed(2)}R)`);
+    this.logger.log(`[EMA SIM] ${t.side} CHIUSO ${hitTp ? 'TP' : 'SL'} · ${t.entry} → ${exit} · $${pnl.toFixed(4)} (${(t.riskUsd > 0 ? pnl / t.riskUsd : 0).toFixed(2)}R)`);
   }
 
   private async openTrade(side: 'long' | 'short', cfg: any, price: number, lows: number[], highs: number[], i: number, cs: number, minContracts: number) {
@@ -160,7 +172,7 @@ export class EmaScalperService implements OnModuleInit {
       : Math.max(...highs.slice(i - look + 1, i + 1));
     const swingDist = side === 'long' ? entry - swing : swing - entry;
     if (swingDist <= 0) return;                       // swing dalla parte sbagliata
-    const risk = Math.max(swingDist, entry * 0.0012); // distanza minima 0.12% → TP a 2R copre le fee (~0.12% a/r)
+    const risk = Math.max(swingDist, entry * 0.0025); // distanza minima 0.25%: con R:R 2.5 il TP netto supera l'SL netto nonostante le fee
     const sl = side === 'long' ? entry - risk : entry + risk;
     const tp = side === 'long' ? entry + cfg.riskReward * risk : entry - cfg.riskReward * risk;
     const qty = Math.max(minContracts, Math.round((cfg.capitalUsdt * cfg.leverage / entry) / cs));
@@ -168,11 +180,21 @@ export class EmaScalperService implements OnModuleInit {
     const mode = cfg.liveEnabled ? 'live' : 'sim';
 
     if (mode === 'live') {
+      const pt = side === 'long' ? 1 : 2;
       try {
-        await this.exchange.setLeverage(cfg.leverage, cfg.symbol, { openType: 1, positionType: side === 'long' ? 1 : 2 }).catch(() => {});
+        await this.exchange.setLeverage(cfg.leverage, cfg.symbol, { openType: 1, positionType: pt }).catch(() => {});
         if (side === 'long') await this.exchange.createMarketBuyOrder(cfg.symbol, qty, { openType: 1, positionType: 1, leverage: cfg.leverage });
         else await this.exchange.createMarketSellOrder(cfg.symbol, qty, { openType: 1, positionType: 2, leverage: cfg.leverage });
       } catch (e: any) { this.logger.warn(`[EMA LIVE] apertura saltata: ${e?.message?.slice(0, 60)}`); return; }
+      // ORDINI TP/SL sull'exchange: TP = limit reduceOnly · SL = trigger market reduceOnly.
+      // Eseguono nativamente quando toccati (no attesa del tick), visibili sul grafico.
+      const closeSide: 'buy' | 'sell' = side === 'long' ? 'sell' : 'buy';
+      const tpPx = Number(this.exchange.priceToPrecision(cfg.symbol, tp));
+      const slPx = Number(this.exchange.priceToPrecision(cfg.symbol, sl));
+      try { await this.exchange.createOrder(cfg.symbol, 'limit', closeSide, qty, tpPx, { reduceOnly: true, openType: 1, positionType: pt }); }
+      catch (e: any) { this.logger.warn(`[EMA LIVE] ordine TP: ${e?.message?.slice(0, 50)}`); }
+      try { await this.exchange.createOrder(cfg.symbol, 'market', closeSide, qty, undefined, { triggerPrice: slPx, reduceOnly: true, openType: 1, positionType: pt }); }
+      catch (e: any) { this.logger.warn(`[EMA LIVE] ordine SL: ${e?.message?.slice(0, 50)}`); }
     }
 
     await this.prisma.emaScalperTrade.create({
