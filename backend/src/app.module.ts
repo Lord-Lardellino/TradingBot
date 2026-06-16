@@ -17,6 +17,7 @@ import { GemmaModule } from './gemma/gemma.module';
 import { FundingArbModule } from './funding-arb/funding-arb.module';
 import { GridScannerModule } from './grid-scanner/grid-scanner.module';
 import { EmaScalperModule } from './ema-scalper/ema-scalper.module';
+import { DailySniperModule } from './daily-sniper/daily-sniper.module';
 
 @Module({
   imports: [
@@ -38,6 +39,7 @@ import { EmaScalperModule } from './ema-scalper/ema-scalper.module';
     FundingArbModule,
     GridScannerModule,
     EmaScalperModule,
+    DailySniperModule,
   ],
 })
 export class AppModule {}

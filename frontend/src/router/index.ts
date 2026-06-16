@@ -30,6 +30,12 @@ const router = createRouter({
           meta: { title: '3 EMA Scalper' },
         },
         {
+          path: 'daily-sniper',
+          name: 'daily-sniper',
+          component: () => import('@/pages/DailySniper.vue'),
+          meta: { title: 'Top-Down Daily' },
+        },
+        {
           path: 'trades',
           name: 'trades',
           component: () => import('@/pages/Trades.vue'),

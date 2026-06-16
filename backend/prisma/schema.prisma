@@ -1150,6 +1150,62 @@ model EmaScalperConfig {
   updatedAt        DateTime  @updatedAt
 }
 
+// ── Top-Down Daily (cascata 1W -> 1D -> 4H -> 1H) ───────────────────────────
+model DailySniperConfig {
+  id               Int       @id @default(1)
+  enabled          Boolean   @default(true)
+  liveEnabled      Boolean   @default(false)   // toggle ordini reali su MEXC
+  symbol           String    @default("BTC/USDT:USDT")
+  weeklyTf         String    @default("1w")
+  dailyTf          String    @default("1d")
+  h4Tf             String    @default("4h")
+  h1Tf             String    @default("1h")
+  emaWeekly        Int       @default(21)      // regime macro (1W)
+  emaDailyFast     Int       @default(20)      // bias del giorno (1D)
+  emaDailySlow     Int       @default(50)
+  ema4h            Int       @default(20)      // allineamento momentum (4H)
+  ema4hSlow        Int       @default(50)
+  ema1h            Int       @default(20)      // pullback/innesco (1H)
+  rsiPeriod        Int       @default(14)
+  rsiLongMin       Float     @default(52)      // RSI 4H minimo per long
+  rsiShortMax      Float     @default(48)      // RSI 4H massimo per short
+  swingLookback    Int       @default(6)       // candele 1H per swing (SL)
+  requireWeekly    Boolean   @default(true)    // gate settimanale obbligatorio
+  riskReward       Float     @default(2.0)     // TP = 2R (5% rischio -> 10% target)
+  capitalUsdt      Float     @default(100)     // capitale di riferimento
+  riskPct          Float     @default(5.0)     // % capitale a rischio per trade
+  leverage         Int       @default(5)
+  maxStopPct       Float     @default(2.5)     // cap distanza SL (% prezzo)
+  minStopPct       Float     @default(0.4)     // distanza SL minima (% prezzo)
+  slBufferPct      Float     @default(0.2)     // buffer extra oltre lo swing (% prezzo) -> SL piu largo
+  nyOpenHour       Int       @default(13)      // apertura NY (UTC): confine giornata + reset
+  nyOpenMin        Int       @default(30)
+  flattenHour      Int       @default(21)      // (legacy) non piu usato: il reset avviene a NY open
+  analyticsResetAt DateTime?
+  updatedAt        DateTime  @updatedAt
+}
+
+model DailySniperTrade {
+  id          String    @id @default(cuid())
+  symbol      String
+  side        String    // long | short
+  mode        String    @default("sim")  // sim | live
+  tradeDate   String    // YYYY-MM-DD (UTC) per limite 1/giorno
+  entry       Float
+  stopLoss    Float
+  takeProfit  Float
+  qty         Float
+  leverage    Int
+  riskUsd     Float     @default(0)
+  status      String    @default("open")  // open | win | loss | manual
+  exitPrice   Float?
+  pnl         Float?
+  rMultiple   Float?
+  reason      String?   // tp | sl | eod | manual
+  openedAt    DateTime  @default(now())
+  closedAt    DateTime?
+}
+
 model EmaScalperTrade {
   id          String    @id @default(cuid())
   symbol      String
