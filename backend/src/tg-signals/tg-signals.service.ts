@@ -16,6 +16,8 @@ import { OrderExecutorService } from './order-executor.service';
 @Injectable()
 export class TgSignalsService implements OnModuleInit {
   private readonly logger = new Logger(TgSignalsService.name);
+  private lastDialogSyncAt = 0;
+  private syncingDialogs = false;
 
   constructor(
     private prisma: PrismaService,
@@ -26,12 +28,13 @@ export class TgSignalsService implements OnModuleInit {
 
   onModuleInit() {
     this.tg.onMessage((msg) => this.handleIncoming(msg).catch((e) => this.logger.warn(`[TGS] handle: ${e?.message?.slice(0, 80)}`)));
+    setTimeout(() => this.syncDialogs(true).catch((e) => this.logger.warn(`[TGS] sync dialogs: ${e?.message?.slice(0, 80)}`)), 15000);
   }
 
   // ── Ingresso messaggio ────────────────────────────────────────────────────
   private async handleIncoming(msg: IncomingMessage) {
-    const channel = await this.prisma.tgChannel.findUnique({ where: { channelId: msg.channelId } });
-    if (!channel || !channel.enabled) return;                 // canale non monitorato
+    const channel = await this.ensureChannelForMessage(msg);
+    if (!channel.enabled) return;                 // canale disattivato manualmente
     // dedup: stesso messaggio già processato
     const dup = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tgMessageId: msg.messageId } });
     if (dup) return;
@@ -40,7 +43,7 @@ export class TgSignalsService implements OnModuleInit {
     }
 
     const memory = await this.getPromptMemory();
-    const parsed = await this.parser.parse(msg.text, memory.summary);
+    const parsed = await this.parser.parse(msg.text, memory.summary, { riskPct: channel.riskPct, leverageMax: channel.levaMax });
     const rec = await this.prisma.tgSignal.create({
       data: {
         channelDbId: channel.id, tgMessageId: msg.messageId, rawText: msg.text.slice(0, 4000),
@@ -55,6 +58,74 @@ export class TgSignalsService implements OnModuleInit {
     if (parsed.type === 'CLOSE') return this.applyClose(channel, rec.id);
     // RUMORE → nessuna azione
     return this.learnFromNonSignal(rec.id, msg.text, parsed, memory.summary, channel.title ?? channel.username ?? channel.channelId);
+  }
+
+  private async ensureChannelForMessage(msg: IncomingMessage) {
+    const skipCodes = this.isCodesChannel(msg.title);
+    return this.prisma.tgChannel.upsert({
+      where: { channelId: msg.channelId },
+      create: {
+        channelId: msg.channelId,
+        title: msg.title ?? null,
+        enabled: !skipCodes,
+        mode: 'sim',
+        riskPct: 4.0,
+        levaMax: 20,
+        minConf: 0.6,
+        tpSplit: '50,30,20',
+      },
+      update: {
+        ...(msg.title ? { title: msg.title } : {}),
+        ...(skipCodes ? { enabled: false } : {}),
+      },
+    });
+  }
+
+  private isCodesChannel(...parts: Array<string | null | undefined>) {
+    const text = parts.filter(Boolean).join(' ').toLowerCase();
+    return /\b(codice|codici|code|codes|otp|2fa)\b/.test(text);
+  }
+
+  private async syncDialogs(force = false) {
+    const now = Date.now();
+    if (this.syncingDialogs) return;
+    if (!force && now - this.lastDialogSyncAt < 60_000) return;
+    this.lastDialogSyncAt = now;
+
+    const status = this.tg.status();
+    if (!status.connected) return;
+
+    this.syncingDialogs = true;
+    try {
+      const dialogs = await this.tg.listDialogs();
+      let added = 0;
+      for (const d of dialogs) {
+        const skipCodes = this.isCodesChannel(d.title, d.username);
+        const rec = await this.prisma.tgChannel.upsert({
+          where: { channelId: d.id },
+          create: {
+            channelId: d.id,
+            username: d.username ?? null,
+            title: d.title ?? null,
+            enabled: !skipCodes,
+            mode: 'sim',
+            riskPct: 4.0,
+            levaMax: 20,
+            minConf: 0.6,
+            tpSplit: '50,30,20',
+          },
+          update: {
+            username: d.username ?? null,
+            title: d.title ?? null,
+            ...(skipCodes ? { enabled: false } : {}),
+          },
+        });
+        if (rec.createdAt.getTime() === rec.updatedAt.getTime()) added++;
+      }
+      if (added) this.logger.log(`[TGS] auto-registrati ${added} canali Telegram`);
+    } finally {
+      this.syncingDialogs = false;
+    }
   }
 
   // ── NEW: apri trade (sim|live) ────────────────────────────────────────────
@@ -112,7 +183,8 @@ export class TgSignalsService implements OnModuleInit {
     const openOnChannel = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tradeStatus: 'open' } });
     if (openOnChannel) return void (await skip('già un trade aperto su questo canale (no hedge)'));
 
-    const leverage = Math.min(p.leverage ?? channel.levaMax, channel.levaMax);
+    if (p.leverage == null) return void (await skip('leva Gemini mancante'));
+    const leverage = this.resolveLeverage(p.leverage, channel.levaMax);
     const tpSplit = String(channel.tpSplit).split(',').map((x: string) => Number(x.trim())).filter((x) => x > 0);
     const entryRef = (p.entryType === 'limit' && p.entryPrice) ? p.entryPrice : (await this.executor.getPrice(symbol)) ?? p.entryPrice;
     if (!entryRef) return void (await skip('prezzo entry non disponibile'));
@@ -198,6 +270,7 @@ export class TgSignalsService implements OnModuleInit {
 
   // ── API ───────────────────────────────────────────────────────────────────
   async getDashboard() {
+    await this.syncDialogs().catch((e) => this.logger.warn(`[TGS] sync dialogs: ${e?.message?.slice(0, 80)}`));
     const [channels, openTrades, recent, all, tgStatus, promptMemory] = await Promise.all([
       this.prisma.tgChannel.findMany({ orderBy: { createdAt: 'asc' } }),
       this.prisma.tgSignal.findMany({ where: { tradeStatus: 'open' }, orderBy: { createdAt: 'desc' } }),
@@ -218,7 +291,60 @@ export class TgSignalsService implements OnModuleInit {
 
   getChannels() { return this.prisma.tgChannel.findMany({ orderBy: { createdAt: 'asc' } }); }
 
-  async listDialogs() { return this.tg.listDialogs(); }
+  async listDialogs() {
+    await this.syncDialogs(true).catch((e) => this.logger.warn(`[TGS] sync dialogs: ${e?.message?.slice(0, 80)}`));
+    return this.tg.listDialogs();
+  }
+
+  async testParse(b: any) {
+    const rawText = String(b?.text ?? '').trim();
+    if (!rawText) return { ok: false, error: 'testo mancante' };
+
+    const channel = b?.channelId
+      ? await this.prisma.tgChannel.findFirst({
+          where: { OR: [{ channelId: String(b.channelId) }, { id: Number(b.channelId) || -1 }] },
+        })
+      : await this.prisma.tgChannel.findFirst({ where: { enabled: true }, orderBy: { createdAt: 'asc' } });
+
+    const ctx = {
+      riskPct: Number(channel?.riskPct ?? 4.0),
+      leverageMax: Number(channel?.levaMax ?? 20),
+      minConf: Number(channel?.minConf ?? 0.6),
+    };
+    const memory = await this.getPromptMemory();
+    const parsed = await this.parser.parse(rawText, memory.summary, { riskPct: ctx.riskPct, leverageMax: ctx.leverageMax });
+    const normalizedSymbol = parsed.symbol ? this.executor.resolveSymbol(parsed.symbol) : null;
+    const leverage = parsed.leverage == null ? null : this.resolveLeverage(parsed.leverage, ctx.leverageMax);
+
+    const checks: string[] = [];
+    if (parsed.type !== 'NEW') checks.push(`tipo ${parsed.type}: nessun ingresso`);
+    if (parsed.confidence < ctx.minConf) checks.push(`confidenza ${parsed.confidence} < soglia ${ctx.minConf}`);
+    if (!parsed.side) checks.push('direzione mancante');
+    if (parsed.sl == null) checks.push('SL mancante');
+    if (!normalizedSymbol) checks.push(`simbolo non mappabile: ${parsed.symbol ?? '-'}`);
+    if (parsed.leverage == null) checks.push('leva Gemini mancante');
+
+    return {
+      ok: true,
+      wouldExecute: checks.length === 0,
+      checks,
+      parsed,
+      normalized: {
+        symbol: normalizedSymbol,
+        leverage,
+        leverageFromGemini: parsed.leverage,
+        leverageCap: ctx.leverageMax,
+        riskPct: ctx.riskPct,
+        confidenceThreshold: ctx.minConf,
+      },
+    };
+  }
+
+  private resolveLeverage(parsed: number, max: number) {
+    const cap = Math.max(1, Math.floor(Number(max) || 1));
+    const suggested = isFinite(Number(parsed)) ? Math.round(Number(parsed)) : 1;
+    return Math.max(1, Math.min(suggested, cap));
+  }
 
   addChannel(b: any) {
     return this.prisma.tgChannel.create({ data: {

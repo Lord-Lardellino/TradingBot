@@ -4,7 +4,7 @@ import { ConfigService } from '@nestjs/config';
 
 const BASE_URL  = 'https://generativelanguage.googleapis.com/v1beta/models';
 const FILES_URL = 'https://generativelanguage.googleapis.com/upload/v1beta/files';
-const GEMMA_MODELS = ['gemma-4-31b-it', 'gemma-4-26b-a4b-it'];
+const GEMMA_MODELS = ['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'];
 
 const SYSTEM_PROMPT = `Sei un assistente professionale per il trading di futures crypto su MEXC.
 Aiuti l'utente ad analizzare segnali, pattern e posizioni aperte per prendere decisioni migliori.

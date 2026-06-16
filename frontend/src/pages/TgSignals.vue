@@ -13,7 +13,7 @@
       <div class="flex items-center gap-2">
         <button @click="loadDialogs" class="btn-soft">
           <i class="pi pi-refresh" />
-          Dialoghi
+          Sincronizza
         </button>
         <button @click="load" class="btn-soft">
           <i class="pi pi-sync" />
@@ -74,17 +74,43 @@
       </div>
     </section>
 
-    <div class="grid xl:grid-cols-[minmax(0,1fr)_360px] gap-4">
+    <section class="section">
+      <div class="section-head">
+        <div>
+          <h2>Test Gemini</h2>
+          <p>Dry-run del parser: nessun ordine viene aperto.</p>
+        </div>
+        <button @click="testParse" class="btn-soft" :disabled="parserTesting || !parserText.trim()">
+          <i class="pi pi-bolt" />
+          Test
+        </button>
+      </div>
+      <textarea
+        v-model="parserText"
+        class="input min-h-28 resize-y font-mono"
+        placeholder="Incolla qui un segnale Telegram..."
+      />
+      <div v-if="parserResult" class="mt-3 rounded-lg border border-white/5 bg-surface-0 p-3">
+        <div class="mb-2 flex flex-wrap items-center gap-2 text-xs">
+          <span :class="['badge', parserResult.wouldExecute ? 'badge-ok' : 'badge-muted']">
+            {{ parserResult.wouldExecute ? 'Eseguibile' : 'Non eseguibile' }}
+          </span>
+          <span v-if="parserResult.normalized?.leverage" class="badge badge-new">
+            Leva Gemini {{ parserResult.normalized.leverage }}x
+          </span>
+          <span v-for="c in parserResult.checks || []" :key="c" class="badge badge-muted">{{ c }}</span>
+        </div>
+        <pre class="overflow-x-auto text-[10px] text-gray-400">{{ JSON.stringify(parserResult, null, 2) }}</pre>
+      </div>
+    </section>
+
+    <div class="grid gap-4">
       <section class="section">
         <div class="section-head">
           <div>
             <h2>Canali monitorati</h2>
-            <p>SIM di default, LIVE solo quando lo abiliti sul singolo canale.</p>
+            <p>Sincronizzati automaticamente dai dialoghi Telegram. SIM di default, LIVE solo quando lo abiliti sul singolo canale.</p>
           </div>
-          <button @click="addChannel" class="btn-primary">
-            <i class="pi pi-plus" />
-            Aggiungi
-          </button>
         </div>
 
         <div class="overflow-x-auto">
@@ -95,14 +121,12 @@
                 <th class="py-2 px-3">Stato</th>
                 <th class="py-2 px-3">Mode</th>
                 <th class="py-2 px-3">Risk</th>
-                <th class="py-2 px-3">Leva</th>
-                <th class="py-2 px-3">Conf</th>
                 <th class="py-2 pl-3 text-right">Azioni</th>
               </tr>
             </thead>
             <tbody>
               <tr v-if="!channels.length">
-                <td colspan="7" class="py-8 text-center text-gray-500">Nessun canale configurato.</td>
+                <td colspan="5" class="py-8 text-center text-gray-500">Nessun canale sincronizzato. Verifica TG_SESSION e premi Sincronizza.</td>
               </tr>
               <tr v-for="c in channels" :key="c.id" class="border-b border-white/5 align-top">
                 <td class="py-2 pr-3 min-w-[220px]">
@@ -125,12 +149,6 @@
                 <td class="py-2 px-3 w-24">
                   <input v-model.number="c.riskPct" type="number" step="0.25" class="input text-right" @change="saveChannel(c)" />
                 </td>
-                <td class="py-2 px-3 w-20">
-                  <input v-model.number="c.levaMax" type="number" class="input text-right" @change="saveChannel(c)" />
-                </td>
-                <td class="py-2 px-3 w-24">
-                  <input v-model.number="c.minConf" type="number" min="0" max="1" step="0.05" class="input text-right" @change="saveChannel(c)" />
-                </td>
                 <td class="py-2 pl-3 text-right">
                   <button @click="removeChannel(c)" class="icon-btn" title="Rimuovi canale">
                     <i class="pi pi-trash" />
@@ -142,64 +160,6 @@
         </div>
       </section>
 
-      <aside class="section">
-        <div class="section-head">
-          <div>
-            <h2>Nuovo canale</h2>
-            <p>Usa ID dialogo o incolla manualmente l'ID Telegram.</p>
-          </div>
-        </div>
-
-        <div class="space-y-3">
-          <label class="field">
-            ID canale
-            <input v-model="draft.channelId" class="input" placeholder="-100..." />
-          </label>
-          <label class="field">
-            Titolo
-            <input v-model="draft.title" class="input" placeholder="Nome canale" />
-          </label>
-          <label class="field">
-            Username
-            <input v-model="draft.username" class="input" placeholder="@handle" />
-          </label>
-          <div class="grid grid-cols-3 gap-2">
-            <label class="field">
-              Risk %
-              <input v-model.number="draft.riskPct" type="number" step="0.25" class="input" />
-            </label>
-            <label class="field">
-              Leva
-              <input v-model.number="draft.levaMax" type="number" class="input" />
-            </label>
-            <label class="field">
-              Conf
-              <input v-model.number="draft.minConf" type="number" min="0" max="1" step="0.05" class="input" />
-            </label>
-          </div>
-        </div>
-
-        <div class="mt-4 border-t border-white/5 pt-3">
-          <div class="flex items-center justify-between mb-2">
-            <div class="text-xs font-semibold text-gray-400">Dialoghi Telegram</div>
-            <span class="text-[10px] text-gray-600">{{ dialogs.length }}</span>
-          </div>
-          <div class="max-h-72 overflow-y-auto space-y-1">
-            <button
-              v-for="d in dialogs"
-              :key="d.id"
-              @click="pickDialog(d)"
-              class="w-full text-left rounded-lg border border-white/5 bg-surface-0 px-2 py-2 hover:border-brand/50"
-            >
-              <div class="text-xs text-gray-200 truncate">{{ d.title }}</div>
-              <div class="text-[10px] text-gray-500 font-mono truncate">{{ d.id }} {{ d.username ? '@' + d.username : '' }}</div>
-            </button>
-            <div v-if="!dialogs.length" class="text-xs text-gray-500 py-4 text-center">
-              Dialoghi disponibili dopo TG_SESSION.
-            </div>
-          </div>
-        </div>
-      </aside>
     </div>
 
     <section v-if="openTrades.length" class="section">
@@ -288,16 +248,16 @@ type TgChannel = {
 }
 
 type TgSignal = Record<string, any>
-type Dialog = { id: string; title: string; username?: string; isChannel: boolean }
 
 const telegram = ref({ configured: false, connected: false })
 const channels = ref<TgChannel[]>([])
 const openTrades = ref<TgSignal[]>([])
 const recent = ref<TgSignal[]>([])
-const dialogs = ref<Dialog[]>([])
 const promptMemory = ref({ summary: '', lastNews: '', lastAnalysis: '' })
 const stats = ref({ closed: 0, wins: 0, losses: 0, winRate: 0, pnl: 0 })
-const draft = ref({ channelId: '', title: '', username: '', riskPct: 4, levaMax: 20, minConf: 0.6 })
+const parserText = ref('')
+const parserTesting = ref(false)
+const parserResult = ref<any>(null)
 let timer: ReturnType<typeof setInterval> | null = null
 
 const hasLiveChannel = computed(() => channels.value.some((c) => c.enabled && c.mode === 'live'))
@@ -315,22 +275,20 @@ async function load() {
 }
 
 async function loadDialogs() {
-  const { data } = await axios.get('/api/tg-signals/dialogs')
-  dialogs.value = data || []
+  await axios.get('/api/tg-signals/dialogs')
+  await load()
 }
 
-async function addChannel() {
-  if (!draft.value.channelId.trim()) return
-  await axios.post('/api/tg-signals/channels', {
-    ...draft.value,
-    channelId: draft.value.channelId.trim(),
-    username: draft.value.username?.trim() || null,
-    title: draft.value.title?.trim() || null,
-    mode: 'sim',
-    enabled: true,
-  })
-  draft.value = { channelId: '', title: '', username: '', riskPct: 4, levaMax: 20, minConf: 0.6 }
-  await load()
+async function testParse() {
+  const text = parserText.value.trim()
+  if (!text) return
+  parserTesting.value = true
+  try {
+    const { data } = await axios.post('/api/tg-signals/test-parse', { text })
+    parserResult.value = data
+  } finally {
+    parserTesting.value = false
+  }
 }
 
 async function saveChannel(c: TgChannel) {
@@ -372,12 +330,6 @@ async function resetSignals() {
   if (!confirm('Cancellare tutti i segnali Telegram salvati?')) return
   await axios.post('/api/tg-signals/reset')
   await load()
-}
-
-function pickDialog(d: Dialog) {
-  draft.value.channelId = d.id
-  draft.value.title = d.title
-  draft.value.username = d.username || ''
 }
 
 function channelName(id: number) {

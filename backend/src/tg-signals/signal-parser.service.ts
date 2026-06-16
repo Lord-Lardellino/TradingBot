@@ -27,6 +27,11 @@ export interface NewsAnalysis {
   confidence: number;
 }
 
+export interface ParseContext {
+  riskPct?: number;
+  leverageMax?: number;
+}
+
 const PROMPT = `Sei un parser di segnali di trading futures crypto. Ricevi UN messaggio
 grezzo (in qualsiasi lingua, spesso informale) da un canale Telegram di segnali e
 ritorni SOLO un oggetto JSON valido, senza testo prima o dopo, senza markdown.
@@ -44,7 +49,10 @@ Estrai (usa null se assente):
 - "entryPrice": prezzo di ingresso numerico (null se a mercato senza prezzo).
 - "sl": prezzo stop loss.
 - "tps": array di prezzi take-profit in ordine (può essere vuoto).
-- "leverage": leva suggerita come numero (null se assente).
+- "leverage": leva consigliata come numero. Per NEW scegli una leva anche se non e' scritta nel messaggio:
+  considera volatilita' dell'asset, distanza entry-SL, rischio/budget indicati nel contesto e qualita' del segnale.
+  Usa leva piu' bassa su meme/alt illiquide o SL stretto, piu' alta solo su asset liquidi e setup chiaro.
+  Non superare "leverageMax" se presente nel contesto. Usa null solo per UPDATE/CLOSE/RUMORE.
 - "confidence": 0..1, quanto sei sicuro dell'interpretazione (testo chiaro e completo = alto).
 - per "UPDATE": "newSl" (nuovo SL/BE) e "closePct" (% da chiudere) se presenti.
 
@@ -81,12 +89,12 @@ export class SignalParserService {
 
   constructor(private gemma: GemmaService) {}
 
-  async parse(rawText: string, promptMemory = ''): Promise<ParsedSignal> {
+  async parse(rawText: string, promptMemory = '', context: ParseContext = {}): Promise<ParsedSignal> {
     const fallback: ParsedSignal = { type: 'RUMORE', symbol: null, side: null, entryType: 'market', entryPrice: null, sl: null, tps: [], leverage: null, confidence: 0 };
     if (!rawText || !rawText.trim()) return fallback;
 
     try {
-      const systemPrompt = this.withPromptMemory(PROMPT, promptMemory);
+      const systemPrompt = this.withPromptMemory(this.withParseContext(PROMPT, context), promptMemory);
       const res = await this.gemma.callApi({
         systemInstruction: { parts: [{ text: systemPrompt }] },
         contents: [{ role: 'user', parts: [{ text: rawText.slice(0, 4000) }] }],
@@ -205,5 +213,19 @@ attuale non li contiene chiaramente. Risultati VIP, promo e performance passate 
 esclusi dalla memoria.
 
 ${trimmed}`;
+  }
+
+  private withParseContext(base: string, context: ParseContext): string {
+    const lines: string[] = [];
+    if (context.riskPct != null) lines.push(`riskPct=${context.riskPct}`);
+    if (context.leverageMax != null) lines.push(`leverageMax=${context.leverageMax}`);
+    if (!lines.length) return base;
+    return `${base}
+
+--- CONTESTO RISCHIO / BUDGET ---
+${lines.join('\n')}
+Per i NEW, usa questo contesto per scegliere "leverage". La leva non aumenta il rischio
+massimo del trade: il backend dimensiona la size su entry-SL e riskPct, poi applica la
+leva scelta/cappata all'ordine di entrata.`;
   }
 }

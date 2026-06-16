@@ -17,6 +17,10 @@ export class TgSignalsController {
     return this.svc.listDialogs();
   }
 
+  @Post('test-parse') testParse(@Body() body: any) {
+    return this.svc.testParse(body);
+  }
+
   @Post('channels') addChannel(@Body() body: any) {
     return this.svc.addChannel(body);
   }
