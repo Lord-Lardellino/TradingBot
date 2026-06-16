@@ -1225,3 +1225,64 @@ model EmaScalperTrade {
   openedAt    DateTime  @default(now())
   closedAt    DateTime?
 }
+
+// ── Telegram Signals → Gemini → MEXC ────────────────────────────────────────
+// Un canale Telegram di segnali monitorato via GramJS. Config di rischio PER canale.
+model TgChannel {
+  id           Int      @id @default(autoincrement())
+  channelId    String   @unique          // id numerico Telegram (peer) del canale
+  username     String?                   // @handle o titolo, per la UI
+  title        String?                   // titolo leggibile del canale
+  enabled      Boolean  @default(true)   // monitora i messaggi di questo canale
+  mode         String   @default("sim")  // sim | live  (toggle ordini reali per-canale)
+  riskPct      Float    @default(4.0)    // % capitale a rischio per trade
+  levaMax      Int      @default(20)     // cap leva: anche se il segnale dice di più
+  minConf      Float    @default(0.6)    // soglia confidenza Gemini per eseguire
+  tpSplit      String   @default("50,30,20") // ripartizione vol sui TP multipli (%)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+  signals      TgSignal[]
+}
+
+// Un messaggio ricevuto: testo grezzo + JSON interpretato da Gemini + stato ordine.
+model TgSignal {
+  id           String    @id @default(cuid())
+  channel      TgChannel @relation(fields: [channelDbId], references: [id], onDelete: Cascade)
+  channelDbId  Int
+  tgMessageId  String                      // id messaggio Telegram (dedup)
+  rawText      String                      // testo grezzo del messaggio
+  parsed       String    @default("{}")    // JSON Gemini: {type,symbol,side,entryType,entryPrice,sl,tp[],leva,conf}
+  type         String    @default("RUMORE")// NEW | UPDATE | CLOSE | RUMORE
+  symbol       String?                     // simbolo MEXC normalizzato (BTC/USDT:USDT)
+  side         String?                     // long | short
+  confidence   Float?                      // confidenza Gemini 0..1
+  status       String    @default("parsed")// parsed | skipped | executed | error
+  mode         String?                     // sim | live  (modalità con cui è stato eseguito)
+  note         String?                     // motivo skip/errore o info esecuzione
+  // legame al trade aperto da questo segnale (per UPDATE/CLOSE successivi)
+  side2        String?                     // (riservato)
+  entry        Float?
+  stopLoss     Float?
+  takeProfits  String?                     // JSON array dei TP
+  qty          Float?
+  leverage     Int?
+  riskUsd      Float?
+  tradeStatus  String    @default("none")  // none | open | win | loss | manual | closed
+  exitPrice    Float?
+  pnl          Float?
+  reason       String?                     // tp | sl | update | close | manual
+  createdAt    DateTime  @default(now())
+  closedAt     DateTime?
+
+  @@index([channelDbId, tradeStatus])
+}
+
+// Memoria dinamica usata dal parser Telegram: news/commenti non operativi
+// sintetizzati da Gemini e reiniettati nel prompt dei segnali successivi.
+model TgPromptMemory {
+  id           Int      @id @default(1)
+  summary      String   @default("")
+  lastNews     String?
+  lastAnalysis String?
+  updatedAt    DateTime @updatedAt
+}

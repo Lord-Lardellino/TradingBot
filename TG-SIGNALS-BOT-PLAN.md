@@ -11,6 +11,19 @@
   (ccxt MEXC, `contractPrivatePostStoporderPlace` con `positionId`, sizing % capitale,
   `getCapital()` = saldo futures massimo del conto).
 
+## Decisioni FISSATE (2026-06-16)
+- **Canali**: solo TESTO (niente immagini) → prompt Gemini text-only.
+- **Login GramJS**: script CLI in locale (inserisco codice SMS una volta), salvo
+  `StringSession` in `.env`, copio sul VPS. Backend usa solo la sessione salvata.
+- **Entry**: lo decide **Gemini** in base al testo del segnale → il JSON include
+  `entryType: "market" | "limit"` + `entryPrice`. "Entra ora/a mercato" → market;
+  "limit a X" → limit all'entry.
+- **TP multipli**: uno **stop-order nativo PARZIALE per ogni TP** (vol ripartito,
+  default 50/30/20) + 1 SL nativo sul volume totale. Gestione interamente sull'exchange.
+- **Modalità**: **toggle live PER-CANALE** già da subito (config per canale `mode: sim|live`).
+- **Riuso ordini**: estraggo il motore di `daily-sniper` in un `order-executor`
+  parametrico `(symbol, side, entryType, entryPrice, sl, tp[], riskPct, leva, mode)`.
+
 ## Decisione tecnica CHIAVE: come leggere i canali
 - **Bot API Telegram = NO** → un bot legge solo i canali dove è ADMIN. I canali di
   segnali altrui non lo permettono.
@@ -29,11 +42,15 @@
 3. Gemini classifica il tipo messaggio:
    `NEW` (nuovo segnale) | `UPDATE` (sposta SL/BE, chiudi parziale) | `CLOSE` (chiudi tutto) | `RUMORE`.
    Ed estrae: `symbol, side (long/short), entry, sl, tp[] (più TP), leva, confidenza`.
-4. Normalizzazione/Risk: mappa symbol → simbolo MEXC (`BTC` → `BTC/USDT:USDT`),
+4. Se il messaggio non è operativo, passa al **Brain Gemini globale**:
+   - news, rumor, sentiment, commenti macro e catalyst utili aggiornano una memoria compatta;
+   - risultati VIP, screenshot profit, "TP hit", promo, referral e performance passate vengono saltati;
+   - la memoria globale viene reiniettata nel prompt dei segnali successivi per tutti i canali.
+5. Normalizzazione/Risk: mappa symbol → simbolo MEXC (`BTC` → `BTC/USDT:USDT`),
    sizing % capitale, cap leva, dedup (segnale ripostato), soglia di confidenza.
-5. ccxt MEXC: apre ordine (market o limit all'entry) + SL/TP nativi.
+6. ccxt MEXC: apre ordine (market o limit all'entry) + SL/TP nativi.
    TP multipli = chiusure parziali.
-6. DB: trade + link al messaggio + canale.
+7. DB: trade + link al messaggio + canale + memoria Brain Gemini.
 
 ## Punti difficili (da gestire)
 1. Parsing MAI affidabile al 100% (testo informale + immagini) → soglia di confidenza
@@ -76,6 +93,7 @@
 - [ ] Login MTProto + salvataggio StringSession
 - [ ] Listener nuovi messaggi sui canali configurati
 - [ ] Parser Gemini (testo + immagini) → JSON + classificazione tipo
+- [ ] Brain Gemini globale: impara da news utili, salta risultati VIP/promo, aggiorna prompt dinamico
 - [ ] Normalizzazione symbol/risk + dedup
 - [ ] Esecuzione ordini MEXC (riuso daily-sniper) — prima SIM
 - [ ] Tabelle Prisma (config canali + segnali/trade)

@@ -18,6 +18,7 @@ import { FundingArbModule } from './funding-arb/funding-arb.module';
 import { GridScannerModule } from './grid-scanner/grid-scanner.module';
 import { EmaScalperModule } from './ema-scalper/ema-scalper.module';
 import { DailySniperModule } from './daily-sniper/daily-sniper.module';
+import { TgSignalsModule } from './tg-signals/tg-signals.module';
 
 @Module({
   imports: [
@@ -40,6 +41,7 @@ import { DailySniperModule } from './daily-sniper/daily-sniper.module';
     GridScannerModule,
     EmaScalperModule,
     DailySniperModule,
+    TgSignalsModule,
   ],
 })
 export class AppModule {}

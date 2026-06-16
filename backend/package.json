@@ -9,7 +9,8 @@
     "db:migrate": "prisma migrate dev --name init",
     "db:generate": "prisma generate",
     "db:studio": "prisma studio",
-    "db:push": "prisma db push"
+    "db:push": "prisma db push",
+    "tg:login": "ts-node scripts/tg-login.ts"
   },
   "dependencies": {
     "@nestjs/common": "^10.3.0",
@@ -25,11 +26,13 @@
     "class-validator": "^0.14.1",
     "reflect-metadata": "^0.1.14",
     "rxjs": "^7.8.1",
-    "socket.io": "^4.7.4"
+    "socket.io": "^4.7.4",
+    "telegram": "^2.26.22"
   },
   "devDependencies": {
     "@nestjs/cli": "^10.3.0",
     "@types/node": "^20.11.0",
+    "dotenv": "^17.4.2",
     "prisma": "^5.10.0",
     "ts-node": "^10.9.2",
     "tsconfig-paths": "^4.2.0",

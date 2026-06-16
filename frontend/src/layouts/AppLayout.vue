@@ -97,10 +97,7 @@ const { connected } = useSocket()
 const sidebarOpen = ref(false)
 
 const navItems: { to?: string; icon?: string; label?: string; section?: string }[] = [
-  { to: '/funding-arb',  icon: 'pi-dollar',        label: '💰 Funding Arb' },
-  { to: '/grid',         icon: 'pi-th-large',      label: '🔲 Grid Trading' },
-  { to: '/ema-scalper',  icon: 'pi-chart-line',    label: '📈 3 EMA Scalper' },
-  { to: '/daily-sniper', icon: 'pi-bullseye',      label: '🎯 Top-Down Daily' },
+  { to: '/tg-signals',  icon: 'pi-telegram',      label: '📡 Telegram Signals' },
 
   { section: 'Altro' },
   { to: '/trades',      icon: 'pi-list',         label: 'Trade History' },

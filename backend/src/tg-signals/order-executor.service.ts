@@ -1,0 +1,186 @@
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import * as ccxt from 'ccxt';
+
+// ── Motore ordini parametrico ───────────────────────────────────────────────
+// Estratto/generalizzato dal modulo daily-sniper: stesso flusso di apertura
+// (setLeverage → market/limit order → SL/TP nativi via contractPrivatePostStoporderPlace
+// con positionId) ma parametrico su (symbol, side, entry, sl, tp[]...).
+// Differenza chiave: TP MULTIPLI → uno stop-order nativo PARZIALE per ogni TP
+// (vol ripartito), più 1 SL nativo sul volume totale.
+
+export interface ExecParams {
+  symbol: string;            // simbolo MEXC già normalizzato (BTC/USDT:USDT)
+  side: 'long' | 'short';
+  entryType: 'market' | 'limit';
+  entryPrice?: number;       // richiesto per limit; per market è solo riferimento
+  sl: number;
+  tps: number[];             // uno o più take-profit (prezzi)
+  tpSplit: number[];         // ripartizione % volume sui TP (es. [50,30,20])
+  riskPct: number;           // % capitale a rischio
+  leverage: number;          // leva già cappata a levaMax dal chiamante
+}
+
+export interface ExecResult {
+  ok: boolean;
+  qty?: number;
+  entry?: number;
+  riskUsd?: number;
+  positionId?: string;
+  error?: string;
+}
+
+@Injectable()
+export class OrderExecutorService implements OnModuleInit {
+  private readonly logger = new Logger(OrderExecutorService.name);
+  private exchange: ccxt.mexc;
+  private ready = false;
+
+  constructor(private config: ConfigService) {}
+
+  async onModuleInit() {
+    const apiKey = this.config.get<string>('MEXC_API_KEY', '');
+    const secret = this.config.get<string>('MEXC_API_SECRET', '');
+    const has = apiKey && apiKey !== 'your_api_key_here';
+    this.exchange = new ccxt.mexc({ ...(has ? { apiKey, secret } : {}), enableRateLimit: true, timeout: 15000, options: { defaultType: 'swap' } });
+    try { await this.exchange.loadMarkets(); this.ready = true; } catch (e: any) { this.logger.warn(`[ORD] markets: ${e?.message}`); }
+  }
+
+  isReady() { return this.ready; }
+
+  // ── Normalizzazione simbolo ───────────────────────────────────────────────
+  // "BTC" | "btcusdt" | "BTC/USDT" | "BTC-USDT" → "BTC/USDT:USDT" se esiste su MEXC swap.
+  resolveSymbol(raw: string): string | null {
+    if (!raw) return null;
+    const s = raw.trim().toUpperCase();
+    const direct = this.tryMarket(s) || this.tryMarket(`${s}:USDT`);
+    if (direct) return direct;
+    // estrai la base (toglie USDT/PERP/suffissi e separatori)
+    const base = s.replace(/[\/\-_: ]/g, '').replace(/USDT.*$/, '').replace(/PERP$/, '');
+    if (!base) return null;
+    return this.tryMarket(`${base}/USDT:USDT`);
+  }
+
+  private tryMarket(sym: string): string | null {
+    try { const m = this.exchange.market(sym); return m ? m.symbol : null; } catch { return null; }
+  }
+
+  private marketMeta(symbol: string): { cs: number; minContracts: number } {
+    const m = this.exchange.market(symbol) as any;
+    return { cs: Number(m?.contractSize ?? 1) || 1, minContracts: Number(m?.limits?.amount?.min ?? 1) || 1 };
+  }
+
+  // Capitale = saldo MAX disponibile sul conto futures
+  async getCapital(fallback = 100): Promise<number> {
+    try {
+      const bal = await this.exchange.fetchBalance({ type: 'swap' });
+      const usdt = Number(bal?.USDT?.total ?? bal?.USDT?.free ?? 0);
+      if (usdt > 0) return usdt;
+    } catch (e: any) { this.logger.warn(`[ORD] saldo non letto: ${e?.message?.slice(0, 50)}`); }
+    return fallback;
+  }
+
+  async getPrice(symbol: string): Promise<number | null> {
+    try { const t = await this.exchange.fetchTicker(symbol); return Number(t?.last ?? t?.close ?? 0) || null; } catch { return null; }
+  }
+
+  // Dimensiona la quantità in contratti dato il rischio (entry-SL).
+  async sizeQty(symbol: string, entry: number, sl: number, riskPct: number, capitalFallback = 100): Promise<{ qty: number; riskUsd: number; cs: number }> {
+    const { cs, minContracts } = this.marketMeta(symbol);
+    const slDist = Math.abs(entry - sl);
+    const capital = await this.getCapital(capitalFallback);
+    const riskUsd = capital * (riskPct / 100);
+    const qty = slDist > 0 ? Math.max(minContracts, Math.round(riskUsd / (slDist * cs))) : minContracts;
+    return { qty, riskUsd: slDist * qty * cs, cs };
+  }
+
+  // ── Apertura LIVE su MEXC ─────────────────────────────────────────────────
+  async openLive(p: ExecParams): Promise<ExecResult> {
+    const { symbol, side } = p;
+    const positionType = side === 'long' ? 1 : 2;
+    const entryRef = p.entryType === 'limit' && p.entryPrice ? p.entryPrice : (await this.getPrice(symbol)) ?? p.entryPrice ?? 0;
+    if (!entryRef) return { ok: false, error: 'prezzo entry non disponibile' };
+
+    const { qty, riskUsd } = await this.sizeQty(symbol, entryRef, p.sl, p.riskPct);
+    if (qty <= 0) return { ok: false, error: 'qty calcolata = 0' };
+
+    try {
+      await this.exchange.setLeverage(p.leverage, symbol, { openType: 1, positionType }).catch(() => {});
+      const params: any = { openType: 1, positionType, leverage: p.leverage };
+      if (p.entryType === 'limit' && p.entryPrice) {
+        const px = Number(this.exchange.priceToPrecision(symbol, p.entryPrice));
+        if (side === 'long') await this.exchange.createLimitBuyOrder(symbol, qty, px, params);
+        else await this.exchange.createLimitSellOrder(symbol, qty, px, params);
+      } else {
+        if (side === 'long') await this.exchange.createMarketBuyOrder(symbol, qty, params);
+        else await this.exchange.createMarketSellOrder(symbol, qty, params);
+      }
+    } catch (e: any) {
+      return { ok: false, error: `apertura: ${e?.message?.slice(0, 80)}` };
+    }
+
+    // Per i market order la posizione è immediata → attacca SL/TP nativi.
+    // Per i limit l'attacco SL/TP avviene quando la posizione esiste (gestito a parte).
+    let positionId: string | undefined;
+    if (p.entryType !== 'limit') {
+      try {
+        await new Promise((r) => setTimeout(r, 800));
+        positionId = await this.attachStops(symbol, side, qty, p.sl, p.tps, p.tpSplit);
+      } catch (e: any) { this.logger.warn(`[ORD LIVE] SL/TP: ${e?.message?.slice(0, 70)}`); }
+    }
+    this.logger.log(`[ORD LIVE] ${side.toUpperCase()} ${symbol} qty ${qty} entry~${entryRef} SL ${p.sl} TP ${p.tps.join('/')} rischio $${riskUsd.toFixed(2)}`);
+    return { ok: true, qty, entry: entryRef, riskUsd, positionId };
+  }
+
+  // Attacca 1 SL nativo (vol totale) + N TP nativi parziali (vol ripartito su tpSplit).
+  async attachStops(symbol: string, side: 'long' | 'short', qty: number, sl: number, tps: number[], tpSplit: number[]): Promise<string | undefined> {
+    const pos = (await this.exchange.fetchPositions([symbol])).filter((x: any) => Math.abs(Number(x.contracts || 0)) > 0)[0];
+    const positionId = pos?.info?.positionId;
+    const posVol = Math.abs(Number(pos?.contracts ?? qty));
+    const mexcSymbol = (this.exchange.market(symbol) as any).id;
+    if (!positionId) { this.logger.warn('[ORD LIVE] positionId non trovato — SL/TP non attaccati'); return undefined; }
+
+    const slPx = Number(this.exchange.priceToPrecision(symbol, sl));
+    // SL sul volume totale
+    await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol: posVol, stopLossPrice: slPx });
+
+    // TP parziali: ripartisci posVol sui pesi tpSplit
+    const weights = this.normalizeSplit(tpSplit, tps.length);
+    let allocated = 0;
+    for (let i = 0; i < tps.length; i++) {
+      const isLast = i === tps.length - 1;
+      const vol = isLast ? Math.max(1, posVol - allocated) : Math.max(1, Math.round(posVol * weights[i]));
+      allocated += vol;
+      const tpPx = Number(this.exchange.priceToPrecision(symbol, tps[i]));
+      try {
+        await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol, takeProfitPrice: tpPx });
+      } catch (e: any) { this.logger.warn(`[ORD LIVE] TP${i + 1}: ${e?.message?.slice(0, 50)}`); }
+    }
+    this.logger.log(`[ORD LIVE] SL/TP attaccati · posId ${positionId} · SL ${slPx} · TP ${tps.join('/')}`);
+    return positionId;
+  }
+
+  // pesi normalizzati (somma 1) per n TP, partendo da split tipo [50,30,20]
+  private normalizeSplit(split: number[], n: number): number[] {
+    const base = (split && split.length ? split : [50, 30, 20]).slice(0, n);
+    while (base.length < n) base.push(base.length ? base[base.length - 1] : 100 / n);
+    const sum = base.reduce((s, x) => s + x, 0) || 1;
+    return base.map((x) => x / sum);
+  }
+
+  // ── Chiusura LIVE: market reduceOnly su tutta la posizione + cancel trigger ─
+  async closeLive(symbol: string, side: 'long' | 'short', qty?: number): Promise<{ ok: boolean; error?: string }> {
+    try {
+      const positions = (await this.exchange.fetchPositions([symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
+      for (const pos of positions) {
+        const vol = Math.abs(Number(pos.contracts));
+        const isLong = (pos.side === 'long') || Number(pos.contracts) > 0;
+        if (isLong) await this.exchange.createMarketSellOrder(symbol, vol, { reduceOnly: true });
+        else await this.exchange.createMarketBuyOrder(symbol, vol, { reduceOnly: true });
+      }
+    } catch (e: any) { return { ok: false, error: e?.message?.slice(0, 80) }; }
+    try { for (const o of await this.exchange.fetchOpenOrders(symbol)) { try { await this.exchange.cancelOrder(o.id, symbol); } catch {} } } catch {}
+    try { await this.exchange.cancelAllOrders(symbol, { trigger: true }); } catch {}
+    return { ok: true };
+  }
+}

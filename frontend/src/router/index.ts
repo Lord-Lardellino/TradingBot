@@ -5,35 +5,17 @@ const router = createRouter({
   routes: [
     {
       path: '/',
-      redirect: '/funding-arb',
+      redirect: '/tg-signals',
     },
     {
       path: '/',
       component: () => import('@/layouts/AppLayout.vue'),
       children: [
         {
-          path: 'funding-arb',
-          name: 'funding-arb',
-          component: () => import('@/pages/FundingArb.vue'),
-          meta: { title: 'Funding Rate Arbitrage' },
-        },
-        {
-          path: 'grid',
-          name: 'grid',
-          component: () => import('@/pages/GridScanner.vue'),
-          meta: { title: 'Grid Trading' },
-        },
-        {
-          path: 'ema-scalper',
-          name: 'ema-scalper',
-          component: () => import('@/pages/EmaScalper.vue'),
-          meta: { title: '3 EMA Scalper' },
-        },
-        {
-          path: 'daily-sniper',
-          name: 'daily-sniper',
-          component: () => import('@/pages/DailySniper.vue'),
-          meta: { title: 'Top-Down Daily' },
+          path: 'tg-signals',
+          name: 'tg-signals',
+          component: () => import('@/pages/TgSignals.vue'),
+          meta: { title: 'Telegram Signals' },
         },
         {
           path: 'trades',
