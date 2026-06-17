@@ -84,7 +84,7 @@ export class TgSignalsService implements OnModuleInit {
     // serve una direzione/azione operativa…
     const action = /\b(long|short|buy|sell|compra|vendi|close|chiudi|exit|breakeven|break\s*even)\b/.test(t);
     // …oppure i campi tipici di un setup (entry/sl/tp/target/leva)
-    const fields = /\b(entry|entrata|sl|stop\s*loss|tp\d?|take\s*profit|targets?|leverage|leva)\b/.test(t);
+    const fields = /\b(entry|entrata|sl|stop[\s_-]*loss|tp\d?|take[\s_-]*profits?|targets?|leverage|leva)\b/.test(t);
     return action || fields;
   }
 
@@ -211,6 +211,16 @@ export class TgSignalsService implements OnModuleInit {
     // (coin diversi sullo stesso canale sono permessi → prima li skippava tutti).
     const dupSameSymbol = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, symbol, side: p.side, tradeStatus: { in: ['open', 'pending'] } } });
     if (dupSameSymbol) return void (await skip(`già un trade ${p.side} aperto su ${symbol} (no duplicato)`));
+
+    if (channel.mode === 'live') {
+      const liveConflict = await this.prisma.tgSignal.findFirst({
+        where: { symbol, mode: 'live', tradeStatus: { in: ['open', 'pending'] } },
+        orderBy: { createdAt: 'desc' },
+      });
+      if (liveConflict) {
+        return void (await skip(`live gia attivo su ${symbol} da altro canale: non tocco posizione/SL/TP`));
+      }
+    }
 
     if (p.leverage == null) return void (await skip('leva Gemini mancante'));
     const leverage = this.resolveLeverage(p.leverage, channel.levaMax);
@@ -353,22 +363,32 @@ export class TgSignalsService implements OnModuleInit {
           continue;
         }
 
-        if (String(t.note ?? '').match(/posId\s+(?!n\/d)/i)) continue;
         const tps: number[] = JSON.parse(t.takeProfits ?? '[]');
-        if (!tps.length) continue;
         const position = await this.executor.getOpenPosition(t.symbol, t.side as any);
         if (!position) {
           const hasOrder = await this.executor.hasOpenOrder(t.symbol);
           const hasStops = await this.executor.hasStopOrders(t.symbol);
           if (!hasOrder && !hasStops) {
+            const hadPosition = /posId\s+(?!n\/d)/i.test(String(t.note ?? ''));
             await this.prisma.tgSignal.update({
               where: { id: t.id },
               data: {
                 tradeStatus: 'closed',
-                reason: 'no_fill',
-                note: 'chiuso: nessuna posizione/ordine live trovato',
+                reason: hadPosition ? 'external_close' : 'no_fill',
+                note: hadPosition ? 'chiuso: posizione live non piu presente' : 'chiuso: nessuna posizione/ordine live trovato',
                 closedAt: new Date(),
               },
+            });
+          }
+          continue;
+        }
+
+        const protectedNow = await this.executor.hasProtection(t.symbol, position.positionId, tps.length > 0);
+        if (protectedNow) {
+          if (!/posId\s+(?!n\/d)/i.test(String(t.note ?? '')) && position.positionId) {
+            await this.prisma.tgSignal.update({
+              where: { id: t.id },
+              data: { tradeStatus: 'open', note: `live posId ${position.positionId}` },
             });
           }
           continue;

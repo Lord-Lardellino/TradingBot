@@ -208,7 +208,13 @@ export class SignalParserService {
   }
 
   private parseStructuredSignal(rawText: string): ParsedSignal | null {
-    const text = rawText.replace(/\u00a0/g, ' ');
+    const labeled = this.parseLabeledSignal(rawText);
+    if (labeled) return labeled;
+
+    const text = rawText
+      .replace(/\u00a0/g, ' ')
+      .replace(/\btake[\s_-]*profits?\b/gi, 'targets')
+      .replace(/\bstop[\s_-]*loss\b/gi, 'stop loss');
     const compact = text.replace(/\s+/g, ' ').trim();
     const hasTradeShape = /(futures signal|trade\s*:|entry\s*:|targets?\s*:|stop\s*loss\s*:|leverage\s*:)/i.test(compact);
     if (!hasTradeShape || !/entry\s*:/i.test(compact) || !/(stop\s*loss|sl)\s*:/i.test(compact)) return null;
@@ -227,6 +233,53 @@ export class SignalParserService {
     const tps = nums(targetLine);
     const sl = nums(slLine)[0] ?? null;
     const leverage = nums(leverageLine)[0] ?? null;
+    if (!entries.length || !tps.length || sl == null || leverage == null) return null;
+
+    const entryPrice = entries.reduce((sum, x) => sum + x, 0) / entries.length;
+    const entryLow = entries.length > 1 ? Math.min(...entries) : null;
+    const entryHigh = entries.length > 1 ? Math.max(...entries) : null;
+
+    return {
+      type: 'NEW',
+      symbol: symbolMatch[1].toUpperCase(),
+      side: sideMatch[1].toLowerCase() as 'long' | 'short',
+      entryType: 'limit',
+      entryPrice,
+      entryLow,
+      entryHigh,
+      sl,
+      tps,
+      leverage,
+      confidence: 0.95,
+      newSl: null,
+      closePct: null,
+    };
+  }
+
+  private parseLabeledSignal(rawText: string): ParsedSignal | null {
+    const symbolMatch = rawText.match(/#?\$?([A-Z0-9]{2,})(?:\s*\/\s*USDT|USDT)\b/i);
+    const sideMatch = rawText.match(/\b(LONG|SHORT)\b/i);
+    if (!symbolMatch || !sideMatch) return null;
+
+    const text = rawText
+      .replace(/\u00a0/g, ' ')
+      .replace(/\r/g, '\n')
+      .replace(/\btake[\s_-]*profits?\b/gi, 'TAKE_PROFIT')
+      .replace(/\bstop[\s_-]*loss\b/gi, 'STOP_LOSS')
+      .replace(/\bentry\s*price\b/gi, 'ENTRY')
+      .replace(/\b\d+(?:st|nd|rd|th)\s+entry\b/gi, 'ENTRY')
+      .replace(/\bleverage\b/gi, 'LEVERAGE');
+
+    const nums = (s: string) => (s.match(/\d+(?:\.\d+)?/g) ?? []).map(Number).filter((x) => Number.isFinite(x));
+    const entries: number[] = [];
+    for (const m of text.matchAll(/\bENTRY\b\s*:?\s*([^\n]+)/gi)) entries.push(...nums(m[1]));
+
+    const tpBlock = text.match(/\bTAKE_PROFIT\b\s*:?\s*([\s\S]*?)(?=\bSTOP_LOSS\b|\bLEVERAGE\b|\bENTRY\b|$)/i)?.[1] ?? '';
+    const slBlock = text.match(/\bSTOP_LOSS\b\s*:?\s*([\s\S]*?)(?=\bTAKE_PROFIT\b|\bLEVERAGE\b|\bENTRY\b|$)/i)?.[1] ?? '';
+    const leverageBlock = text.match(/\bLEVERAGE\b\s*:?\s*([^\n]+)/i)?.[1] ?? '';
+    const tps = nums(tpBlock);
+    const sl = nums(slBlock)[0] ?? null;
+    const leverage = nums(leverageBlock)[0] ?? null;
     if (!entries.length || !tps.length || sl == null || leverage == null) return null;
 
     const entryPrice = entries.reduce((sum, x) => sum + x, 0) / entries.length;

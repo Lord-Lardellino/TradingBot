@@ -120,13 +120,26 @@ export class OrderExecutorService implements OnModuleInit {
   // Stop order (SL/TP) attivi sulla posizione: se ce ne sono, la posizione è viva.
   // Serve a NON dichiarare "no_fill" quando il limit si è riempito (i filled hanno
   // solo stop order, non ordini normali) e fetchPositions ha un singhiozzo transitorio.
-  async hasStopOrders(symbol: string): Promise<boolean> {
+  async listStopOrders(symbol: string, positionId?: string): Promise<any[]> {
     try {
       const id = (this.exchange.market(symbol) as any).id;
       const r = await (this.exchange as any).contractPrivateGetStoporderOpenOrders({ symbol: id });
       const arr = (r && r.data) || [];
-      return Array.isArray(arr) && arr.length > 0;
-    } catch { return true; }   // nel dubbio non chiudere
+      const list = Array.isArray(arr) ? arr : [];
+      return positionId ? list.filter((o: any) => String(o.positionId ?? '') === String(positionId)) : list;
+    } catch { return [{ unknown: true }]; }   // nel dubbio non chiudere
+  }
+
+  async hasStopOrders(symbol: string, positionId?: string): Promise<boolean> {
+    return (await this.listStopOrders(symbol, positionId)).length > 0;
+  }
+
+  async hasProtection(symbol: string, positionId: string | undefined, needsTp: boolean): Promise<boolean> {
+    const orders = await this.listStopOrders(symbol, positionId);
+    if (orders.some((o: any) => o.unknown)) return true;
+    const hasSl = orders.some((o: any) => o.stopLossPrice != null && String(o.stopLossPrice) !== '');
+    const hasTp = orders.some((o: any) => o.takeProfitPrice != null && String(o.takeProfitPrice) !== '');
+    return hasSl && (!needsTp || hasTp);
   }
 
   // Dimensiona la quantità in contratti dato il rischio (entry-SL).
@@ -247,17 +260,41 @@ export class OrderExecutorService implements OnModuleInit {
 
   // ── Chiusura LIVE: market reduceOnly su tutta la posizione + cancel trigger ─
   async closeLive(symbol: string, side: 'long' | 'short', qty?: number): Promise<{ ok: boolean; error?: string }> {
+    const wantedOrderSide = side === 'long' ? 'buy' : 'sell';
+    const closeSide = side === 'long' ? 'sell' : 'buy';
+    const mexcSymbol = (this.exchange.market(symbol) as any).id;
+    let positionId: string | undefined;
+
     try {
       const positions = (await this.exchange.fetchPositions([symbol])).filter((p: any) => Math.abs(Number(p.contracts || 0)) > 0);
       for (const pos of positions) {
         const vol = Math.abs(Number(pos.contracts));
         const isLong = (pos.side === 'long') || Number(pos.contracts) > 0;
-        if (isLong) await this.exchange.createMarketSellOrder(symbol, vol, { reduceOnly: true });
-        else await this.exchange.createMarketBuyOrder(symbol, vol, { reduceOnly: true });
+        if ((side === 'long') !== isLong) continue;
+        positionId = pos?.info?.positionId ? String(pos.info.positionId) : undefined;
+        await this.exchange.createOrder(symbol, 'market', closeSide, qty ?? vol, undefined, { reduceOnly: true });
       }
     } catch (e: any) { return { ok: false, error: e?.message?.slice(0, 80) }; }
-    try { for (const o of await this.exchange.fetchOpenOrders(symbol)) { try { await this.exchange.cancelOrder(o.id, symbol); } catch {} } } catch {}
-    try { await this.exchange.cancelAllOrders(symbol, { trigger: true }); } catch {}
+
+    try {
+      for (const o of await this.exchange.fetchOpenOrders(symbol, undefined, undefined, { type: 'swap' })) {
+        if (o.side !== wantedOrderSide) continue;
+        try { await this.exchange.cancelOrder(o.id, symbol); } catch {}
+      }
+    } catch {}
+
+    if (positionId) {
+      try {
+        for (const o of await this.listStopOrders(symbol, positionId)) {
+          if (o.unknown) continue;
+          const stopOrderId = o.id ?? o.stopOrderId;
+          if (stopOrderId) {
+            try { await (this.exchange as any).contractPrivatePostStoporderCancel({ symbol: mexcSymbol, stopOrderId }); } catch {}
+          }
+        }
+      } catch {}
+    }
+
     return { ok: true };
   }
 }
