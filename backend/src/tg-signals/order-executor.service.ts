@@ -170,7 +170,10 @@ export class OrderExecutorService implements OnModuleInit {
     return { ok: true, qty, entry: entryRef, riskUsd, positionId };
   }
 
-  // Attacca 1 SL nativo (vol totale) + N TP nativi parziali (vol ripartito su tpSplit).
+  // Attacca SL + N TP parziali. IMPORTANTE: MEXC SOMMA i volumi degli stop order
+  // (code 5004 se SL_pieno + TP_parziali > posizione). Pattern corretto: N stop order,
+  // ognuno con la SUA fetta di volume che porta SIA lo stesso SL SIA il proprio TP
+  // (totale vol = posizione). Così ogni chunk ha TP+SL e i parziali funzionano.
   async attachStops(symbol: string, side: 'long' | 'short', qty: number, sl: number, tps: number[], tpSplit: number[]): Promise<string | undefined> {
     const pos = await this.getOpenPosition(symbol, side);
     const positionId = pos?.positionId;
@@ -183,25 +186,33 @@ export class OrderExecutorService implements OnModuleInit {
     if (refPrice && !this.protectionIsValid(side, refPrice, slPx, tps)) {
       throw new Error(`protection_invalid ${symbol}: price=${refPrice} sl=${slPx} tp=${tps.join('/')}`);
     }
-    // SL sul volume totale
-    await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol: posVol, stopLossPrice: slPx });
 
-    // TP parziali: ripartisci posVol sui pesi tpSplit
+    // azzera eventuali stop order già presenti (preset al fill / update SL) per non sommare i volumi
+    try { await (this.exchange as any).contractPrivatePostStoporderCancelAll({ symbol: mexcSymbol }); await new Promise((r) => setTimeout(r, 400)); } catch {}
+
+    // nessun TP → solo SL sul volume totale
+    if (!tps?.length) {
+      await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol: posVol, stopLossPrice: slPx });
+      this.logger.log(`[ORD LIVE] SL attaccato (no TP) · posId ${positionId} · SL ${slPx}`);
+      return positionId;
+    }
+
+    // N chunk: vol ripartito su tpSplit, ognuno con SL + il proprio TP (totale = posVol)
     const weights = this.normalizeSplit(tpSplit, tps.length);
     let allocated = 0;
-    let placedTp = 0;
+    let placed = 0;
     for (let i = 0; i < tps.length; i++) {
       const isLast = i === tps.length - 1;
       const vol = isLast ? Math.max(1, posVol - allocated) : Math.max(1, Math.round(posVol * weights[i]));
       allocated += vol;
       const tpPx = Number(this.exchange.priceToPrecision(symbol, tps[i]));
       try {
-        await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol, takeProfitPrice: tpPx });
-        placedTp++;
-      } catch (e: any) { this.logger.warn(`[ORD LIVE] TP${i + 1}: ${e?.message?.slice(0, 50)}`); }
+        await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol, stopLossPrice: slPx, takeProfitPrice: tpPx });
+        placed++;
+      } catch (e: any) { this.logger.warn(`[ORD LIVE] chunk TP${i + 1}: ${e?.message?.slice(0, 50)}`); }
     }
-    if (!placedTp) throw new Error(`protection_failed_tp ${symbol}`);
-    this.logger.log(`[ORD LIVE] SL/TP attaccati · posId ${positionId} · SL ${slPx} · TP ${tps.join('/')}`);
+    if (!placed) throw new Error(`protection_failed ${symbol}`);
+    this.logger.log(`[ORD LIVE] SL+TP parziali attaccati · posId ${positionId} · SL ${slPx} · TP ${tps.join('/')} · chunk ${placed}/${tps.length}`);
     return positionId;
   }
 
