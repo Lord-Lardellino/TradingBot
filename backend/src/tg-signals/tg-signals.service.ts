@@ -31,6 +31,9 @@ export class TgSignalsService implements OnModuleInit {
   onModuleInit() {
     this.tg.onMessage((msg) => this.handleIncoming(msg).catch((e) => this.logger.warn(`[TGS] handle: ${e?.message?.slice(0, 80)}`)));
     setTimeout(() => this.syncDialogs(true).catch((e) => this.logger.warn(`[TGS] sync dialogs: ${e?.message?.slice(0, 80)}`)), 15000);
+    // Catch-up all'avvio: recupera i segnali arrivati durante il downtime del restart
+    // (finestra in cui il listener realtime è offline) senza aspettare il poll dei 5 min.
+    setTimeout(() => this.pollTelegramMessages(15).catch((e) => this.logger.warn(`[TGS] catch-up poll: ${e?.message?.slice(0, 80)}`)), 45000);
   }
 
   // ── Ingresso messaggio ────────────────────────────────────────────────────
