@@ -53,7 +53,13 @@ export class TelegramClientService implements OnModuleInit, OnModuleDestroy {
     const { StringSession } = await import('telegram/sessions');
     const { NewMessage } = await import('telegram/events');
 
-    this.client = new TelegramClient(new StringSession(session), apiId, apiHash, { connectionRetries: 5 });
+    this.client = new TelegramClient(new StringSession(session), apiId, apiHash, {
+      connectionRetries: 5,
+      // tieni la connessione viva e ricevi gli update in tempo reale
+      autoReconnect: true,
+      retryDelay: 1000,
+      requestRetries: 5,
+    });
     await this.client.connect();
     this.connected = await this.client.checkAuthorization();
     if (!this.connected) { this.logger.warn('[TG] sessione non autorizzata — rifai npm run tg:login'); return; }
@@ -66,11 +72,20 @@ export class TelegramClientService implements OnModuleInit, OnModuleDestroy {
         const channelId = String(msg?.chatId ?? msg?.peerId?.channelId ?? '');
         let title: string | undefined;
         try { const chat = await msg.getChat(); title = chat?.title ?? chat?.username; } catch {}
+        this.logger.log(`[TG] realtime msg da ${title ?? channelId} (#${msg?.id})`);
         this.handler?.({ channelId, messageId: String(msg?.id ?? ''), text, title });
       } catch (e: any) { this.logger.warn(`[TG] msg handler: ${e?.message?.slice(0, 60)}`); }
     }, new NewMessage({}));
 
-    this.logger.log('[TG] listener MTProto attivo (lettura passiva canali)');
+    // IMPORTANTE: scalda la cache delle entità/dialoghi. Senza questo GramJS spesso
+    // NON consegna in tempo reale i post dei canali (broadcast) finché non li ha in cache.
+    try {
+      await this.client.getDialogs({ limit: 200 });
+      // recupera eventuali update persi mentre era disconnesso
+      if (typeof (this.client as any).catchUp === 'function') await (this.client as any).catchUp();
+    } catch (e: any) { this.logger.warn(`[TG] warmup dialoghi: ${e?.message?.slice(0, 60)}`); }
+
+    this.logger.log('[TG] listener MTProto attivo (realtime, lettura passiva canali)');
   }
 
   // Lista dei dialoghi (canali/gruppi) a cui l'account è iscritto — per la UI di setup.

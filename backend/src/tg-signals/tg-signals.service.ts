@@ -42,6 +42,17 @@ export class TgSignalsService implements OnModuleInit {
       await this.prisma.tgChannel.update({ where: { id: channel.id }, data: { title: msg.title } }).catch(() => {});
     }
 
+    // PRE-FILTRO ECONOMICO (zero Gemini): prendiamo SOLO i segnali. Tutto ciò che non
+    // ha la forma di un segnale operativo (promo, chiacchiere, news, risultati VIP)
+    // viene scartato senza chiamare Gemini → drastico taglio delle richieste.
+    if (!this.looksLikeSignal(msg.text)) {
+      await this.prisma.tgSignal.create({ data: {
+        channelDbId: channel.id, tgMessageId: msg.messageId, rawText: msg.text.slice(0, 4000),
+        parsed: '{}', type: 'RUMORE', status: 'skipped', note: 'pre-filtro: non è un segnale (no Gemini)',
+      } });
+      return;
+    }
+
     const memory = await this.getPromptMemory();
     const parsed = await this.parser.parse(msg.text, memory.summary, { riskPct: channel.riskPct, leverageMax: channel.levaMax });
     const rec = await this.prisma.tgSignal.create({
@@ -56,8 +67,20 @@ export class TgSignalsService implements OnModuleInit {
     if (parsed.type === 'NEW') return this.executeNew(channel, rec.id, parsed);
     if (parsed.type === 'UPDATE') return this.applyUpdate(channel, rec.id, parsed);
     if (parsed.type === 'CLOSE') return this.applyClose(channel, rec.id);
-    // RUMORE → nessuna azione
-    return this.learnFromNonSignal(rec.id, msg.text, parsed, memory.summary, channel.title ?? channel.username ?? channel.channelId);
+    // RUMORE (Gemini ha visto che non era operativo) → scarto, niente news-brain.
+    return void (await this.prisma.tgSignal.update({ where: { id: rec.id }, data: { status: 'skipped', note: 'non operativo' } }));
+  }
+
+  // Riconosce a regex (zero costo) se un messaggio ha la forma di un segnale/gestione
+  // trade. Serve solo a decidere SE chiamare Gemini, non a interpretare il segnale.
+  private looksLikeSignal(text: string): boolean {
+    const t = (text || '').toLowerCase();
+    if (!t.trim()) return false;
+    // serve una direzione/azione operativa…
+    const action = /\b(long|short|buy|sell|compra|vendi|close|chiudi|exit|breakeven|break\s*even)\b/.test(t);
+    // …oppure i campi tipici di un setup (entry/sl/tp/target/leva)
+    const fields = /\b(entry|entrata|sl|stop\s*loss|tp\d?|take\s*profit|targets?|leverage|leva)\b/.test(t);
+    return action || fields;
   }
 
   private async ensureChannelForMessage(msg: IncomingMessage) {
@@ -179,39 +202,63 @@ export class TgSignalsService implements OnModuleInit {
     const symbol = p.symbol ? this.executor.resolveSymbol(p.symbol) : null;
     if (!symbol) return void (await skip(`simbolo non mappabile: ${p.symbol}`));
 
-    // un solo trade aperto per canale: se ce n'è uno, salta (no hedge)
-    const openOnChannel = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tradeStatus: { in: ['open', 'pending'] } } });
-    if (openOnChannel) return void (await skip('già un trade aperto su questo canale (no hedge)'));
+    // No duplicati: blocca solo lo STESSO symbol+side già aperto su questo canale
+    // (coin diversi sullo stesso canale sono permessi → prima li skippava tutti).
+    const dupSameSymbol = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, symbol, side: p.side, tradeStatus: { in: ['open', 'pending'] } } });
+    if (dupSameSymbol) return void (await skip(`già un trade ${p.side} aperto su ${symbol} (no duplicato)`));
 
     if (p.leverage == null) return void (await skip('leva Gemini mancante'));
     const leverage = this.resolveLeverage(p.leverage, channel.levaMax);
     const tpSplit = String(channel.tpSplit).split(',').map((x: string) => Number(x.trim())).filter((x) => x > 0);
-    const entryRef = (p.entryType === 'limit' && p.entryPrice) ? p.entryPrice : (await this.executor.getPrice(symbol)) ?? p.entryPrice;
-    if (!entryRef) return void (await skip('prezzo entry non disponibile'));
+
+    // Decisione entrata: se il prezzo è nella ZONA d'entrata → MARKET subito;
+    // altrimenti LIMIT al prezzo d'entrata (con SL/TP preimpostati).
     const livePrice = await this.executor.getPrice(symbol);
-    if (livePrice && !this.executor.protectionIsValid(p.side, livePrice, p.sl, p.tps)) {
-      return void (await skip(`prezzo gia oltre protezione: price=${livePrice} SL=${p.sl} TP=${p.tps.join('/')}`));
+    const zone = this.entryZone(p);
+    let entryType: 'market' | 'limit' = p.entryType;
+    let entryPrice: number | null = p.entryPrice;
+    if (livePrice && zone && livePrice >= zone.lo && livePrice <= zone.hi) {
+      entryType = 'market'; entryPrice = null;
+    } else if (p.entryPrice != null) {
+      entryType = 'limit'; entryPrice = p.entryPrice;
+    } else {
+      entryType = 'market'; entryPrice = null;
+    }
+    const entryRef = (entryType === 'limit' && entryPrice) ? entryPrice : (livePrice ?? entryPrice);
+    if (!entryRef) return void (await skip('prezzo entry non disponibile'));
+    // Protezione valida rispetto al prezzo d'ingresso effettivo (non al prezzo live,
+    // che per un limit lontano falsava il controllo e skippava setup validi).
+    if (!this.executor.protectionIsValid(p.side, entryRef, p.sl, p.tps)) {
+      return void (await skip(`SL/TP incoerenti con entry ${entryRef}: SL=${p.sl} TP=${p.tps.join('/')}`));
     }
 
     if (channel.mode === 'live') {
-      const r = await this.executor.openLive({ symbol, side: p.side, entryType: p.entryType, entryPrice: p.entryPrice ?? undefined, sl: p.sl, tps: p.tps, tpSplit, riskPct: channel.riskPct, leverage });
+      const r = await this.executor.openLive({ symbol, side: p.side, entryType, entryPrice: entryPrice ?? undefined, sl: p.sl, tps: p.tps, tpSplit, riskPct: channel.riskPct, leverage });
       if (!r.ok) return void (await skip(`live: ${r.error}`));
-      const tradeStatus = r.positionId ? 'open' : 'pending';
+      const tradeStatus = (r.positionId || entryType === 'market') ? 'open' : 'pending';
+      const note = r.positionId ? `live posId ${r.positionId}` : r.preset ? 'live limit preset (SL/TP sull-ordine)' : 'live pending limit';
       await this.prisma.tgSignal.update({ where: { id: recId }, data: {
         status: 'executed', mode: 'live', tradeStatus, symbol, side: p.side,
         entry: r.entry, stopLoss: p.sl, takeProfits: JSON.stringify(p.tps), qty: r.qty, leverage, riskUsd: r.riskUsd,
-        note: r.positionId ? `live posId ${r.positionId}` : 'live pending limit',
+        note,
       } });
-      this.logger.log(`[TGS LIVE] ${channel.username ?? channel.channelId} → ${p.side} ${symbol} qty ${r.qty}`);
+      this.logger.log(`[TGS LIVE] ${channel.username ?? channel.channelId} → ${entryType} ${p.side} ${symbol} qty ${r.qty}`);
     } else {
       const { qty, riskUsd } = await this.executor.sizeQty(symbol, entryRef, p.sl, channel.riskPct);
       await this.prisma.tgSignal.update({ where: { id: recId }, data: {
         status: 'executed', mode: 'sim', tradeStatus: 'open', symbol, side: p.side,
         entry: entryRef, stopLoss: p.sl, takeProfits: JSON.stringify(p.tps), qty, leverage, riskUsd,
-        note: 'sim',
+        note: `sim ${entryType}`,
       } });
-      this.logger.log(`[TGS SIM] ${channel.username ?? channel.channelId} → ${p.side} ${symbol} qty ${qty} entry ${entryRef}`);
+      this.logger.log(`[TGS SIM] ${channel.username ?? channel.channelId} → ${entryType} ${p.side} ${symbol} qty ${qty} entry ${entryRef}`);
     }
+  }
+
+  // Zona d'entrata: range esplicito se presente, altrimenti banda ±0.15% sul prezzo singolo.
+  private entryZone(p: ParsedSignal): { lo: number; hi: number } | null {
+    if (p.entryLow != null && p.entryHigh != null) return { lo: Math.min(p.entryLow, p.entryHigh), hi: Math.max(p.entryLow, p.entryHigh) };
+    if (p.entryPrice != null) { const tol = Math.abs(p.entryPrice) * 0.0015; return { lo: p.entryPrice - tol, hi: p.entryPrice + tol }; }
+    return null;
   }
 
   // ── UPDATE: sposta SL (BE) sul trade aperto del canale ────────────────────
@@ -282,9 +329,38 @@ export class TgSignalsService implements OnModuleInit {
     for (const t of open) {
       try {
         if (!t.symbol || !t.side || !t.qty || !t.stopLoss) continue;
+
+        // Limit con SL/TP PREIMPOSTATI sull'ordine: niente da attaccare. Quando si
+        // riempie → flip a 'open'; se l'ordine sparisce senza posizione → no_fill.
+        if (/preset/i.test(String(t.note ?? ''))) {
+          const pos = await this.executor.getOpenPosition(t.symbol, t.side as any);
+          if (pos) {
+            if (t.tradeStatus !== 'open') await this.prisma.tgSignal.update({ where: { id: t.id }, data: { tradeStatus: 'open', note: `live preset attivo${pos.positionId ? ` posId ${pos.positionId}` : ''}` } });
+          } else if (!(await this.executor.hasOpenOrder(t.symbol))) {
+            await this.prisma.tgSignal.update({ where: { id: t.id }, data: { tradeStatus: 'closed', reason: 'no_fill', note: 'chiuso: limit preset non riempito', closedAt: new Date() } });
+          }
+          continue;
+        }
+
         if (String(t.note ?? '').match(/posId\s+(?!n\/d)/i)) continue;
         const tps: number[] = JSON.parse(t.takeProfits ?? '[]');
         if (!tps.length) continue;
+        const position = await this.executor.getOpenPosition(t.symbol, t.side as any);
+        if (!position) {
+          const hasOrder = await this.executor.hasOpenOrder(t.symbol);
+          if (!hasOrder) {
+            await this.prisma.tgSignal.update({
+              where: { id: t.id },
+              data: {
+                tradeStatus: 'closed',
+                reason: 'no_fill',
+                note: 'chiuso: nessuna posizione/ordine live trovato',
+                closedAt: new Date(),
+              },
+            });
+          }
+          continue;
+        }
 
         const channel = await this.prisma.tgChannel.findUnique({ where: { id: t.channelDbId } });
         const tpSplit = String(channel?.tpSplit ?? '50,30,20').split(',').map(Number).filter((x) => x > 0);
@@ -310,8 +386,8 @@ export class TgSignalsService implements OnModuleInit {
     }
   }
 
-  @Cron('*/30 * * * * *')
-  async pollTelegramMessages(limitPerDialog = 20) {
+  @Cron('0 */5 * * * *')   // backstop ogni 5 min: il realtime listener copre l'immediatezza
+  async pollTelegramMessages(limitPerDialog = 10) {
     if (!this.tg.status().connected) return { ok: false, reason: 'telegram non connesso', checked: 0 };
     try {
       const messages = await this.tg.listRecentMessages(limitPerDialog);

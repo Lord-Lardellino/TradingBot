@@ -27,6 +27,7 @@ export interface ExecResult {
   entry?: number;
   riskUsd?: number;
   positionId?: string;
+  preset?: boolean;          // SL/TP preimpostati sull'ordine (limit non ancora riempito)
   error?: string;
 }
 
@@ -106,6 +107,16 @@ export class OrderExecutorService implements OnModuleInit {
     };
   }
 
+  async hasOpenOrder(symbol: string): Promise<boolean> {
+    try {
+      const orders = await this.exchange.fetchOpenOrders(symbol, undefined, undefined, { type: 'swap' });
+      return orders.some((o: any) => String(o.status ?? '').toLowerCase() === 'open' || Number(o.remaining ?? 0) > 0);
+    } catch (e: any) {
+      this.logger.warn(`[ORD LIVE] open orders ${symbol}: ${e?.message?.slice(0, 70)}`);
+      return true;
+    }
+  }
+
   // Dimensiona la quantità in contratti dato il rischio (entry-SL).
   async sizeQty(symbol: string, entry: number, sl: number, riskPct: number, capitalFallback = 100): Promise<{ qty: number; riskUsd: number; cs: number }> {
     const { cs, minContracts } = this.marketMeta(symbol);
@@ -131,8 +142,14 @@ export class OrderExecutorService implements OnModuleInit {
       const params: any = { openType: 1, positionType, leverage: p.leverage };
       if (p.entryType === 'limit' && p.entryPrice) {
         const px = Number(this.exchange.priceToPrecision(symbol, p.entryPrice));
+        // SL/TP PREIMPOSTATI sull'ordine limit (MEXC li accetta su order/create):
+        // così appena il limit si riempie la posizione è già protetta, senza attesa.
+        params.stopLossPrice = Number(this.exchange.priceToPrecision(symbol, p.sl));
+        if (p.tps?.length) params.takeProfitPrice = Number(this.exchange.priceToPrecision(symbol, p.tps[0]));
         if (side === 'long') await this.exchange.createLimitBuyOrder(symbol, qty, px, params);
         else await this.exchange.createLimitSellOrder(symbol, qty, px, params);
+        this.logger.log(`[ORD LIVE] LIMIT ${side.toUpperCase()} ${symbol} qty ${qty} @ ${px} · SL/TP preimpostati (SL ${params.stopLossPrice} TP1 ${params.takeProfitPrice})`);
+        return { ok: true, qty, entry: px, riskUsd, preset: true };
       } else {
         if (side === 'long') await this.exchange.createMarketBuyOrder(symbol, qty, params);
         else await this.exchange.createMarketSellOrder(symbol, qty, params);
@@ -141,15 +158,12 @@ export class OrderExecutorService implements OnModuleInit {
       return { ok: false, error: `apertura: ${e?.message?.slice(0, 80)}` };
     }
 
-    // Per i market order la posizione è immediata → attacca SL/TP nativi.
-    // Per i limit l'attacco SL/TP avviene quando la posizione esiste (gestito a parte).
+    // Market order: posizione immediata → attacca SL nativo + N TP parziali.
     let positionId: string | undefined;
-    if (p.entryType !== 'limit') {
-      try {
-        await new Promise((r) => setTimeout(r, 800));
-        positionId = await this.attachStops(symbol, side, qty, p.sl, p.tps, p.tpSplit);
-      } catch (e: any) { this.logger.warn(`[ORD LIVE] SL/TP: ${e?.message?.slice(0, 70)}`); }
-    }
+    try {
+      await new Promise((r) => setTimeout(r, 800));
+      positionId = await this.attachStops(symbol, side, qty, p.sl, p.tps, p.tpSplit);
+    } catch (e: any) { this.logger.warn(`[ORD LIVE] SL/TP: ${e?.message?.slice(0, 70)}`); }
     this.logger.log(`[ORD LIVE] ${side.toUpperCase()} ${symbol} qty ${qty} entry~${entryRef} SL ${p.sl} TP ${p.tps.join('/')} rischio $${riskUsd.toFixed(2)}`);
     return { ok: true, qty, entry: entryRef, riskUsd, positionId };
   }

@@ -8,6 +8,8 @@ export interface ParsedSignal {
   side: 'long' | 'short' | null;
   entryType: 'market' | 'limit';
   entryPrice: number | null;
+  entryLow: number | null;     // estremo basso della zona d'entrata (se range)
+  entryHigh: number | null;    // estremo alto della zona d'entrata (se range)
   sl: number | null;
   tps: number[];               // 0..n take-profit
   leverage: number | null;
@@ -46,7 +48,8 @@ Estrai (usa null se assente):
 - "symbol": ticker base, es "BTC", "ETH", "SOL" (solo la base, senza /USDT).
 - "side": "long" o "short". "buy/long/compra" = long; "sell/short/vendi" = short.
 - "entryType": "market" se dice di entrare ORA / a mercato / "market"; "limit" se dà un prezzo di ingresso preciso da aspettare. Se ambiguo ma c'è un prezzo entry → "limit", altrimenti "market".
-- "entryPrice": prezzo di ingresso numerico (null se a mercato senza prezzo).
+- "entryPrice": prezzo di ingresso numerico (se è una zona/range, la media; null se a mercato senza prezzo).
+- "entryLow"/"entryHigh": se l'entrata è una ZONA/RANGE (es "64000-64500" o "64000 / 64500"), gli estremi basso e alto. Se entrata singola, lascia entrambi null.
 - "sl": prezzo stop loss.
 - "tps": array di prezzi take-profit in ordine (può essere vuoto).
 - "leverage": leva consigliata come numero. Per NEW scegli una leva anche se non e' scritta nel messaggio:
@@ -57,7 +60,7 @@ Estrai (usa null se assente):
 - per "UPDATE": "newSl" (nuovo SL/BE) e "closePct" (% da chiudere) se presenti.
 
 Rispondi SOLO con il JSON. Esempio:
-{"type":"NEW","symbol":"BTC","side":"long","entryType":"limit","entryPrice":64000,"sl":63200,"tps":[65000,66000,67500],"leverage":10,"confidence":0.86,"newSl":null,"closePct":null}`;
+{"type":"NEW","symbol":"BTC","side":"long","entryType":"limit","entryPrice":64250,"entryLow":64000,"entryHigh":64500,"sl":63200,"tps":[65000,66000,67500],"leverage":10,"confidence":0.86,"newSl":null,"closePct":null}`;
 
 const NEWS_PROMPT = `Sei un analista di contesto per trading futures crypto.
 Ricevi un messaggio Telegram che NON e' un segnale operativo. Devi capire se contiene
@@ -90,7 +93,7 @@ export class SignalParserService {
   constructor(private gemma: GemmaService) {}
 
   async parse(rawText: string, promptMemory = '', context: ParseContext = {}): Promise<ParsedSignal> {
-    const fallback: ParsedSignal = { type: 'RUMORE', symbol: null, side: null, entryType: 'market', entryPrice: null, sl: null, tps: [], leverage: null, confidence: 0 };
+    const fallback: ParsedSignal = { type: 'RUMORE', symbol: null, side: null, entryType: 'market', entryPrice: null, entryLow: null, entryHigh: null, sl: null, tps: [], leverage: null, confidence: 0 };
     if (!rawText || !rawText.trim()) return fallback;
     const ruleBased = this.parseStructuredSignal(rawText);
     if (ruleBased) return ruleBased;
@@ -165,6 +168,8 @@ export class SignalParserService {
       side,
       entryType: obj.entryType === 'limit' ? 'limit' : 'market',
       entryPrice: num(obj.entryPrice),
+      entryLow: num(obj.entryLow),
+      entryHigh: num(obj.entryHigh),
       sl: num(obj.sl),
       tps,
       leverage: num(obj.leverage),
@@ -225,6 +230,8 @@ export class SignalParserService {
     if (!entries.length || !tps.length || sl == null || leverage == null) return null;
 
     const entryPrice = entries.reduce((sum, x) => sum + x, 0) / entries.length;
+    const entryLow = entries.length > 1 ? Math.min(...entries) : null;
+    const entryHigh = entries.length > 1 ? Math.max(...entries) : null;
 
     return {
       type: 'NEW',
@@ -232,6 +239,8 @@ export class SignalParserService {
       side: sideMatch[1].toLowerCase() as 'long' | 'short',
       entryType: 'limit',
       entryPrice,
+      entryLow,
+      entryHigh,
       sl,
       tps,
       leverage,
