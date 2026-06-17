@@ -335,12 +335,18 @@ export class TgSignalsService implements OnModuleInit {
       try {
         if (!t.symbol || !t.side || !t.qty || !t.stopLoss) continue;
 
-        // Limit con SL/TP PREIMPOSTATI sull'ordine: niente da attaccare. Quando si
-        // riempie → flip a 'open'; se l'ordine sparisce senza posizione → no_fill.
+        // Limit con SL PREIMPOSTATO sull'ordine. Appena si riempie (posizione esiste)
+        // attacca SL + TP PARZIALI (come il market). Se l'ordine sparisce senza
+        // posizione → no_fill.
         if (/preset/i.test(String(t.note ?? ''))) {
           const pos = await this.executor.getOpenPosition(t.symbol, t.side as any);
           if (pos) {
-            if (t.tradeStatus !== 'open') await this.prisma.tgSignal.update({ where: { id: t.id }, data: { tradeStatus: 'open', note: `live preset attivo${pos.positionId ? ` posId ${pos.positionId}` : ''}` } });
+            const tpsP: number[] = JSON.parse(t.takeProfits ?? '[]');
+            const ch = await this.prisma.tgChannel.findUnique({ where: { id: t.channelDbId } });
+            const split = String(ch?.tpSplit ?? '50,30,20').split(',').map(Number).filter((x) => x > 0);
+            const posId = await this.executor.attachStops(t.symbol, t.side as any, t.qty, t.stopLoss, tpsP, split);
+            await this.prisma.tgSignal.update({ where: { id: t.id }, data: { tradeStatus: 'open', note: `live posId ${posId ?? 'n/d'} (SL+TP parziali)` } });
+            this.logger.log(`[TGS LIVE] fill limit ${t.symbol} → SL+TP parziali attaccati posId ${posId}`);
           } else if (!(await this.executor.hasOpenOrder(t.symbol))) {
             await this.prisma.tgSignal.update({ where: { id: t.id }, data: { tradeStatus: 'closed', reason: 'no_fill', note: 'chiuso: limit preset non riempito', closedAt: new Date() } });
           }

@@ -142,13 +142,15 @@ export class OrderExecutorService implements OnModuleInit {
       const params: any = { openType: 1, positionType, leverage: p.leverage };
       if (p.entryType === 'limit' && p.entryPrice) {
         const px = Number(this.exchange.priceToPrecision(symbol, p.entryPrice));
-        // SL/TP PREIMPOSTATI sull'ordine limit (MEXC li accetta su order/create):
-        // così appena il limit si riempie la posizione è già protetta, senza attesa.
+        // SL PREIMPOSTATO sull'ordine limit (MEXC lo accetta su order/create): così la
+        // posizione è protetta dall'istante del fill. I TP PARZIALI non possono stare su
+        // un ordine non riempito (servono positionId+vol) → vengono attaccati al fill dal
+        // monitor (attachStops: SL + N TP parziali). Niente TP unico qui (andrebbe in
+        // conflitto coi parziali).
         params.stopLossPrice = Number(this.exchange.priceToPrecision(symbol, p.sl));
-        if (p.tps?.length) params.takeProfitPrice = Number(this.exchange.priceToPrecision(symbol, p.tps[0]));
         if (side === 'long') await this.exchange.createLimitBuyOrder(symbol, qty, px, params);
         else await this.exchange.createLimitSellOrder(symbol, qty, px, params);
-        this.logger.log(`[ORD LIVE] LIMIT ${side.toUpperCase()} ${symbol} qty ${qty} @ ${px} · SL/TP preimpostati (SL ${params.stopLossPrice} TP1 ${params.takeProfitPrice})`);
+        this.logger.log(`[ORD LIVE] LIMIT ${side.toUpperCase()} ${symbol} qty ${qty} @ ${px} · SL preimpostato ${params.stopLossPrice} · TP parziali al fill`);
         return { ok: true, qty, entry: px, riskUsd, preset: true };
       } else {
         if (side === 'long') await this.exchange.createMarketBuyOrder(symbol, qty, params);
