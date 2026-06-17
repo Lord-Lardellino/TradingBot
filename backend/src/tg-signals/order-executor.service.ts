@@ -117,6 +117,18 @@ export class OrderExecutorService implements OnModuleInit {
     }
   }
 
+  // Stop order (SL/TP) attivi sulla posizione: se ce ne sono, la posizione è viva.
+  // Serve a NON dichiarare "no_fill" quando il limit si è riempito (i filled hanno
+  // solo stop order, non ordini normali) e fetchPositions ha un singhiozzo transitorio.
+  async hasStopOrders(symbol: string): Promise<boolean> {
+    try {
+      const id = (this.exchange.market(symbol) as any).id;
+      const r = await (this.exchange as any).contractPrivateGetStoporderOpenOrders({ symbol: id });
+      const arr = (r && r.data) || [];
+      return Array.isArray(arr) && arr.length > 0;
+    } catch { return true; }   // nel dubbio non chiudere
+  }
+
   // Dimensiona la quantità in contratti dato il rischio (entry-SL).
   async sizeQty(symbol: string, entry: number, sl: number, riskPct: number, capitalFallback = 100): Promise<{ qty: number; riskUsd: number; cs: number }> {
     const { cs, minContracts } = this.marketMeta(symbol);
@@ -170,10 +182,9 @@ export class OrderExecutorService implements OnModuleInit {
     return { ok: true, qty, entry: entryRef, riskUsd, positionId };
   }
 
-  // Attacca SL + N TP parziali. IMPORTANTE: MEXC SOMMA i volumi degli stop order
-  // (code 5004 se SL_pieno + TP_parziali > posizione). Pattern corretto: N stop order,
-  // ognuno con la SUA fetta di volume che porta SIA lo stesso SL SIA il proprio TP
-  // (totale vol = posizione). Così ogni chunk ha TP+SL e i parziali funzionano.
+  // Attacca 1 SL pieno + N TP parziali (vol ripartito su tpSplit). SL e TP su MEXC sono
+  // pool SEPARATI, quindi SL_pieno + TP_parziali è valido. IMPORTANTE: prima azzerare gli
+  // stop order esistenti (preset al fill / update), altrimenti i volumi si sommano → 5004.
   async attachStops(symbol: string, side: 'long' | 'short', qty: number, sl: number, tps: number[], tpSplit: number[]): Promise<string | undefined> {
     const pos = await this.getOpenPosition(symbol, side);
     const positionId = pos?.positionId;
@@ -188,16 +199,16 @@ export class OrderExecutorService implements OnModuleInit {
     }
 
     // azzera eventuali stop order già presenti (preset al fill / update SL) per non sommare i volumi
-    try { await (this.exchange as any).contractPrivatePostStoporderCancelAll({ symbol: mexcSymbol }); await new Promise((r) => setTimeout(r, 400)); } catch {}
+    try { await (this.exchange as any).contractPrivatePostStoporderCancelAll({ symbol: mexcSymbol }); await new Promise((r) => setTimeout(r, 500)); } catch {}
 
-    // nessun TP → solo SL sul volume totale
+    // 1 SL pieno sul volume totale
+    await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol: posVol, stopLossPrice: slPx });
     if (!tps?.length) {
-      await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol: posVol, stopLossPrice: slPx });
       this.logger.log(`[ORD LIVE] SL attaccato (no TP) · posId ${positionId} · SL ${slPx}`);
       return positionId;
     }
 
-    // N chunk: vol ripartito su tpSplit, ognuno con SL + il proprio TP (totale = posVol)
+    // N TP parziali: ripartisci posVol sui pesi tpSplit
     const weights = this.normalizeSplit(tpSplit, tps.length);
     let allocated = 0;
     let placed = 0;
@@ -207,12 +218,12 @@ export class OrderExecutorService implements OnModuleInit {
       allocated += vol;
       const tpPx = Number(this.exchange.priceToPrecision(symbol, tps[i]));
       try {
-        await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol, stopLossPrice: slPx, takeProfitPrice: tpPx });
+        await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol, takeProfitPrice: tpPx });
         placed++;
-      } catch (e: any) { this.logger.warn(`[ORD LIVE] chunk TP${i + 1}: ${e?.message?.slice(0, 50)}`); }
+      } catch (e: any) { this.logger.warn(`[ORD LIVE] TP${i + 1}: ${e?.message?.slice(0, 50)}`); }
     }
-    if (!placed) throw new Error(`protection_failed ${symbol}`);
-    this.logger.log(`[ORD LIVE] SL+TP parziali attaccati · posId ${positionId} · SL ${slPx} · TP ${tps.join('/')} · chunk ${placed}/${tps.length}`);
+    if (!placed) throw new Error(`protection_failed_tp ${symbol}`);
+    this.logger.log(`[ORD LIVE] 1 SL + ${placed} TP parziali attaccati · posId ${positionId} · SL ${slPx} · TP ${tps.join('/')}`);
     return positionId;
   }
 

@@ -347,7 +347,7 @@ export class TgSignalsService implements OnModuleInit {
             const posId = await this.executor.attachStops(t.symbol, t.side as any, t.qty, t.stopLoss, tpsP, split);
             await this.prisma.tgSignal.update({ where: { id: t.id }, data: { tradeStatus: 'open', note: `live posId ${posId ?? 'n/d'} (SL+TP parziali)` } });
             this.logger.log(`[TGS LIVE] fill limit ${t.symbol} → SL+TP parziali attaccati posId ${posId}`);
-          } else if (!(await this.executor.hasOpenOrder(t.symbol))) {
+          } else if (!(await this.executor.hasOpenOrder(t.symbol)) && !(await this.executor.hasStopOrders(t.symbol))) {
             await this.prisma.tgSignal.update({ where: { id: t.id }, data: { tradeStatus: 'closed', reason: 'no_fill', note: 'chiuso: limit preset non riempito', closedAt: new Date() } });
           }
           continue;
@@ -359,7 +359,8 @@ export class TgSignalsService implements OnModuleInit {
         const position = await this.executor.getOpenPosition(t.symbol, t.side as any);
         if (!position) {
           const hasOrder = await this.executor.hasOpenOrder(t.symbol);
-          if (!hasOrder) {
+          const hasStops = await this.executor.hasStopOrders(t.symbol);
+          if (!hasOrder && !hasStops) {
             await this.prisma.tgSignal.update({
               where: { id: t.id },
               data: {
