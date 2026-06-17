@@ -41,8 +41,15 @@ export class TgSignalsService implements OnModuleInit {
     const channel = await this.ensureChannelForMessage(msg);
     if (!channel.enabled) return;                 // canale disattivato manualmente
     // dedup: stesso messaggio già processato
-    const dup = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tgMessageId: msg.messageId } });
-    if (dup) return;
+    const rawText = msg.text.slice(0, 4000);
+    const dup = await this.prisma.tgSignal.findFirst({
+      where: { channelDbId: channel.id, tgMessageId: msg.messageId },
+      orderBy: { createdAt: 'desc' },
+    });
+    if (dup) {
+      const changedSkippedSignal = dup.rawText !== rawText && dup.status === 'skipped' && dup.tradeStatus === 'none';
+      if (!changedSkippedSignal) return;
+    }
     if (msg.title && channel.title !== msg.title) {
       await this.prisma.tgChannel.update({ where: { id: channel.id }, data: { title: msg.title } }).catch(() => {});
     }
@@ -52,7 +59,7 @@ export class TgSignalsService implements OnModuleInit {
     // viene scartato senza chiamare Gemini → drastico taglio delle richieste.
     if (!this.looksLikeSignal(msg.text)) {
       await this.prisma.tgSignal.create({ data: {
-        channelDbId: channel.id, tgMessageId: msg.messageId, rawText: msg.text.slice(0, 4000),
+        channelDbId: channel.id, tgMessageId: msg.messageId, rawText,
         parsed: '{}', type: 'RUMORE', status: 'skipped', note: 'pre-filtro: non è un segnale (no Gemini)',
       } });
       return;
@@ -62,7 +69,7 @@ export class TgSignalsService implements OnModuleInit {
     const parsed = await this.parser.parse(msg.text, memory.summary, { riskPct: channel.riskPct, leverageMax: channel.levaMax });
     const rec = await this.prisma.tgSignal.create({
       data: {
-        channelDbId: channel.id, tgMessageId: msg.messageId, rawText: msg.text.slice(0, 4000),
+        channelDbId: channel.id, tgMessageId: msg.messageId, rawText,
         parsed: JSON.stringify(parsed), type: parsed.type,
         symbol: parsed.symbol, side: parsed.side, confidence: parsed.confidence,
         status: 'parsed',
@@ -232,7 +239,7 @@ export class TgSignalsService implements OnModuleInit {
     const zone = this.entryZone(p);
     let entryType: 'market' | 'limit' = p.entryType;
     let entryPrice: number | null = p.entryPrice;
-    if (livePrice && zone && livePrice >= zone.lo && livePrice <= zone.hi) {
+    if (livePrice && zone && this.priceNearZone(livePrice, zone)) {
       entryType = 'market'; entryPrice = null;
     } else if (p.entryPrice != null) {
       entryType = 'limit'; entryPrice = p.entryPrice;
@@ -248,7 +255,7 @@ export class TgSignalsService implements OnModuleInit {
     }
 
     if (channel.mode === 'live') {
-      const r = await this.executor.openLive({ symbol, side: p.side, entryType, entryPrice: entryPrice ?? undefined, sl: p.sl, tps: p.tps, tpSplit, riskPct: channel.riskPct, leverage });
+      const r = await this.executor.openLive({ symbol, side: p.side, entryType, entryPrice: (entryType === 'market' ? entryRef : entryPrice) ?? undefined, sl: p.sl, tps: p.tps, tpSplit, riskPct: channel.riskPct, leverage });
       if (!r.ok) return void (await skip(`live: ${r.error}`));
       const tradeStatus = (r.positionId || entryType === 'market') ? 'open' : 'pending';
       const note = r.positionId ? `live posId ${r.positionId}` : r.preset ? 'live limit preset (SL/TP sull-ordine)' : 'live pending limit';
@@ -272,8 +279,15 @@ export class TgSignalsService implements OnModuleInit {
   // Zona d'entrata: range esplicito se presente, altrimenti banda ±0.15% sul prezzo singolo.
   private entryZone(p: ParsedSignal): { lo: number; hi: number } | null {
     if (p.entryLow != null && p.entryHigh != null) return { lo: Math.min(p.entryLow, p.entryHigh), hi: Math.max(p.entryLow, p.entryHigh) };
-    if (p.entryPrice != null) { const tol = Math.abs(p.entryPrice) * 0.0015; return { lo: p.entryPrice - tol, hi: p.entryPrice + tol }; }
+    if (p.entryPrice != null) { const tol = Math.abs(p.entryPrice) * 0.0035; return { lo: p.entryPrice - tol, hi: p.entryPrice + tol }; }
     return null;
+  }
+
+  private priceNearZone(price: number, zone: { lo: number; hi: number }) {
+    const mid = (zone.lo + zone.hi) / 2;
+    const width = Math.max(zone.hi - zone.lo, Math.abs(mid) * 0.0035);
+    const buffer = Math.max(Math.abs(mid) * 0.0035, width * 0.25);
+    return price >= zone.lo - buffer && price <= zone.hi + buffer;
   }
 
   // ── UPDATE: sposta SL (BE) sul trade aperto del canale ────────────────────

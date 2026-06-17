@@ -156,7 +156,7 @@ export class OrderExecutorService implements OnModuleInit {
   async openLive(p: ExecParams): Promise<ExecResult> {
     const { symbol, side } = p;
     const positionType = side === 'long' ? 1 : 2;
-    const entryRef = p.entryType === 'limit' && p.entryPrice ? p.entryPrice : (await this.getPrice(symbol)) ?? p.entryPrice ?? 0;
+    const entryRef = p.entryType === 'limit' && p.entryPrice ? p.entryPrice : p.entryPrice ?? (await this.getPrice(symbol)) ?? 0;
     if (!entryRef) return { ok: false, error: 'prezzo entry non disponibile' };
 
     const { qty, riskUsd } = await this.sizeQty(symbol, entryRef, p.sl, p.riskPct);

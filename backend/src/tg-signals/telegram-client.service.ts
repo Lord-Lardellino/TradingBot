@@ -70,10 +70,8 @@ export class TelegramClientService implements OnModuleInit, OnModuleDestroy {
         const text: string = msg?.message ?? '';
         if (!text) return;
         const channelId = String(msg?.chatId ?? msg?.peerId?.channelId ?? '');
-        let title: string | undefined;
-        try { const chat = await msg.getChat(); title = chat?.title ?? chat?.username; } catch {}
-        this.logger.log(`[TG] realtime msg da ${title ?? channelId} (#${msg?.id})`);
-        this.handler?.({ channelId, messageId: String(msg?.id ?? ''), text, title });
+        this.logger.log(`[TG] realtime msg da ${channelId} (#${msg?.id})`);
+        this.handler?.({ channelId, messageId: String(msg?.id ?? ''), text });
       } catch (e: any) { this.logger.warn(`[TG] msg handler: ${e?.message?.slice(0, 60)}`); }
     }, new NewMessage({}));
 

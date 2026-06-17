@@ -282,9 +282,11 @@ export class SignalParserService {
     const leverage = nums(leverageBlock)[0] ?? null;
     if (!entries.length || !tps.length || sl == null || leverage == null) return null;
 
-    const entryPrice = entries.reduce((sum, x) => sum + x, 0) / entries.length;
-    const entryLow = entries.length > 1 ? Math.min(...entries) : null;
-    const entryHigh = entries.length > 1 ? Math.max(...entries) : null;
+    const reference = this.median([sl, ...tps]);
+    const normalizedEntries = entries.map((x) => this.normalizePriceScale(x, reference));
+    const entryPrice = normalizedEntries.reduce((sum, x) => sum + x, 0) / normalizedEntries.length;
+    const entryLow = normalizedEntries.length > 1 ? Math.min(...normalizedEntries) : null;
+    const entryHigh = normalizedEntries.length > 1 ? Math.max(...normalizedEntries) : null;
 
     return {
       type: 'NEW',
@@ -301,6 +303,19 @@ export class SignalParserService {
       newSl: null,
       closePct: null,
     };
+  }
+
+  private median(values: number[]) {
+    const sorted = values.filter((x) => Number.isFinite(x) && x > 0).sort((a, b) => a - b);
+    return sorted[Math.floor(sorted.length / 2)] ?? 0;
+  }
+
+  private normalizePriceScale(price: number, reference: number) {
+    let out = price;
+    if (!reference || !Number.isFinite(reference)) return out;
+    while (out > 0 && out < reference / 3) out *= 10;
+    while (out > reference * 3) out /= 10;
+    return out;
   }
 
   private withPromptMemory(base: string, memory: string): string {
