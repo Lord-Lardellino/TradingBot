@@ -4,7 +4,8 @@ import { ConfigService } from '@nestjs/config';
 
 const BASE_URL  = 'https://generativelanguage.googleapis.com/v1beta/models';
 const FILES_URL = 'https://generativelanguage.googleapis.com/upload/v1beta/files';
-const GEMMA_MODELS = ['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite'];
+// Catena di fallback: si scala al successivo quando la quota/token si esaurisce (429/403).
+const GEMMA_MODELS = ['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemma-4-31-it', 'gemma-4-26-it'];
 
 const SYSTEM_PROMPT = `Sei un assistente professionale per il trading di futures crypto su MEXC.
 Aiuti l'utente ad analizzare segnali, pattern e posizioni aperte per prendere decisioni migliori.
@@ -60,12 +61,33 @@ export class GemmaService {
     }
   }
 
+  // I modelli Gemma sull'API Gemini NON supportano systemInstruction né responseMimeType:
+  // ripieghiamo il system prompt dentro il primo messaggio user e rimuoviamo i campi non
+  // supportati, così il fallback su gemma-* funziona davvero.
+  private adaptBodyForModel(model: string, body: any): any {
+    if (!model.startsWith('gemma')) return body;
+    const b: any = JSON.parse(JSON.stringify(body));
+    const sysText = b?.systemInstruction?.parts?.map((p: any) => p?.text ?? '').join('\n').trim();
+    if (sysText) {
+      b.contents = Array.isArray(b.contents) ? b.contents : [];
+      const first = b.contents.find((c: any) => c.role === 'user') ?? b.contents[0];
+      if (first?.parts?.length) {
+        first.parts = [{ text: `${sysText}\n\n---\n` }, ...first.parts];
+      } else {
+        b.contents.unshift({ role: 'user', parts: [{ text: sysText }] });
+      }
+    }
+    delete b.systemInstruction;
+    if (b.generationConfig) delete b.generationConfig.responseMimeType;
+    return b;
+  }
+
   async callApi(body: object, retryOnQuota = true): Promise<Response> {
     const model = GEMMA_MODELS[this.modelIdx];
     const res = await fetch(`${BASE_URL}/${model}:generateContent?key=${this.apiKey}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: JSON.stringify(this.adaptBodyForModel(model, body)),
     });
     if ((res.status === 429 || res.status === 403) && retryOnQuota) {
       const text = await res.clone().text();
