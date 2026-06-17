@@ -86,4 +86,28 @@ export class TelegramClientService implements OnModuleInit, OnModuleDestroy {
     } catch (e: any) { this.logger.warn(`[TG] dialogs: ${e?.message?.slice(0, 60)}`); }
     return out;
   }
+
+  async listRecentMessages(limitPerDialog = 3): Promise<IncomingMessage[]> {
+    if (!this.connected || !this.client) return [];
+    const out: IncomingMessage[] = [];
+    try {
+      const dialogs = await this.client.getDialogs({ limit: 200 });
+      for (const d of dialogs) {
+        if (!(d.isChannel || d.isGroup)) continue;
+        let messages: any[] = [];
+        try { messages = await this.client.getMessages(d.entity, { limit: limitPerDialog }); } catch { continue; }
+        for (const msg of messages.reverse()) {
+          const text = String(msg?.message ?? '').trim();
+          if (!text) continue;
+          out.push({
+            channelId: String(d.id),
+            messageId: String(msg?.id ?? ''),
+            text,
+            title: d.title ?? d.name ?? msg?.chat?.title,
+          });
+        }
+      }
+    } catch (e: any) { this.logger.warn(`[TG] recent messages: ${e?.message?.slice(0, 60)}`); }
+    return out;
+  }
 }

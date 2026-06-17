@@ -21,6 +21,10 @@ export class TgSignalsController {
     return this.svc.testParse(body);
   }
 
+  @Post('poll') poll(@Body() body: any) {
+    return this.svc.pollTelegramMessages(Number(body?.limit ?? 20) || 20);
+  }
+
   @Post('channels') addChannel(@Body() body: any) {
     return this.svc.addChannel(body);
   }

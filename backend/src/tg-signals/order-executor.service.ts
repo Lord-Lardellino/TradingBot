@@ -30,6 +30,13 @@ export interface ExecResult {
   error?: string;
 }
 
+export interface LivePositionSnapshot {
+  positionId?: string;
+  contracts: number;
+  entryPrice?: number;
+  markPrice?: number;
+}
+
 @Injectable()
 export class OrderExecutorService implements OnModuleInit {
   private readonly logger = new Logger(OrderExecutorService.name);
@@ -84,6 +91,21 @@ export class OrderExecutorService implements OnModuleInit {
     try { const t = await this.exchange.fetchTicker(symbol); return Number(t?.last ?? t?.close ?? 0) || null; } catch { return null; }
   }
 
+  async getOpenPosition(symbol: string, side?: 'long' | 'short'): Promise<LivePositionSnapshot | null> {
+    const positions = (await this.exchange.fetchPositions([symbol]))
+      .filter((x: any) => Math.abs(Number(x.contracts || 0)) > 0);
+    const pos = side
+      ? positions.find((x: any) => (x.side === side) || (side === 'long' ? Number(x.contracts) > 0 : Number(x.contracts) < 0))
+      : positions[0];
+    if (!pos) return null;
+    return {
+      positionId: pos?.info?.positionId ? String(pos.info.positionId) : undefined,
+      contracts: Math.abs(Number(pos.contracts ?? 0)),
+      entryPrice: Number(pos.entryPrice ?? pos.info?.openAvgPrice ?? 0) || undefined,
+      markPrice: Number(pos.markPrice ?? pos.info?.markPrice ?? 0) || undefined,
+    };
+  }
+
   // Dimensiona la quantità in contratti dato il rischio (entry-SL).
   async sizeQty(symbol: string, entry: number, sl: number, riskPct: number, capitalFallback = 100): Promise<{ qty: number; riskUsd: number; cs: number }> {
     const { cs, minContracts } = this.marketMeta(symbol);
@@ -134,19 +156,24 @@ export class OrderExecutorService implements OnModuleInit {
 
   // Attacca 1 SL nativo (vol totale) + N TP nativi parziali (vol ripartito su tpSplit).
   async attachStops(symbol: string, side: 'long' | 'short', qty: number, sl: number, tps: number[], tpSplit: number[]): Promise<string | undefined> {
-    const pos = (await this.exchange.fetchPositions([symbol])).filter((x: any) => Math.abs(Number(x.contracts || 0)) > 0)[0];
-    const positionId = pos?.info?.positionId;
+    const pos = await this.getOpenPosition(symbol, side);
+    const positionId = pos?.positionId;
     const posVol = Math.abs(Number(pos?.contracts ?? qty));
     const mexcSymbol = (this.exchange.market(symbol) as any).id;
     if (!positionId) { this.logger.warn('[ORD LIVE] positionId non trovato — SL/TP non attaccati'); return undefined; }
 
     const slPx = Number(this.exchange.priceToPrecision(symbol, sl));
+    const refPrice = pos?.markPrice ?? pos?.entryPrice ?? await this.getPrice(symbol);
+    if (refPrice && !this.protectionIsValid(side, refPrice, slPx, tps)) {
+      throw new Error(`protection_invalid ${symbol}: price=${refPrice} sl=${slPx} tp=${tps.join('/')}`);
+    }
     // SL sul volume totale
     await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol: posVol, stopLossPrice: slPx });
 
     // TP parziali: ripartisci posVol sui pesi tpSplit
     const weights = this.normalizeSplit(tpSplit, tps.length);
     let allocated = 0;
+    let placedTp = 0;
     for (let i = 0; i < tps.length; i++) {
       const isLast = i === tps.length - 1;
       const vol = isLast ? Math.max(1, posVol - allocated) : Math.max(1, Math.round(posVol * weights[i]));
@@ -154,13 +181,25 @@ export class OrderExecutorService implements OnModuleInit {
       const tpPx = Number(this.exchange.priceToPrecision(symbol, tps[i]));
       try {
         await (this.exchange as any).contractPrivatePostStoporderPlace({ symbol: mexcSymbol, positionId, vol, takeProfitPrice: tpPx });
+        placedTp++;
       } catch (e: any) { this.logger.warn(`[ORD LIVE] TP${i + 1}: ${e?.message?.slice(0, 50)}`); }
     }
+    if (!placedTp) throw new Error(`protection_failed_tp ${symbol}`);
     this.logger.log(`[ORD LIVE] SL/TP attaccati · posId ${positionId} · SL ${slPx} · TP ${tps.join('/')}`);
     return positionId;
   }
 
   // pesi normalizzati (somma 1) per n TP, partendo da split tipo [50,30,20]
+  protectionIsValid(side: 'long' | 'short', reference: number, sl: number, tps: number[]) {
+    if (!Number.isFinite(reference) || reference <= 0) return true;
+    if (side === 'long') {
+      if (sl >= reference) return false;
+      return tps.some((tp) => Number(tp) > reference);
+    }
+    if (sl <= reference) return false;
+    return tps.some((tp) => Number(tp) < reference);
+  }
+
   private normalizeSplit(split: number[], n: number): number[] {
     const base = (split && split.length ? split : [50, 30, 20]).slice(0, n);
     while (base.length < n) base.push(base.length ? base[base.length - 1] : 100 / n);

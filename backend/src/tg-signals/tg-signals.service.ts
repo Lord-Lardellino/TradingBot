@@ -180,7 +180,7 @@ export class TgSignalsService implements OnModuleInit {
     if (!symbol) return void (await skip(`simbolo non mappabile: ${p.symbol}`));
 
     // un solo trade aperto per canale: se ce n'è uno, salta (no hedge)
-    const openOnChannel = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tradeStatus: 'open' } });
+    const openOnChannel = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tradeStatus: { in: ['open', 'pending'] } } });
     if (openOnChannel) return void (await skip('già un trade aperto su questo canale (no hedge)'));
 
     if (p.leverage == null) return void (await skip('leva Gemini mancante'));
@@ -188,14 +188,19 @@ export class TgSignalsService implements OnModuleInit {
     const tpSplit = String(channel.tpSplit).split(',').map((x: string) => Number(x.trim())).filter((x) => x > 0);
     const entryRef = (p.entryType === 'limit' && p.entryPrice) ? p.entryPrice : (await this.executor.getPrice(symbol)) ?? p.entryPrice;
     if (!entryRef) return void (await skip('prezzo entry non disponibile'));
+    const livePrice = await this.executor.getPrice(symbol);
+    if (livePrice && !this.executor.protectionIsValid(p.side, livePrice, p.sl, p.tps)) {
+      return void (await skip(`prezzo gia oltre protezione: price=${livePrice} SL=${p.sl} TP=${p.tps.join('/')}`));
+    }
 
     if (channel.mode === 'live') {
       const r = await this.executor.openLive({ symbol, side: p.side, entryType: p.entryType, entryPrice: p.entryPrice ?? undefined, sl: p.sl, tps: p.tps, tpSplit, riskPct: channel.riskPct, leverage });
       if (!r.ok) return void (await skip(`live: ${r.error}`));
+      const tradeStatus = r.positionId ? 'open' : 'pending';
       await this.prisma.tgSignal.update({ where: { id: recId }, data: {
-        status: 'executed', mode: 'live', tradeStatus: 'open', symbol, side: p.side,
+        status: 'executed', mode: 'live', tradeStatus, symbol, side: p.side,
         entry: r.entry, stopLoss: p.sl, takeProfits: JSON.stringify(p.tps), qty: r.qty, leverage, riskUsd: r.riskUsd,
-        note: `live · posId ${r.positionId ?? 'n/d'}`,
+        note: r.positionId ? `live posId ${r.positionId}` : 'live pending limit',
       } });
       this.logger.log(`[TGS LIVE] ${channel.username ?? channel.channelId} → ${p.side} ${symbol} qty ${r.qty}`);
     } else {
@@ -211,7 +216,7 @@ export class TgSignalsService implements OnModuleInit {
 
   // ── UPDATE: sposta SL (BE) sul trade aperto del canale ────────────────────
   private async applyUpdate(channel: any, recId: string, p: ParsedSignal) {
-    const open = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tradeStatus: 'open' }, orderBy: { createdAt: 'desc' } });
+    const open = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tradeStatus: { in: ['open', 'pending'] } }, orderBy: { createdAt: 'desc' } });
     if (!open) return void (await this.prisma.tgSignal.update({ where: { id: recId }, data: { status: 'skipped', note: 'UPDATE senza trade aperto' } }));
 
     const newSl = p.newSl ?? null;
@@ -226,7 +231,7 @@ export class TgSignalsService implements OnModuleInit {
 
   // ── CLOSE: chiudi il trade aperto del canale ──────────────────────────────
   private async applyClose(channel: any, recId: string) {
-    const open = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tradeStatus: 'open' }, orderBy: { createdAt: 'desc' } });
+    const open = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tradeStatus: { in: ['open', 'pending'] } }, orderBy: { createdAt: 'desc' } });
     if (!open) return void (await this.prisma.tgSignal.update({ where: { id: recId }, data: { status: 'skipped', note: 'CLOSE senza trade aperto' } }));
     await this.closeTrade(open, 'close');
     await this.prisma.tgSignal.update({ where: { id: recId }, data: { status: 'executed', note: `chiuso ${open.symbol}` } });
@@ -268,12 +273,65 @@ export class TgSignalsService implements OnModuleInit {
     }
   }
 
+  @Cron('*/20 * * * * *')
+  async monitorLiveStops() {
+    const open = await this.prisma.tgSignal.findMany({
+      where: { tradeStatus: { in: ['open', 'pending'] }, mode: 'live' },
+    });
+
+    for (const t of open) {
+      try {
+        if (!t.symbol || !t.side || !t.qty || !t.stopLoss) continue;
+        if (String(t.note ?? '').match(/posId\s+(?!n\/d)/i)) continue;
+        const tps: number[] = JSON.parse(t.takeProfits ?? '[]');
+        if (!tps.length) continue;
+
+        const channel = await this.prisma.tgChannel.findUnique({ where: { id: t.channelDbId } });
+        const tpSplit = String(channel?.tpSplit ?? '50,30,20').split(',').map(Number).filter((x) => x > 0);
+        const posId = await this.executor.attachStops(t.symbol, t.side as any, t.qty, t.stopLoss, tps, tpSplit);
+        if (!posId) continue;
+
+        await this.prisma.tgSignal.update({
+          where: { id: t.id },
+          data: { tradeStatus: 'open', note: `live posId ${posId}` },
+        });
+        this.logger.log(`[TGS LIVE] SL/TP agganciati post-fill ${t.symbol} posId ${posId}`);
+      } catch (e: any) {
+        const msg = String(e?.message ?? '');
+        this.logger.warn(`[TGS LIVE] monitor SL/TP: ${msg.slice(0, 80)}`);
+        if (/protection_|price of stop-limit order error/i.test(msg) && t.symbol && t.side) {
+          await this.closeTrade(t, 'protection_failed');
+          await this.prisma.tgSignal.update({
+            where: { id: t.id },
+            data: { note: `chiuso: protezione non valida (${msg.slice(0, 90)})` },
+          });
+        }
+      }
+    }
+  }
+
+  @Cron('*/30 * * * * *')
+  async pollTelegramMessages(limitPerDialog = 20) {
+    if (!this.tg.status().connected) return { ok: false, reason: 'telegram non connesso', checked: 0 };
+    try {
+      const messages = await this.tg.listRecentMessages(limitPerDialog);
+      for (const msg of messages) {
+        await this.handleIncoming(msg).catch((e) => this.logger.warn(`[TGS] poll handle: ${e?.message?.slice(0, 80)}`));
+      }
+      if (messages.length) this.logger.log(`[TGS] polling Telegram: ${messages.length} messaggi controllati`);
+      return { ok: true, checked: messages.length };
+    } catch (e: any) {
+      this.logger.warn(`[TGS] polling Telegram: ${e?.message?.slice(0, 80)}`);
+      return { ok: false, reason: e?.message?.slice(0, 120), checked: 0 };
+    }
+  }
+
   // ── API ───────────────────────────────────────────────────────────────────
   async getDashboard() {
     await this.syncDialogs().catch((e) => this.logger.warn(`[TGS] sync dialogs: ${e?.message?.slice(0, 80)}`));
     const [channels, openTrades, recent, all, tgStatus, promptMemory] = await Promise.all([
       this.prisma.tgChannel.findMany({ orderBy: { createdAt: 'asc' } }),
-      this.prisma.tgSignal.findMany({ where: { tradeStatus: 'open' }, orderBy: { createdAt: 'desc' } }),
+      this.prisma.tgSignal.findMany({ where: { tradeStatus: { in: ['open', 'pending'] } }, orderBy: { createdAt: 'desc' } }),
       this.prisma.tgSignal.findMany({ orderBy: { createdAt: 'desc' }, take: 50 }),
       this.prisma.tgSignal.findMany({ where: { tradeStatus: { in: ['win', 'loss', 'closed'] } } }),
       Promise.resolve(this.tg.status()),
@@ -366,7 +424,7 @@ export class TgSignalsService implements OnModuleInit {
 
   async closeSignalManual(id: string) {
     const t = await this.prisma.tgSignal.findUnique({ where: { id } });
-    if (!t || t.tradeStatus !== 'open') return { closed: false };
+    if (!t || !['open', 'pending'].includes(t.tradeStatus)) return { closed: false };
     await this.closeTrade(t, 'manual');
     return { closed: true };
   }

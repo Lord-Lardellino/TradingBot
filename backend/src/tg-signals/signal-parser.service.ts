@@ -92,6 +92,8 @@ export class SignalParserService {
   async parse(rawText: string, promptMemory = '', context: ParseContext = {}): Promise<ParsedSignal> {
     const fallback: ParsedSignal = { type: 'RUMORE', symbol: null, side: null, entryType: 'market', entryPrice: null, sl: null, tps: [], leverage: null, confidence: 0 };
     if (!rawText || !rawText.trim()) return fallback;
+    const ruleBased = this.parseStructuredSignal(rawText);
+    if (ruleBased) return ruleBased;
 
     try {
       const systemPrompt = this.withPromptMemory(this.withParseContext(PROMPT, context), promptMemory);
@@ -197,6 +199,45 @@ export class SignalParserService {
       marketBias: bias,
       promptMemory,
       confidence: Math.max(0, Math.min(1, num(obj.confidence) ?? 0)),
+    };
+  }
+
+  private parseStructuredSignal(rawText: string): ParsedSignal | null {
+    const text = rawText.replace(/\u00a0/g, ' ');
+    const compact = text.replace(/\s+/g, ' ').trim();
+    const hasTradeShape = /(futures signal|trade\s*:|entry\s*:|targets?\s*:|stop\s*loss\s*:|leverage\s*:)/i.test(compact);
+    if (!hasTradeShape || !/entry\s*:/i.test(compact) || !/(stop\s*loss|sl)\s*:/i.test(compact)) return null;
+
+    const symbolMatch = compact.match(/#?\$?([A-Z0-9]{2,})(?:\s*\/\s*USDT|USDT)\b/i);
+    const sideMatch = compact.match(/\b(LONG|SHORT)\b/i);
+    if (!symbolMatch || !sideMatch) return null;
+
+    const entryLine = compact.match(/entry\s*:\s*([^🏹❌⚠️\n\r]+)/i)?.[1] ?? '';
+    const targetLine = compact.match(/targets?\s*:\s*([^❌⚠️\n\r]+)/i)?.[1] ?? '';
+    const slLine = compact.match(/(?:stop\s*loss|sl)\s*:\s*([^⚠️\n\r]+)/i)?.[1] ?? '';
+    const leverageLine = compact.match(/leverage\s*:\s*([^.\n\r]+)/i)?.[1] ?? '';
+
+    const nums = (s: string) => (s.match(/\d+(?:\.\d+)?/g) ?? []).map(Number).filter((x) => Number.isFinite(x));
+    const entries = nums(entryLine);
+    const tps = nums(targetLine);
+    const sl = nums(slLine)[0] ?? null;
+    const leverage = nums(leverageLine)[0] ?? null;
+    if (!entries.length || !tps.length || sl == null || leverage == null) return null;
+
+    const entryPrice = entries.reduce((sum, x) => sum + x, 0) / entries.length;
+
+    return {
+      type: 'NEW',
+      symbol: symbolMatch[1].toUpperCase(),
+      side: sideMatch[1].toLowerCase() as 'long' | 'short',
+      entryType: 'limit',
+      entryPrice,
+      sl,
+      tps,
+      leverage,
+      confidence: 0.95,
+      newSl: null,
+      closePct: null,
     };
   }
 
