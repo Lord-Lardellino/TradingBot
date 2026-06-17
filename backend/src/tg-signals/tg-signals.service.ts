@@ -4,6 +4,7 @@ import { PrismaService } from '../prisma/prisma.service';
 import { TelegramClientService, IncomingMessage } from './telegram-client.service';
 import { SignalParserService, ParsedSignal } from './signal-parser.service';
 import { OrderExecutorService } from './order-executor.service';
+import { GemmaService } from '../gemma/gemma.service';
 
 // ── Orchestratore Telegram Signals ──────────────────────────────────────────
 // GramJS (messaggio) → Gemini (parse) → risk/normalizzazione → esecuzione
@@ -24,6 +25,7 @@ export class TgSignalsService implements OnModuleInit {
     private tg: TelegramClientService,
     private parser: SignalParserService,
     private executor: OrderExecutorService,
+    private gemma: GemmaService,
   ) {}
 
   onModuleInit() {
@@ -417,8 +419,10 @@ export class TgSignalsService implements OnModuleInit {
     const losses = all.filter((t) => t.tradeStatus === 'loss').length;
     const pnl = all.reduce((s, t) => s + (t.pnl ?? 0), 0);
     const closed = all.length;
+    const gemmaIdx = this.gemma.modelIdx;
     return {
       telegram: tgStatus, channels, openTrades, recent, promptMemory,
+      gemma: { model: this.gemma.currentModel, idx: gemmaIdx, onFallback: gemmaIdx > 0 },
       stats: { closed, wins, losses, winRate: closed ? +(wins / closed * 100).toFixed(1) : 0, pnl: +pnl.toFixed(4) },
     };
   }

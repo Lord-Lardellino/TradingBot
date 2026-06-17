@@ -26,7 +26,7 @@
       Live attivo su almeno un canale: i nuovi segnali validi possono aprire ordini reali su MEXC.
     </div>
 
-    <div class="grid grid-cols-2 md:grid-cols-5 gap-3">
+    <div class="grid grid-cols-2 md:grid-cols-6 gap-3">
       <div class="panel">
         <div class="label">Telegram</div>
         <div :class="['value', telegram.connected ? 'text-profit' : 'text-gray-400']">
@@ -49,6 +49,12 @@
         <div class="label">PnL sim</div>
         <div :class="['value', (stats.pnl || 0) >= 0 ? 'text-profit' : 'text-loss']">
           ${{ money(stats.pnl) }}
+        </div>
+      </div>
+      <div class="panel">
+        <div class="label">Modello Gemini</div>
+        <div :class="['value text-sm', gemma.onFallback ? 'text-amber-400' : 'text-profit']" :title="gemma.model">
+          {{ gemma.onFallback ? '⚠ ' : '' }}{{ gemma.model || '—' }}
         </div>
       </div>
     </div>
@@ -250,6 +256,7 @@ type TgChannel = {
 type TgSignal = Record<string, any>
 
 const telegram = ref({ configured: false, connected: false })
+const gemma = ref<{ model: string; idx: number; onFallback: boolean }>({ model: '', idx: 0, onFallback: false })
 const channels = ref<TgChannel[]>([])
 const openTrades = ref<TgSignal[]>([])
 const recent = ref<TgSignal[]>([])
@@ -266,6 +273,7 @@ async function load() {
   try {
     const { data } = await axios.get('/api/tg-signals/dashboard')
     telegram.value = data.telegram || telegram.value
+    gemma.value = data.gemma || gemma.value
     channels.value = data.channels || []
     openTrades.value = data.openTrades || []
     recent.value = data.recent || []
