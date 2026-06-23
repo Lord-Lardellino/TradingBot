@@ -133,6 +133,10 @@ export class TgSignalsService implements OnModuleInit {
     this.syncingDialogs = true;
     try {
       const dialogs = await this.tg.listDialogs();
+      // id normalizzato (toglie -100/segno): i record creati dal realtime usano un
+      // formato diverso da quello dei dialoghi → confronto su forma normalizzata.
+      const norm = (s: string | null | undefined) => String(s ?? '').replace(/^-100/, '').replace(/^-/, '');
+      const liveNorm = new Set(dialogs.map((d) => norm(d.id)));
       let added = 0;
       for (const d of dialogs) {
         const skipCodes = this.isCodesChannel(d.title, d.username);
@@ -152,12 +156,24 @@ export class TgSignalsService implements OnModuleInit {
           update: {
             username: d.username ?? null,
             title: d.title ?? null,
-            ...(skipCodes ? { enabled: false } : {}),
+            enabled: !skipCodes,   // mirror: sei iscritto → attivo (salvo canale di codici/OTP)
           },
         });
         if (rec.createdAt.getTime() === rec.updatedAt.getTime()) added++;
       }
       if (added) this.logger.log(`[TGS] auto-registrati ${added} canali Telegram`);
+
+      // Mirror dell'iscrizione: disabilita i canali che NON sono piu nei tuoi dialoghi
+      // (lasciati/eliminati su Telegram). GUARDIA: se i dialoghi tornano vuoti (errore
+      // transitorio) NON disabilita nulla, per non spegnere tutto per sbaglio.
+      if (dialogs.length) {
+        const enabledChans = await this.prisma.tgChannel.findMany({ where: { enabled: true } });
+        const stale = enabledChans.filter((c) => !liveNorm.has(norm(c.channelId)));
+        if (stale.length) {
+          await this.prisma.tgChannel.updateMany({ where: { id: { in: stale.map((c) => c.id) } }, data: { enabled: false } });
+          this.logger.log(`[TGS] disabilitati ${stale.length} canali non piu nei dialoghi: ${stale.map((c) => c.title ?? c.channelId).join(', ').slice(0, 200)}`);
+        }
+      }
     } finally {
       this.syncingDialogs = false;
     }
@@ -405,6 +421,9 @@ export class TgSignalsService implements OnModuleInit {
               data: { tradeStatus: 'open', note: `live posId ${position.positionId}` },
             });
           }
+          // BE automatico: appena TP1 viene toccato (parziale riempito → volume ridotto)
+          // sposta lo SL a entry, una sola volta.
+          await this.maybeMoveToBreakeven(t, position, tps);
           continue;
         }
 
@@ -429,6 +448,41 @@ export class TgSignalsService implements OnModuleInit {
           });
         }
       }
+    }
+  }
+
+  // ── BE automatico: TP1 toccato → SL a entry (una sola volta) ──────────────
+  // Rileva il tocco di TP1 dal calo del volume della posizione (il TP1 parziale
+  // nativo si e' riempito). Poi riaggancia SL=entry sul volume residuo, mantenendo
+  // i TP ancora davanti al prezzo. Errori (es. protezione non valida per un rapido
+  // ritracciamento) vengono inghiottiti qui: NON propagano al monitor, cosi non
+  // possono causare chiusure indesiderate; si ritenta al tick successivo.
+  private async maybeMoveToBreakeven(t: any, position: { contracts: number; markPrice?: number; positionId?: string }, tps: number[]) {
+    if (tps.length < 2) return;                                  // 1 solo TP: al fill chiude tutto, niente BE
+    if (/\bBE\b/.test(String(t.note ?? ''))) return;             // gia' spostato a break-even
+    if (!t.entry || !t.side || !t.symbol || !t.qty) return;
+
+    const curVol = Math.abs(Number(position.contracts ?? 0));
+    const tp1Filled = curVol > 0 && curVol < Number(t.qty) * 0.999;
+    if (!tp1Filled) return;                                      // TP1 non ancora toccato
+
+    // sicurezza: SL a entry e' valido solo se il prezzo e' ancora in profitto oltre l'entry
+    const price = position.markPrice ?? (await this.executor.getPrice(t.symbol)) ?? undefined;
+    const inProfit = price != null && (t.side === 'long' ? price > t.entry : price < t.entry);
+    if (!inProfit) return;
+
+    const remaining = tps.filter((tp) => (t.side === 'long' ? tp > price! : tp < price!));
+    const channel = await this.prisma.tgChannel.findUnique({ where: { id: t.channelDbId } });
+    const split = String(channel?.tpSplit ?? '50,30,20').split(',').map(Number).filter((x) => x > 0);
+    try {
+      const posId = await this.executor.attachStops(t.symbol, t.side, t.qty, t.entry, remaining, split);
+      await this.prisma.tgSignal.update({
+        where: { id: t.id },
+        data: { stopLoss: t.entry, reason: 'be', note: `live posId ${posId ?? position.positionId ?? 'n/d'} · BE` },
+      });
+      this.logger.log(`[TGS LIVE] BE ${t.symbol}: TP1 toccato → SL spostato a entry ${t.entry}`);
+    } catch (e: any) {
+      this.logger.warn(`[TGS LIVE] BE ${t.symbol}: ${String(e?.message ?? '').slice(0, 70)}`);
     }
   }
 
