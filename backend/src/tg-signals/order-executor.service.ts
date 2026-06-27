@@ -88,6 +88,29 @@ export class OrderExecutorService implements OnModuleInit {
     return fallback;
   }
 
+  // Saldo LIBERO (disponibile) sul conto futures — base per il margine dinamico.
+  async getFreeBalance(): Promise<number> {
+    try {
+      const bal = await this.exchange.fetchBalance({ type: 'swap' });
+      return Number(bal?.USDT?.free ?? bal?.USDT?.total ?? 0) || 0;
+    } catch (e: any) { this.logger.warn(`[ORD] saldo libero non letto: ${e?.message?.slice(0, 50)}`); return 0; }
+  }
+
+  // % del saldo LIBERO usata come margine per ogni trade (margine dinamico).
+  private static readonly MARGIN_PCT = 0.25;
+
+  // Sizing a MARGINE: notional = margine(= MARGIN_PCT del libero) × leva (del segnale).
+  // qty in contratti = notional / (entry × contractSize). Cosi i gain seguono la leva
+  // del segnale e la size scala con l'account.
+  async sizeByMargin(symbol: string, entry: number, lev: number): Promise<{ qty: number; margin: number; notional: number; cs: number }> {
+    const { cs, minContracts } = this.marketMeta(symbol);
+    const free = await this.getFreeBalance();
+    const margin = free * OrderExecutorService.MARGIN_PCT;
+    const notional = margin * Math.max(1, lev);
+    const qty = (entry > 0 && cs > 0 && notional > 0) ? Math.max(minContracts, Math.floor(notional / (entry * cs))) : minContracts;
+    return { qty, margin, notional, cs };
+  }
+
   async getPrice(symbol: string): Promise<number | null> {
     try { const t = await this.exchange.fetchTicker(symbol); return Number(t?.last ?? t?.close ?? 0) || null; } catch { return null; }
   }
@@ -159,12 +182,14 @@ export class OrderExecutorService implements OnModuleInit {
     const entryRef = p.entryType === 'limit' && p.entryPrice ? p.entryPrice : p.entryPrice ?? (await this.getPrice(symbol)) ?? 0;
     if (!entryRef) return { ok: false, error: 'prezzo entry non disponibile' };
 
-    const { qty, riskUsd } = await this.sizeQty(symbol, entryRef, p.sl, p.riskPct);
-    if (qty <= 0) return { ok: false, error: 'qty calcolata = 0' };
+    const lev = Math.max(1, Math.round(p.leverage || 1));
+    const { qty, cs } = await this.sizeByMargin(symbol, entryRef, lev);
+    if (qty <= 0) return { ok: false, error: 'qty = 0 (saldo libero insufficiente?)' };
+    const riskUsd = Math.abs(entryRef - p.sl) * qty * cs;   // perdita stimata se va allo SL
 
     try {
-      await this.exchange.setLeverage(p.leverage, symbol, { openType: 1, positionType }).catch(() => {});
-      const params: any = { openType: 1, positionType, leverage: p.leverage };
+      await this.exchange.setLeverage(lev, symbol, { openType: 1, positionType }).catch(() => {});
+      const params: any = { openType: 1, positionType, leverage: lev };
       if (p.entryType === 'limit' && p.entryPrice) {
         const px = Number(this.exchange.priceToPrecision(symbol, p.entryPrice));
         // SL PREIMPOSTATO sull'ordine limit (MEXC lo accetta su order/create): così la

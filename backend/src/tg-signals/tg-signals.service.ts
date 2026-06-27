@@ -19,6 +19,7 @@ export class TgSignalsService implements OnModuleInit {
   private readonly logger = new Logger(TgSignalsService.name);
   private lastDialogSyncAt = 0;
   private syncingDialogs = false;
+  private monitoringLive = false;   // guardia: niente run sovrapposti del monitor live (gira ogni 2s)
 
   constructor(
     private prisma: PrismaService,
@@ -67,6 +68,9 @@ export class TgSignalsService implements OnModuleInit {
 
     const memory = await this.getPromptMemory();
     const parsed = await this.parser.parse(msg.text, memory.summary, { riskPct: channel.riskPct, leverageMax: channel.levaMax });
+    // Override leva dal testo grezzo: Gemini a volte sbaglia (es. "SHORT 20X" letto come 10).
+    const rawLev = this.extractLeverage(msg.text);
+    if (rawLev != null) parsed.leverage = rawLev;
     const rec = await this.prisma.tgSignal.create({
       data: {
         channelDbId: channel.id, tgMessageId: msg.messageId, rawText,
@@ -93,6 +97,18 @@ export class TgSignalsService implements OnModuleInit {
     // …oppure i campi tipici di un setup (entry/sl/tp/target/leva)
     const fields = /\b(entry|entrata|sl|stop[\s_-]*loss|tp\d?|take[\s_-]*profits?|targets?|leverage|leva)\b/.test(t);
     return action || fields;
+  }
+
+  // Estrae la leva dichiarata nel testo grezzo (es. "20X", "leva 20", "cross 20x").
+  // Override usato quando Gemini sbaglia la leva del segnale.
+  private extractLeverage(text: string): number | null {
+    const t = (text || '').toLowerCase();
+    const m =
+      t.match(/(\d{1,3})\s*x\b/) ||                                  // "20x", "20 x"
+      t.match(/\bx\s*(\d{1,3})\b/) ||                                // "x20"
+      t.match(/(?:lev(?:erage|a)?|cross|isolated)\s*:?\s*(\d{1,3})/); // "leva 20", "leverage: 20"
+    if (m) { const n = parseInt(m[1], 10); if (n >= 1 && n <= 125) return n; }
+    return null;
   }
 
   private async ensureChannelForMessage(msg: IncomingMessage) {
@@ -282,7 +298,8 @@ export class TgSignalsService implements OnModuleInit {
       } });
       this.logger.log(`[TGS LIVE] ${channel.username ?? channel.channelId} → ${entryType} ${p.side} ${symbol} qty ${r.qty}`);
     } else {
-      const { qty, riskUsd } = await this.executor.sizeQty(symbol, entryRef, p.sl, channel.riskPct);
+      const sm = await this.executor.sizeByMargin(symbol, entryRef, leverage);
+      const qty = sm.qty; const riskUsd = Math.abs(entryRef - p.sl) * qty * sm.cs;
       await this.prisma.tgSignal.update({ where: { id: recId }, data: {
         status: 'executed', mode: 'sim', tradeStatus: 'open', symbol, side: p.side,
         entry: entryRef, stopLoss: p.sl, takeProfits: JSON.stringify(p.tps), qty, leverage, riskUsd,
@@ -365,8 +382,11 @@ export class TgSignalsService implements OnModuleInit {
     }
   }
 
-  @Cron('*/20 * * * * *')
+  @Cron('*/2 * * * * *')
   async monitorLiveStops() {
+    if (this.monitoringLive) return;   // evita run sovrapposti (ora gira ogni 2s)
+    this.monitoringLive = true;
+    try {
     const open = await this.prisma.tgSignal.findMany({
       where: { tradeStatus: { in: ['open', 'pending'] }, mode: 'live' },
     });
@@ -449,6 +469,7 @@ export class TgSignalsService implements OnModuleInit {
         }
       }
     }
+    } finally { this.monitoringLive = false; }
   }
 
   // ── BE automatico: TP1 toccato → SL a entry (una sola volta) ──────────────
@@ -466,23 +487,37 @@ export class TgSignalsService implements OnModuleInit {
     const tp1Filled = curVol > 0 && curVol < Number(t.qty) * 0.999;
     if (!tp1Filled) return;                                      // TP1 non ancora toccato
 
-    // sicurezza: SL a entry e' valido solo se il prezzo e' ancora in profitto oltre l'entry
-    const price = position.markPrice ?? (await this.executor.getPrice(t.symbol)) ?? undefined;
-    const inProfit = price != null && (t.side === 'long' ? price > t.entry : price < t.entry);
-    if (!inProfit) return;
+    const long = t.side === 'long';
+    const price = position.markPrice ?? (await this.executor.getPrice(t.symbol)) ?? Number(t.entry);
+    // Lo STOP a break-even si puo' piazzare solo se il prezzo e' ancora oltre l'entry
+    // (long: prezzo > entry). Altrimenti lo stop sarebbe "gia' passato".
+    const canPlaceBeStop = long ? price > t.entry : price < t.entry;
 
-    const remaining = tps.filter((tp) => (t.side === 'long' ? tp > price! : tp < price!));
-    const channel = await this.prisma.tgChannel.findUnique({ where: { id: t.channelDbId } });
-    const split = String(channel?.tpSplit ?? '50,30,20').split(',').map(Number).filter((x) => x > 0);
-    try {
-      const posId = await this.executor.attachStops(t.symbol, t.side, t.qty, t.entry, remaining, split);
-      await this.prisma.tgSignal.update({
-        where: { id: t.id },
-        data: { stopLoss: t.entry, reason: 'be', note: `live posId ${posId ?? position.positionId ?? 'n/d'} · BE` },
-      });
-      this.logger.log(`[TGS LIVE] BE ${t.symbol}: TP1 toccato → SL spostato a entry ${t.entry}`);
-    } catch (e: any) {
-      this.logger.warn(`[TGS LIVE] BE ${t.symbol}: ${String(e?.message ?? '').slice(0, 70)}`);
+    if (canPlaceBeStop) {
+      // sposta lo SL a entry sul volume residuo, mantenendo i TP ancora davanti al prezzo
+      const remaining = tps.filter((tp) => (long ? tp > price : tp < price));
+      const channel = await this.prisma.tgChannel.findUnique({ where: { id: t.channelDbId } });
+      const split = String(channel?.tpSplit ?? '50,30,20').split(',').map(Number).filter((x) => x > 0);
+      try {
+        const posId = await this.executor.attachStops(t.symbol, t.side, t.qty, t.entry, remaining, split);
+        await this.prisma.tgSignal.update({
+          where: { id: t.id },
+          data: { stopLoss: t.entry, reason: 'be', note: `live posId ${posId ?? position.positionId ?? 'n/d'} · BE` },
+        });
+        this.logger.log(`[TGS LIVE] BE ${t.symbol}: TP1 toccato → SL spostato a entry ${t.entry}`);
+      } catch (e: any) {
+        this.logger.warn(`[TGS LIVE] BE ${t.symbol}: ${String(e?.message ?? '').slice(0, 70)}`);
+      }
+    } else {
+      // Il prezzo e' gia' tornato all'entry/sotto dopo il TP1: non si puo' piazzare lo stop
+      // a BE (sarebbe gia' passato). CHIUDO subito a mercato il residuo per loccare il
+      // ~breakeven, invece di lasciarlo correre verso la liquidazione (questo era il bug).
+      try {
+        await this.closeTrade(t, 'be');
+        this.logger.log(`[TGS LIVE] BE ${t.symbol}: prezzo rientrato a entry dopo TP1 → chiuso residuo a mercato (~breakeven)`);
+      } catch (e: any) {
+        this.logger.warn(`[TGS LIVE] BE close ${t.symbol}: ${String(e?.message ?? '').slice(0, 70)}`);
+      }
     }
   }
 
