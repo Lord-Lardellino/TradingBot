@@ -182,7 +182,11 @@ export class OrderExecutorService implements OnModuleInit {
     const entryRef = p.entryType === 'limit' && p.entryPrice ? p.entryPrice : p.entryPrice ?? (await this.getPrice(symbol)) ?? 0;
     if (!entryRef) return { ok: false, error: 'prezzo entry non disponibile' };
 
-    const lev = Math.max(1, Math.round(p.leverage || 1));
+    // Leva SL-SAFE: cappa la leva del segnale cosi' la liquidazione resta OLTRE lo SL
+    // (lo SL del segnale diventa un vero stop, perdita ~margine). safe = 0.8×entry/distanza-SL.
+    const slDist = Math.abs(entryRef - p.sl);
+    const safeLev = slDist > 0 ? Math.max(1, Math.floor((entryRef / slDist) * 0.8)) : Math.max(1, Math.round(p.leverage || 1));
+    const lev = Math.max(1, Math.min(Math.round(p.leverage || safeLev), safeLev));
     const { qty, cs } = await this.sizeByMargin(symbol, entryRef, lev);
     if (qty <= 0) return { ok: false, error: 'qty = 0 (saldo libero insufficiente?)' };
     const riskUsd = Math.abs(entryRef - p.sl) * qty * cs;   // perdita stimata se va allo SL
