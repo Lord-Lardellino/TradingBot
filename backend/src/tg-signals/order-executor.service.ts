@@ -235,7 +235,7 @@ export class OrderExecutorService implements OnModuleInit {
     if (!positionId) { this.logger.warn('[ORD LIVE] positionId non trovato — SL/TP non attaccati'); return undefined; }
 
     const slPx = Number(this.exchange.priceToPrecision(symbol, sl));
-    const refPrice = pos?.markPrice ?? pos?.entryPrice ?? await this.getPrice(symbol);
+    const refPrice = pos?.markPrice ?? (await this.getPrice(symbol)) ?? pos?.entryPrice;
     if (refPrice && !this.protectionIsValid(side, refPrice, slPx, tps)) {
       throw new Error(`protection_invalid ${symbol}: price=${refPrice} sl=${slPx} tp=${tps.join('/')}`);
     }
