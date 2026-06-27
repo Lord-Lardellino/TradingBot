@@ -48,7 +48,13 @@ export class TgSignalsService implements OnModuleInit {
       orderBy: { createdAt: 'desc' },
     });
     if (dup) {
-      const changedSkippedSignal = dup.rawText !== rawText && dup.status === 'skipped' && dup.tradeStatus === 'none';
+      const textChanged = dup.rawText !== rawText;
+      // Messaggio MODIFICATO in un'istruzione di uscita → chiudi il trade aperto del canale.
+      if (textChanged && this.isCloseInstruction(msg.text)) {
+        const open = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, tradeStatus: { in: ['open', 'pending'] } }, orderBy: { createdAt: 'desc' } });
+        if (open) { await this.closeTrade(open, 'close'); this.logger.log(`[TGS] CLOSE da messaggio modificato → ${open.symbol}`); return; }
+      }
+      const changedSkippedSignal = textChanged && dup.status === 'skipped' && dup.tradeStatus === 'none';
       if (!changedSkippedSignal) return;
     }
     if (msg.title && channel.title !== msg.title) {
