@@ -71,6 +71,9 @@ export class TgSignalsService implements OnModuleInit {
     // Override leva dal testo grezzo: Gemini a volte sbaglia (es. "SHORT 20X" letto come 10).
     const rawLev = this.extractLeverage(msg.text);
     if (rawLev != null) parsed.leverage = rawLev;
+    // CLOSE robusto: se il messaggio dice chiaramente di uscire/chiudere e NON e' un nuovo
+    // ingresso, forza la chiusura (override su eventuale errore di classificazione Gemini).
+    if (parsed.type !== 'NEW' && this.isCloseInstruction(msg.text)) parsed.type = 'CLOSE';
     const rec = await this.prisma.tgSignal.create({
       data: {
         channelDbId: channel.id, tgMessageId: msg.messageId, rawText,
@@ -109,6 +112,16 @@ export class TgSignalsService implements OnModuleInit {
       t.match(/(?:lev(?:erage|a)?|cross|isolated)\s*:?\s*(\d{1,3})/); // "leva 20", "leverage: 20"
     if (m) { const n = parseInt(m[1], 10); if (n >= 1 && n <= 125) return n; }
     return null;
+  }
+
+  // Vero solo se il messaggio e' una vera ISTRUZIONE di chiusura/uscita del trade
+  // (es. "Exit #AGLD", "close the trade", "chiudi", "book profit"), non una menzione
+  // casuale di "close" (es. "candle close above").
+  private isCloseInstruction(text: string): boolean {
+    const t = (text || '').toLowerCase();
+    return /\b(exit|close)\s+(the\s+|this\s+|now|all|trade|position|#|\$)/.test(t)
+        || /\b(chiudi|chiudere|esci|uscire)\b/.test(t)
+        || /\b(book|take)\s+profit\b/.test(t);
   }
 
   private async ensureChannelForMessage(msg: IncomingMessage) {
