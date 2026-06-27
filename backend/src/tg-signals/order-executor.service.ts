@@ -96,8 +96,8 @@ export class OrderExecutorService implements OnModuleInit {
     } catch (e: any) { this.logger.warn(`[ORD] saldo libero non letto: ${e?.message?.slice(0, 50)}`); return 0; }
   }
 
-  // % del saldo LIBERO usata come margine per ogni trade (margine dinamico).
-  private static readonly MARGIN_PCT = 0.25;
+  // Margine FISSO per trade (USDT), cappato al saldo libero disponibile.
+  private static readonly MARGIN_USDT = 10;
 
   // Sizing a MARGINE: notional = margine(= MARGIN_PCT del libero) × leva (del segnale).
   // qty in contratti = notional / (entry × contractSize). Cosi i gain seguono la leva
@@ -105,7 +105,7 @@ export class OrderExecutorService implements OnModuleInit {
   async sizeByMargin(symbol: string, entry: number, lev: number): Promise<{ qty: number; margin: number; notional: number; cs: number }> {
     const { cs, minContracts } = this.marketMeta(symbol);
     const free = await this.getFreeBalance();
-    const margin = free * OrderExecutorService.MARGIN_PCT;
+    const margin = Math.min(OrderExecutorService.MARGIN_USDT, free * 0.95);
     const notional = margin * Math.max(1, lev);
     const qty = (entry > 0 && cs > 0 && notional > 0) ? Math.max(minContracts, Math.floor(notional / (entry * cs))) : minContracts;
     return { qty, margin, notional, cs };
