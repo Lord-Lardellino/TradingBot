@@ -272,10 +272,10 @@ export class OrderExecutorService implements OnModuleInit {
     if (!Number.isFinite(reference) || reference <= 0) return true;
     if (side === 'long') {
       if (sl >= reference) return false;
-      return tps.some((tp) => Number(tp) > reference);
+      return tps.length === 0 || tps.some((tp) => Number(tp) > reference);   // TP assente = SL-only ok
     }
     if (sl <= reference) return false;
-    return tps.some((tp) => Number(tp) < reference);
+    return tps.length === 0 || tps.some((tp) => Number(tp) < reference);
   }
 
   private normalizeSplit(split: number[], n: number): number[] {

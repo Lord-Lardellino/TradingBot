@@ -55,7 +55,9 @@ export class TgSignalsService implements OnModuleInit {
         if (open) { await this.closeTrade(open, 'close'); this.logger.log(`[TGS] CLOSE da messaggio modificato → ${open.symbol}`); return; }
       }
       const changedSkippedSignal = textChanged && dup.status === 'skipped' && dup.tradeStatus === 'none';
-      if (!changedSkippedSignal) return;
+      // Edit su un trade aperto con SL di default → ri-processa per applicare lo SL/TP vero.
+      const editOnDefaultSl = textChanged && dup.tradeStatus === 'open' && /SL-default/.test(String(dup.note ?? ''));
+      if (!changedSkippedSignal && !editOnDefaultSl) return;
     }
     if (msg.title && channel.title !== msg.title) {
       await this.prisma.tgChannel.update({ where: { id: channel.id }, data: { title: msg.title } }).catch(() => {});
@@ -261,14 +263,24 @@ export class TgSignalsService implements OnModuleInit {
 
     if (p.confidence < channel.minConf) return void (await skip(`confidenza ${p.confidence} < soglia ${channel.minConf}`));
     if (!p.side) return void (await skip('direzione non riconosciuta'));
-    if (p.sl == null) return void (await skip('SL mancante — impossibile dimensionare il rischio'));
+    // SL mancante: NON skippiamo piu' — si entra lo stesso (simbolo+leva) e si mette uno
+    // SL di default (100% margine = distanza 1/leva), poi si aggiorna quando arriva lo SL vero.
     const symbol = p.symbol ? this.executor.resolveSymbol(p.symbol) : null;
     if (!symbol) return void (await skip(`simbolo non mappabile: ${p.symbol}`));
 
     // No duplicati: blocca solo lo STESSO symbol+side già aperto su questo canale
     // (coin diversi sullo stesso canale sono permessi → prima li skippava tutti).
     const dupSameSymbol = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, symbol, side: p.side, tradeStatus: { in: ['open', 'pending'] } } });
-    if (dupSameSymbol) return void (await skip(`già un trade ${p.side} aperto su ${symbol} (no duplicato)`));
+    if (dupSameSymbol) {
+      // Trade aperto con SL di default e ora arriva lo SL vero → aggiorna SL/TP (non riapre).
+      if (p.sl != null && dupSameSymbol.mode === 'live' && /SL-default/.test(String(dupSameSymbol.note ?? ''))) {
+        const tpSplitU = String(channel.tpSplit).split(',').map((x: string) => Number(x.trim())).filter((x) => x > 0);
+        try { await this.executor.attachStops(symbol, p.side as any, dupSameSymbol.qty ?? 0, p.sl, p.tps, tpSplitU); } catch (e: any) { this.logger.warn(`[TGS] update SL/TP ${symbol}: ${e?.message?.slice(0, 60)}`); }
+        await this.prisma.tgSignal.update({ where: { id: dupSameSymbol.id }, data: { stopLoss: p.sl, takeProfits: JSON.stringify(p.tps), note: String(dupSameSymbol.note ?? '').replace(' · SL-default', '') + ' · SL/TP aggiornati' } });
+        return void (await skip(`SL/TP veri applicati su ${symbol} (era SL-default)`));
+      }
+      return void (await skip(`già un trade ${p.side} aperto su ${symbol} (no duplicato)`));
+    }
 
     if (channel.mode === 'live') {
       const liveConflict = await this.prisma.tgSignal.findFirst({
@@ -299,8 +311,15 @@ export class TgSignalsService implements OnModuleInit {
     }
     const entryRef = (entryType === 'limit' && entryPrice) ? entryPrice : (livePrice ?? entryPrice);
     if (!entryRef) return void (await skip('prezzo entry non disponibile'));
-    // Protezione valida rispetto al prezzo d'ingresso effettivo (non al prezzo live,
-    // che per un limit lontano falsava il controllo e skippava setup validi).
+    // SL di default se mancante: distanza 1/leva dall'entry → se toccato perdi il 100% del
+    // margine ("tanto quello e'"). Verra' aggiornato quando arriva lo SL vero (edit/UPDATE).
+    let slIsDefault = false;
+    if (p.sl == null) {
+      p.sl = p.side === 'long' ? entryRef * (1 - 1 / leverage) : entryRef * (1 + 1 / leverage);
+      slIsDefault = true;
+    }
+    // Protezione valida rispetto al prezzo d'ingresso effettivo. Con TP assenti si entra
+    // comunque (SL only): la gestione d'uscita arriva dai messaggi del canale.
     if (!this.executor.protectionIsValid(p.side, entryRef, p.sl, p.tps)) {
       return void (await skip(`SL/TP incoerenti con entry ${entryRef}: SL=${p.sl} TP=${p.tps.join('/')}`));
     }
@@ -309,7 +328,7 @@ export class TgSignalsService implements OnModuleInit {
       const r = await this.executor.openLive({ symbol, side: p.side, entryType, entryPrice: (entryType === 'market' ? entryRef : entryPrice) ?? undefined, sl: p.sl, tps: p.tps, tpSplit, riskPct: channel.riskPct, leverage });
       if (!r.ok) return void (await skip(`live: ${r.error}`));
       const tradeStatus = (r.positionId || entryType === 'market') ? 'open' : 'pending';
-      const note = r.positionId ? `live posId ${r.positionId}` : r.preset ? 'live limit preset (SL/TP sull-ordine)' : 'live pending limit';
+      const note = (r.positionId ? `live posId ${r.positionId}` : r.preset ? 'live limit preset (SL/TP sull-ordine)' : 'live pending limit') + (slIsDefault ? ' · SL-default' : '');
       await this.prisma.tgSignal.update({ where: { id: recId }, data: {
         status: 'executed', mode: 'live', tradeStatus, symbol, side: p.side,
         entry: r.entry, stopLoss: p.sl, takeProfits: JSON.stringify(p.tps), qty: r.qty, leverage, riskUsd: r.riskUsd,
@@ -322,7 +341,7 @@ export class TgSignalsService implements OnModuleInit {
       await this.prisma.tgSignal.update({ where: { id: recId }, data: {
         status: 'executed', mode: 'sim', tradeStatus: 'open', symbol, side: p.side,
         entry: entryRef, stopLoss: p.sl, takeProfits: JSON.stringify(p.tps), qty, leverage, riskUsd,
-        note: `sim ${entryType}`,
+        note: `sim ${entryType}${slIsDefault ? ' · SL-default' : ''}`,
       } });
       this.logger.log(`[TGS SIM] ${channel.username ?? channel.channelId} → ${entryType} ${p.side} ${symbol} qty ${qty} entry ${entryRef}`);
     }
