@@ -97,7 +97,7 @@ export class OrderExecutorService implements OnModuleInit {
   }
 
   // Margine FISSO per trade (USDT), cappato al saldo libero disponibile.
-  private static readonly MARGIN_USDT = 10;
+  private static readonly MARGIN_USDT = 2;
 
   // Sizing a MARGINE: notional = margine(= MARGIN_PCT del libero) × leva (del segnale).
   // qty in contratti = notional / (entry × contractSize). Cosi i gain seguono la leva
@@ -182,18 +182,16 @@ export class OrderExecutorService implements OnModuleInit {
     const entryRef = p.entryType === 'limit' && p.entryPrice ? p.entryPrice : p.entryPrice ?? (await this.getPrice(symbol)) ?? 0;
     if (!entryRef) return { ok: false, error: 'prezzo entry non disponibile' };
 
-    // Leva SL-SAFE: cappa la leva del segnale cosi' la liquidazione resta OLTRE lo SL
-    // (lo SL del segnale diventa un vero stop, perdita ~margine). safe = 0.8×entry/distanza-SL.
-    const slDist = Math.abs(entryRef - p.sl);
-    const safeLev = slDist > 0 ? Math.max(1, Math.floor((entryRef / slDist) * 0.8)) : Math.max(1, Math.round(p.leverage || 1));
-    const lev = Math.max(1, Math.min(Math.round(p.leverage || safeLev), safeLev));
+    // Leva PIENA del segnale + CROSS margin (openType 2): in cross il collaterale e' l'intero
+    // saldo, la liquidazione resta lontana e lo SL del segnale resta il vero stop anche a leva alta.
+    const lev = Math.max(1, Math.round(p.leverage || 1));
     const { qty, cs } = await this.sizeByMargin(symbol, entryRef, lev);
     if (qty <= 0) return { ok: false, error: 'qty = 0 (saldo libero insufficiente?)' };
     const riskUsd = Math.abs(entryRef - p.sl) * qty * cs;   // perdita stimata se va allo SL
 
     try {
-      await this.exchange.setLeverage(lev, symbol, { openType: 1, positionType }).catch(() => {});
-      const params: any = { openType: 1, positionType, leverage: lev };
+      await this.exchange.setLeverage(lev, symbol, { openType: 2, positionType }).catch(() => {});
+      const params: any = { openType: 2, positionType, leverage: lev };
       if (p.entryType === 'limit' && p.entryPrice) {
         const px = Number(this.exchange.priceToPrecision(symbol, p.entryPrice));
         // SL PREIMPOSTATO sull'ordine limit (MEXC lo accetta su order/create): così la
