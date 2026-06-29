@@ -56,7 +56,7 @@ export class TgSignalsService implements OnModuleInit {
       }
       const changedSkippedSignal = textChanged && dup.status === 'skipped' && dup.tradeStatus === 'none';
       // Edit su un trade aperto con SL di default → ri-processa per applicare lo SL/TP vero.
-      const editOnDefaultSl = textChanged && dup.tradeStatus === 'open' && /SL-default/.test(String(dup.note ?? ''));
+      const editOnDefaultSl = textChanged && dup.tradeStatus === 'open';   // edit su trade aperto → ri-processa per aggiornare SL/TP
       if (!changedSkippedSignal && !editOnDefaultSl) return;
     }
     if (msg.title && channel.title !== msg.title) {
@@ -273,7 +273,7 @@ export class TgSignalsService implements OnModuleInit {
     const dupSameSymbol = await this.prisma.tgSignal.findFirst({ where: { channelDbId: channel.id, symbol, side: p.side, tradeStatus: { in: ['open', 'pending'] } } });
     if (dupSameSymbol) {
       // Trade aperto con SL di default e ora arriva lo SL vero → aggiorna SL/TP (non riapre).
-      if (p.sl != null && dupSameSymbol.mode === 'live' && /SL-default/.test(String(dupSameSymbol.note ?? ''))) {
+      if (p.sl != null && dupSameSymbol.mode === 'live') {
         const tpSplitU = String(channel.tpSplit).split(',').map((x: string) => Number(x.trim())).filter((x) => x > 0);
         try { await this.executor.attachStops(symbol, p.side as any, dupSameSymbol.qty ?? 0, p.sl, p.tps, tpSplitU); } catch (e: any) { this.logger.warn(`[TGS] update SL/TP ${symbol}: ${e?.message?.slice(0, 60)}`); }
         await this.prisma.tgSignal.update({ where: { id: dupSameSymbol.id }, data: { stopLoss: p.sl, takeProfits: JSON.stringify(p.tps), note: String(dupSameSymbol.note ?? '').replace(' · SL-default', '') + ' · SL/TP aggiornati' } });
