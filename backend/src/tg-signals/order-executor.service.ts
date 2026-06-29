@@ -97,7 +97,7 @@ export class OrderExecutorService implements OnModuleInit {
   }
 
   // Margine FISSO per trade (USDT), cappato al saldo libero disponibile.
-  private static readonly MARGIN_USDT = 2;
+  private static readonly MARGIN_USDT = 1;
 
   // Sizing a MARGINE: notional = margine(= MARGIN_PCT del libero) × leva (del segnale).
   // qty in contratti = notional / (entry × contractSize). Cosi i gain seguono la leva
