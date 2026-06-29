@@ -79,6 +79,7 @@ export class TgSignalsService implements OnModuleInit {
     // Override leva dal testo grezzo: Gemini a volte sbaglia (es. "SHORT 20X" letto come 10).
     const rawLev = this.extractLeverage(msg.text);
     if (rawLev != null) parsed.leverage = rawLev;
+    else parsed.leverage = Math.max(50, Number(parsed.leverage) || 0);   // leva non scritta nel segnale → default alto (50)
     // CLOSE robusto: se il messaggio dice chiaramente di uscire/chiudere e NON e' un nuovo
     // ingresso, forza la chiusura (override su eventuale errore di classificazione Gemini).
     if (parsed.type !== 'NEW' && this.isCloseInstruction(msg.text)) parsed.type = 'CLOSE';
